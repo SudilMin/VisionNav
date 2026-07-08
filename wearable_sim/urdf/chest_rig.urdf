@@ -1,0 +1,340 @@
+<?xml version="1.0"?>
+<robot name="blind_assist_wearable">
+
+  <material name="skin">  <color rgba="0.87 0.72 0.53 1.0"/></material>
+  <material name="shirt"> <color rgba="0.20 0.35 0.60 1.0"/></material>
+  <material name="dark">  <color rgba="0.12 0.12 0.12 1.0"/></material>
+  <material name="silver"><color rgba="0.75 0.75 0.75 1.0"/></material>
+  <material name="base">  <color rgba="0.30 0.30 0.30 1.0"/></material>
+
+  <!-- virtual ground reference -->
+  <link name="base_footprint"/>
+
+  <!--
+    BASE PLATFORM  – wide, heavy, low to ground.
+    This is the physics anchor; the human body hangs on top with almost no mass.
+    Box: 0.50 m (x) × 0.40 m (y) × 0.10 m (z)
+    Centre at world z = 0.11 m  (bottom at 0.06 m, clears wheel radius)
+    Mass 80 kg at z=0 keeps the whole robot bottom-heavy.
+  -->
+  <joint name="base_footprint_joint" type="fixed">
+    <parent link="base_footprint"/>
+    <child  link="base_platform"/>
+    <origin xyz="0 0 0.11" rpy="0 0 0"/>
+  </joint>
+
+  <link name="base_platform">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.50 0.40 0.10"/></geometry>
+      <material name="base"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.50 0.40 0.10"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="80.0"/>
+      <origin xyz="0 0 -0.04" rpy="0 0 0"/><!-- CoM near bottom -->
+      <inertia ixx="0.547" ixy="0" ixz="0"
+               iyy="0.440" iyz="0"
+               izz="0.947"/>
+    </inertial>
+  </link>
+
+  <!--
+    DRIVE WHEELS  (front-left, front-right)
+    radius = 0.06 m  →  centre at world z = 0.06
+    In base_platform frame:  z = 0.06 – 0.11 = –0.05
+    Separation 0.44 m  →  y = ±0.22
+    x = +0.15  (front half of platform)
+  -->
+  <joint name="left_wheel_joint" type="continuous">
+    <parent link="base_platform"/>
+    <child  link="left_wheel"/>
+    <origin xyz="0.15 0.22 -0.05" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+  <link name="left_wheel">
+    <visual><origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry><cylinder radius="0.06" length="0.05"/></geometry>
+      <material name="dark"/>
+    </visual>
+    <collision><origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry><cylinder radius="0.06" length="0.05"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="1.5"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <inertia ixx="0.0014" ixy="0" ixz="0"
+               iyy="0.0027" iyz="0" izz="0.0014"/>
+    </inertial>
+  </link>
+
+  <joint name="right_wheel_joint" type="continuous">
+    <parent link="base_platform"/>
+    <child  link="right_wheel"/>
+    <origin xyz="0.15 -0.22 -0.05" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+  <link name="right_wheel">
+    <visual><origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry><cylinder radius="0.06" length="0.05"/></geometry>
+      <material name="dark"/>
+    </visual>
+    <collision><origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry><cylinder radius="0.06" length="0.05"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="1.5"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <inertia ixx="0.0014" ixy="0" ixz="0"
+               iyy="0.0027" iyz="0" izz="0.0014"/>
+    </inertial>
+  </link>
+
+  <!--
+    REAR CASTERS  (ball spheres, zero friction)
+    sphere radius = 0.04 m  → centre at world z = 0.04
+    In base_platform frame:  z = 0.04 – 0.11 = –0.07
+    x = –0.15  y = ±0.15
+  -->
+  <joint name="rear_left_caster_joint" type="fixed">
+    <parent link="base_platform"/>
+    <child  link="rear_left_caster"/>
+    <origin xyz="-0.15 0.15 -0.07" rpy="0 0 0"/>
+  </joint>
+  <link name="rear_left_caster">
+    <visual><geometry><sphere radius="0.04"/></geometry><material name="dark"/></visual>
+    <collision><geometry><sphere radius="0.04"/></geometry></collision>
+    <inertial><mass value="0.3"/>
+      <inertia ixx="0.0002" ixy="0" ixz="0" iyy="0.0002" iyz="0" izz="0.0002"/>
+    </inertial>
+  </link>
+
+  <joint name="rear_right_caster_joint" type="fixed">
+    <parent link="base_platform"/>
+    <child  link="rear_right_caster"/>
+    <origin xyz="-0.15 -0.15 -0.07" rpy="0 0 0"/>
+  </joint>
+  <link name="rear_right_caster">
+    <visual><geometry><sphere radius="0.04"/></geometry><material name="dark"/></visual>
+    <collision><geometry><sphere radius="0.04"/></geometry></collision>
+    <inertial><mass value="0.3"/>
+      <inertia ixx="0.0002" ixy="0" ixz="0" iyy="0.0002" iyz="0" izz="0.0002"/>
+    </inertial>
+  </link>
+
+  <!--
+    HUMAN BODY  (visual box, very light – physics is in base_platform)
+    Platform top at world z = 0.11+0.05 = 0.16 m
+    Body centre at world z = 0.16+0.80 = 0.96 m
+    Joint in base_platform frame:  z = 0.96–0.11 = 0.85
+  -->
+  <joint name="body_joint" type="fixed">
+    <parent link="base_platform"/>
+    <child  link="human_body"/>
+    <origin xyz="0 0 0.85" rpy="0 0 0"/>
+  </joint>
+  <link name="human_body">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.35 0.25 1.60"/></geometry>
+      <material name="shirt"/>
+    </visual>
+    <!-- No meaningful collision on the tall body to avoid tipping physics -->
+    <inertial>
+      <mass value="1.0"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <inertia ixx="0.22" ixy="0" ixz="0"
+               iyy="0.22" iyz="0" izz="0.01"/>
+    </inertial>
+  </link>
+
+  <!-- HEAD -->
+  <joint name="head_joint" type="fixed">
+    <parent link="human_body"/>
+    <child  link="head_link"/>
+    <origin xyz="0 0 0.93" rpy="0 0 0"/>
+  </joint>
+  <link name="head_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><sphere radius="0.13"/></geometry>
+      <material name="skin"/>
+    </visual>
+    <inertial><mass value="0.1"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
+    </inertial>
+  </link>
+
+  <!-- LEFT ARM -->
+  <joint name="left_arm_joint" type="fixed">
+    <parent link="human_body"/>
+    <child  link="left_arm"/>
+    <origin xyz="0 0.245 0.35" rpy="0 1.5708 0"/>
+  </joint>
+  <link name="left_arm">
+    <visual><origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.055" length="0.55"/></geometry>
+      <material name="skin"/>
+    </visual>
+    <inertial><mass value="0.1"/>
+      <inertia ixx="0.002" ixy="0" ixz="0" iyy="0.002" iyz="0" izz="0.0001"/>
+    </inertial>
+  </link>
+
+  <!-- RIGHT ARM -->
+  <joint name="right_arm_joint" type="fixed">
+    <parent link="human_body"/>
+    <child  link="right_arm"/>
+    <origin xyz="0 -0.245 0.35" rpy="0 1.5708 0"/>
+  </joint>
+  <link name="right_arm">
+    <visual><origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.055" length="0.55"/></geometry>
+      <material name="skin"/>
+    </visual>
+    <inertial><mass value="0.1"/>
+      <inertia ixx="0.002" ixy="0" ixz="0" iyy="0.002" iyz="0" izz="0.0001"/>
+    </inertial>
+  </link>
+
+  <!--
+    CHEST RIG
+    Target world z = 1.00 m (lowered to see objects better)
+    In human_body frame (centre 0.96m): z = 1.00–0.96 = 0.04
+    Body front face x = 0.175; rig depth/2 = 0.10  → joint x = 0.275
+    Rotation:
+      -90° about Z aligns rig local +Y with world +X (forward).
+      +15° about local X tilts it downward so sensors see the floor.
+  -->
+  <joint name="chest_joint" type="fixed">
+    <parent link="human_body"/>
+    <child  link="base_link"/>
+    <origin xyz="0.275 0 0.04" rpy="0 0.261799 -1.5707963"/>
+  </joint>
+  <link name="base_link">
+    <visual><origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.15 0.20 0.05"/></geometry>
+      <material name="dark"/>
+    </visual>
+    <collision><origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.15 0.20 0.05"/></geometry>
+    </collision>
+    <inertial><mass value="1.0"/>
+      <inertia ixx="0.003542" ixy="0" ixz="0"
+               iyy="0.005208" iyz="0" izz="0.002083"/>
+    </inertial>
+  </link>
+
+  <!-- GPU LIDAR -->
+  <joint name="lidar_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="lidar_link"/>
+    <origin xyz="0.0 0.0 0.0375" rpy="0 0 0"/>
+  </joint>
+  <link name="lidar_link">
+    <visual><geometry><cylinder radius="0.025" length="0.025"/></geometry><material name="dark"/></visual>
+    <collision><geometry><cylinder radius="0.025" length="0.025"/></geometry></collision>
+    <inertial><mass value="0.1"/>
+      <inertia ixx="0.00002" ixy="0" ixz="0" iyy="0.00002" iyz="0" izz="0.00003"/>
+    </inertial>
+  </link>
+  <gazebo reference="lidar_link">
+    <sensor name="chest_lidar" type="gpu_lidar">
+      <gz_frame_id>lidar_link</gz_frame_id>
+      <update_rate>10</update_rate>
+      <topic>/lidar/points</topic>
+      <lidar>
+        <scan>
+          <horizontal><samples>360</samples><resolution>1</resolution>
+            <min_angle>-3.14159</min_angle><max_angle>3.14159</max_angle></horizontal>
+          <vertical><samples>16</samples><resolution>1</resolution>
+            <min_angle>-0.2618</min_angle><max_angle>0.2618</max_angle></vertical>
+        </scan>
+        <range><min>0.10</min><max>30.0</max><resolution>0.01</resolution></range>
+        <noise><type>gaussian</type><mean>0.0</mean><stddev>0.01</stddev></noise>
+      </lidar>
+      <always_on>true</always_on><visualize>false</visualize>
+    </sensor>
+  </gazebo>
+
+  <!-- RGB CAMERA - mounted on the FRONT of the chest rig, pointing forward -->
+  <joint name="camera_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="camera_link"/>
+    <origin xyz="0.0 0.1125 0.0" rpy="0 0 1.5707963"/>
+  </joint>
+  <link name="camera_link">
+    <visual><geometry><box size="0.025 0.025 0.025"/></geometry><material name="silver"/></visual>
+    <collision><geometry><box size="0.025 0.025 0.025"/></geometry></collision>
+    <inertial><mass value="0.05"/>
+      <inertia ixx="0.000005" ixy="0" ixz="0" iyy="0.000005" iyz="0" izz="0.000005"/>
+    </inertial>
+  </link>
+  <joint name="camera_optical_joint" type="fixed">
+    <parent link="camera_link"/>
+    <child  link="camera_optical_link"/>
+    <origin xyz="0 0 0" rpy="-1.5707963 0 -1.5707963"/>
+  </joint>
+  <link name="camera_optical_link"/>
+  <gazebo reference="camera_link">
+    <sensor name="rgb_camera_sensor" type="camera">
+      <gz_frame_id>camera_link</gz_frame_id>
+      <frame_id>camera_optical_link</frame_id>
+      <update_rate>30</update_rate>
+      <topic>/camera/image_raw</topic>
+      <camera>
+        <horizontal_fov>1.3962634</horizontal_fov>
+        <image><width>640</width><height>480</height><format>R8G8B8</format></image>
+        <clip><near>0.05</near><far>300.0</far></clip>
+        <noise><type>gaussian</type><mean>0.0</mean><stddev>0.007</stddev></noise>
+      </camera>
+      <always_on>true</always_on><visualize>false</visualize>
+    </sensor>
+  </gazebo>
+
+  <!-- Wheel friction -->
+  <gazebo reference="left_wheel">
+    <mu1>2.0</mu1><mu2>1.0</mu2><kp>1e6</kp><kd>100</kd>
+  </gazebo>
+  <gazebo reference="right_wheel">
+    <mu1>2.0</mu1><mu2>1.0</mu2><kp>1e6</kp><kd>100</kd>
+  </gazebo>
+  <gazebo reference="rear_left_caster">
+    <mu1>0.01</mu1><mu2>0.01</mu2>
+  </gazebo>
+  <gazebo reference="rear_right_caster">
+    <mu1>0.01</mu1><mu2>0.01</mu2>
+  </gazebo>
+
+  <!-- Differential Drive -->
+  <gazebo>
+    <plugin filename="gz-sim-diff-drive-system"
+            name="gz::sim::systems::DiffDrive">
+      <left_joint>left_wheel_joint</left_joint>
+      <right_joint>right_wheel_joint</right_joint>
+      <wheel_separation>0.44</wheel_separation>
+      <wheel_radius>0.06</wheel_radius>
+      <max_linear_acceleration>1.0</max_linear_acceleration>
+      <max_angular_acceleration>2.0</max_angular_acceleration>
+      <odom_publish_frequency>50</odom_publish_frequency>
+      <topic>/cmd_vel</topic>
+      <odom_topic>/odom</odom_topic>
+      <tf_topic>/tf</tf_topic>
+      <frame_id>odom</frame_id>
+      <child_frame_id>base_footprint</child_frame_id>
+    </plugin>
+  </gazebo>
+
+  <!-- Joint State Publisher -->
+  <gazebo>
+    <plugin filename="gz-sim-joint-state-publisher-system"
+            name="gz::sim::systems::JointStatePublisher">
+      <topic>/joint_states</topic>
+      <update_rate>50</update_rate>
+    </plugin>
+  </gazebo>
+
+</robot>

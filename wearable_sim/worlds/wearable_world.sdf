@@ -1,0 +1,187 @@
+<?xml version="1.0" ?>
+<!--
+  wearable_world.sdf
+  ==================
+  Custom Gazebo Harmonic world for the wearable blind-assist simulation.
+
+  KEY DIFFERENCE from empty.sdf
+  ──────────────────────────────
+  The gz-sim-sensors-system plugin is explicitly loaded here with
+  render_engine = ogre2.  This is REQUIRED for GPU-rendered sensors:
+    • gpu_lidar  (velodyne-style 3-D point cloud)
+    • depth_camera, rgbd_camera, etc.
+
+  Without this world-level plugin, Gazebo will silently skip all
+  gpu_lidar sensors even though the URDF sensor blocks are correct.
+-->
+<sdf version="1.8">
+  <world name="wearable_world">
+
+    <!-- ── Core simulation systems ──────────────────────────────────── -->
+
+    <!-- Physics engine (DART via gz-physics) -->
+    <plugin
+      filename="gz-sim-physics-system"
+      name="gz::sim::systems::Physics"/>
+
+    <!-- Allows Gazebo GUI / ros_gz_sim create to add/move models -->
+    <plugin
+      filename="gz-sim-user-commands-system"
+      name="gz::sim::systems::UserCommands"/>
+
+    <!-- Streams scene updates to the Gazebo rendering client (GUI) -->
+    <plugin
+      filename="gz-sim-scene-broadcaster-system"
+      name="gz::sim::systems::SceneBroadcaster"/>
+
+    <!-- ── SENSOR RENDERING SYSTEM (required for the RGB camera) ────────
+         The CPU-based lidar (type="lidar") does NOT need this plugin.
+         The camera (type="camera") still uses ogre2 GPU rendering.
+         If camera rendering also fails on your GPU, change ogre2→ogre
+         (software rasterizer) here and in the <sensor> block.
+    ──────────────────────────────────────────────────────────────── -->
+    <plugin
+      filename="gz-sim-sensors-system"
+      name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+
+    <!-- ── Lighting ─────────────────────────────────────────────────── -->
+
+    <!-- Ambient light fills shadows softly -->
+    <light name="sun" type="directional">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <!-- ── Ground Plane ─────────────────────────────────────────────── -->
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>100 100</size>
+            </plane>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>100 100</size>
+            </plane>
+          </geometry>
+          <material>
+            <ambient>0.8 0.8 0.8 1</ambient>
+            <diffuse>0.8 0.8 0.8 1</diffuse>
+            <specular>0.8 0.8 0.8 1</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ── Photo-Realistic Models for YOLO Detection ───────────────
+         These are downloaded from Gazebo Fuel. They have real textures
+         which YOLOv5 needs in order to trigger a detection.
+    ───────────────────────────────────────────────────────────────── -->
+
+    <!-- Coke Can (YOLO: 'bottle' or 'cup') -->
+    <include>
+      <name>coke_can</name>
+      <pose>2.0 -3.0 0.0 0 0 0</pose>
+      <uri>https://fuel.gazebosim.org/1.0/OpenRobotics/models/Coke Can</uri>
+    </include>
+
+    <!-- Office Chair (YOLO: 'chair') -->
+    <include>
+      <name>office_chair</name>
+      <pose>6.0 -6.0 0.0 0 0 -1.0</pose>
+      <uri>https://fuel.gazebosim.org/1.0/OpenRobotics/models/Office Chair</uri>
+    </include>
+
+    <!-- Table (YOLO: 'dining table') -->
+    <include>
+      <name>table</name>
+      <pose>-6.0 6.0 0.0 0 0 0</pose>
+      <uri>https://fuel.gazebosim.org/1.0/OpenRobotics/models/Table</uri>
+    </include>
+
+    <!-- Bookshelf -->
+    <include>
+      <name>bookshelf</name>
+      <pose>-9.5 0.0 0.0 0 0 1.57</pose>
+      <uri>https://fuel.gazebosim.org/1.0/OpenRobotics/models/Bookshelf</uri>
+    </include>
+
+    <!-- ── Extra Objects Added for YOLO ────────────────────────────── -->
+    <include>
+      <name>sofa</name>
+      <pose>0.0 -8.0 0.0 0 0 0</pose>
+      <uri>https://fuel.gazebosim.org/1.0/OpenRobotics/models/Sofa</uri>
+    </include>
+
+    <!-- ── Walls (Room Boundary for SLAM) ──────────────────────────────
+         4 walls forming a massive 20m x 20m enclosed space.
+    ───────────────────────────────────────────────────────────────── -->
+    <model name="wall_north">
+      <static>true</static>
+      <pose>10 0 1 0 0 0</pose>
+      <link name="link">
+        <visual name="visual"><geometry><box><size>0.2 20 2</size></box></geometry><material><ambient>0.6 0.6 0.6 1</ambient></material></visual>
+        <collision name="collision"><geometry><box><size>0.2 20 2</size></box></geometry></collision>
+      </link>
+    </model>
+    
+    <model name="wall_south">
+      <static>true</static>
+      <pose>-10 0 1 0 0 0</pose>
+      <link name="link">
+        <visual name="visual"><geometry><box><size>0.2 20 2</size></box></geometry><material><ambient>0.6 0.6 0.6 1</ambient></material></visual>
+        <collision name="collision"><geometry><box><size>0.2 20 2</size></box></geometry></collision>
+      </link>
+    </model>
+
+    <model name="wall_east">
+      <static>true</static>
+      <pose>0 10 1 0 0 0</pose>
+      <link name="link">
+        <visual name="visual"><geometry><box><size>20 0.2 2</size></box></geometry><material><ambient>0.6 0.6 0.6 1</ambient></material></visual>
+        <collision name="collision"><geometry><box><size>20 0.2 2</size></box></geometry></collision>
+      </link>
+    </model>
+
+    <model name="wall_west">
+      <static>true</static>
+      <pose>0 -10 1 0 0 0</pose>
+      <link name="link">
+        <visual name="visual"><geometry><box><size>20 0.2 2</size></box></geometry><material><ambient>0.6 0.6 0.6 1</ambient></material></visual>
+        <collision name="collision"><geometry><box><size>20 0.2 2</size></box></geometry></collision>
+      </link>
+    </model>
+
+    <!-- ── Physics settings ─────────────────────────────────────────── -->
+    <physics name="1ms" type="ignored">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <!-- ── Scene (background colour, ambient, sky) ─────────────────── -->
+    <scene>
+      <ambient>0.4 0.4 0.4 1</ambient>
+      <background>0.7 0.7 0.7 1</background>
+      <shadows>true</shadows>
+    </scene>
+
+  </world>
+</sdf>
