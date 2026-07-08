@@ -1,6 +1,6 @@
 # VisionNav: Wearable Assistive Navigation System
 
-![download]download.png)
+![download](download.png)
 
 ## Product Overview
 VisionNav is an intelligent, wearable assistive device engineered to act as a digital guide for individuals suffering from severe visual impairment or total blindness. The physical device consists of a comfortable, tactical-style chest harness equipped with environmental sensors, which connects to a discreet wearable processing unit and a wireless earpiece. By constantly scanning the surrounding environment, identifying everyday household objects, and measuring distances, the system can speak directly to the user to guide them safely through complex indoor spaces.
