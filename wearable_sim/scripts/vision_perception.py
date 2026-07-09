@@ -231,17 +231,22 @@ class VisionPerceptionNode(Node):
                             is_duplicate = False
                             for i, mapped in enumerate(self._mapped_locations):
                                 # Handle existing memory if script wasn't restarted
-                                if len(mapped) == 3: mapped = (*mapped, 0.0, 0)
-                                mapped_cid, m_x, m_y, m_conf, m_idx = mapped
+                                if len(mapped) == 3: mapped = (*mapped, 0.0, 0, "")
+                                if len(mapped) == 5: mapped = (*mapped, "")
+                                mapped_cid, m_x, m_y, m_conf, m_idx, m_label = mapped
                                 
-                                # If ANY object is within 1.5 meters, it's the SAME object!
-                                if math.hypot(px - m_x, py - m_y) < 1.5:
+                                # Increased to 3.0 meters to prevent double-pinning large objects (like sofas) from different angles!
+                                if math.hypot(px - m_x, py - m_y) < 3.0:
                                     is_duplicate = True
                                     # If the new AI classification is MORE confident than the old one, OVERWRITE IT!
-                                    # This fixes the Couch -> Chair flip when walking closer!
                                     if conf > m_conf and m_idx < len(self._saved_markers):
-                                        self._mapped_locations[i] = (cid, px, py, conf, m_idx)
-                                        self._saved_markers[m_idx].text = label.replace(" ", "_")
+                                        if cid != mapped_cid:
+                                            if not hasattr(self, '_class_counts'): self._class_counts = {}
+                                            self._class_counts[cid] = self._class_counts.get(cid, 0) + 1
+                                            m_label = f"{label.replace(' ', '_')}_{self._class_counts[cid]}"
+                                            
+                                        self._mapped_locations[i] = (cid, px, py, conf, m_idx, m_label)
+                                        self._saved_markers[m_idx].text = m_label
                                         self._saved_markers[m_idx].pose.position.x = px
                                         self._saved_markers[m_idx].pose.position.y = py
                                         # Update the floating sphere marker too
@@ -253,8 +258,12 @@ class VisionPerceptionNode(Node):
                             if is_duplicate:
                                 continue
                                 
+                            if not hasattr(self, '_class_counts'): self._class_counts = {}
+                            self._class_counts[cid] = self._class_counts.get(cid, 0) + 1
+                            final_label = f"{label.replace(' ', '_')}_{self._class_counts[cid]}"
+                                
                             m_idx = len(self._saved_markers)
-                            self._mapped_locations.append((cid, px, py, conf, m_idx))
+                            self._mapped_locations.append((cid, px, py, conf, m_idx, final_label))
                             
                             marker = Marker()
                             marker.header.frame_id = pt_global.header.frame_id
@@ -268,7 +277,7 @@ class VisionPerceptionNode(Node):
                             marker.pose.position.z = pt_global.point.z
                             marker.scale.z = 0.2
                             marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
-                            marker.text = label.replace(" ", "_")
+                            marker.text = final_label
                             self._saved_markers.append(marker)
                             
                             dot_marker = Marker()

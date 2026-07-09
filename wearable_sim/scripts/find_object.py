@@ -85,9 +85,19 @@ class FindObjectNode(Node):
             # If the user types "dining table", convert it to "dining_table" to match our RViz marker text!
             search_key = target.replace(" ", "_")
                 
+            # Allow matching generic terms like "chair" to specific labels like "chair_1"
+            matched_key = None
             if search_key in self.saved_objects:
-                print(f"✅ Route calculating for '{target}' using A* Obstacle Avoidance...")
-                self.draw_path_to(search_key)
+                matched_key = search_key
+            else:
+                for key in self.saved_objects.keys():
+                    if key.startswith(f"{search_key}_"):
+                        matched_key = key
+                        break
+                        
+            if matched_key:
+                print(f"✅ Route calculating for '{matched_key}' using A* Obstacle Avoidance...")
+                self.draw_path_to(matched_key)
             else:
                 print(f"❌ '{target}' has not been seen yet! Drive around to map it.")
 
