@@ -67,6 +67,9 @@ class FindObjectNode(Node):
     def input_loop(self):
         import time
         time.sleep(2)
+        
+        self.last_found_object = None
+        
         while rclpy.ok():
             if not self.saved_objects:
                 continue
@@ -77,30 +80,58 @@ class FindObjectNode(Node):
                 print(f"  - {obj}")
             print("==============================")
             
-            target = input("Enter the name of an object to find (or 'exit'): ").strip().lower()
+            target = input("\n🗣️ You (Type 'find <object>' or 'go to <object>'): ").strip().lower()
             if target == 'exit':
                 rclpy.shutdown()
                 break
                 
-            # If the user types "dining table", convert it to "dining_table" to match our RViz marker text!
-            search_key = target.replace(" ", "_")
+            if target.startswith("find "):
+                search_term = target.replace("find ", "").strip()
+                search_key = search_term.replace(" ", "_")
                 
-            # Allow matching generic terms like "chair" to specific labels like "chair_1"
-            matched_key = None
-            if search_key in self.saved_objects:
-                matched_key = search_key
-            else:
-                for key in self.saved_objects.keys():
-                    if key.startswith(f"{search_key}_"):
-                        matched_key = key
-                        break
+                matched_key = None
+                if search_key in self.saved_objects:
+                    matched_key = search_key
+                else:
+                    for key in self.saved_objects.keys():
+                        if key.startswith(f"{search_key}_"):
+                            matched_key = key
+                            break
+                            
+                if matched_key:
+                    print(f"🤖 System: '{search_term.capitalize()}' detected! You can now say 'go to {search_term}'.")
+                    self.last_found_object = matched_key
+                else:
+                    print(f"🤖 System: ❌ '{search_term}' has not been seen yet! Keep walking to map it.")
+                    
+            elif target.startswith("go to "):
+                dest_term = target.replace("go to ", "").strip()
+                
+                # Check if it matches the last found object loosely
+                if self.last_found_object and dest_term.replace(" ", "_") in self.last_found_object:
+                    print(f"🤖 System: ✅ Route calculating for '{self.last_found_object}' using A* Obstacle Avoidance...")
+                    self.draw_path_to(self.last_found_object)
+                    self.last_found_object = None # Reset after navigation
+                else:
+                    # Allow direct "go to" if they know the name
+                    search_key = dest_term.replace(" ", "_")
+                    matched_key = None
+                    if search_key in self.saved_objects:
+                        matched_key = search_key
+                    else:
+                        for key in self.saved_objects.keys():
+                            if key.startswith(f"{search_key}_"):
+                                matched_key = key
+                                break
+                    if matched_key:
+                        print(f"🤖 System: ✅ Route calculating for '{matched_key}' using A* Obstacle Avoidance...")
+                        self.draw_path_to(matched_key)
+                    else:
+                        print(f"🤖 System: ❌ I don't know where '{dest_term}' is. Try saying 'find {dest_term}' first.")
                         
-            if matched_key:
-                print(f"✅ Route calculating for '{matched_key}' using A* Obstacle Avoidance...")
-                self.draw_path_to(matched_key)
             else:
-                print(f"❌ '{target}' has not been seen yet! Drive around to map it.")
-
+                print("🤖 System: Unknown command. Please say 'find <object>' or 'go to <object>'.")
+                
     def world_to_grid(self, x, y, map_info):
         gx = int((x - map_info.origin.position.x) / map_info.resolution)
         gy = int((y - map_info.origin.position.y) / map_info.resolution)
