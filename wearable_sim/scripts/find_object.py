@@ -2,16 +2,16 @@
 """
 find_object.py
 --------------
-Interactive semantic navigation node with VOICE OUTPUT.
-Uses typed commands for input and Piper TTS for spoken turn-by-turn guidance.
-Shows A* path on the RViz map.
+Voice-guided semantic navigation node — like Google Maps for blind users.
 
 Flow:
   1. User drives robot with arrow_teleop → YOLO detects objects
   2. User types: find chair
   3. System SPEAKS: "Chair detected! Say go to chair."
   4. User types: go to chair
-  5. System calculates A* path, draws it on RViz, and SPEAKS directions
+  5. System calculates A* path, draws it on RViz
+  6. System gives CONTINUOUS turn-by-turn voice navigation:
+     "Go straight... Turn left now... Keep going, 12 feet... You have arrived."
 """
 
 import rclpy
@@ -22,12 +22,12 @@ import math
 import heapq
 import subprocess
 import os
+import time
 from visualization_msgs.msg import MarkerArray
 from nav_msgs.msg import Path, OccupancyGrid
 from geometry_msgs.msg import PoseStamped
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 
-# Get the directory where this script lives (for finding the Piper model)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 class FindObjectNode(Node):
@@ -36,7 +36,6 @@ class FindObjectNode(Node):
         
         self._marker_sub = self.create_subscription(MarkerArray, '/semantic_markers', self._marker_callback, 10)
         
-        # SLAM publishes map as Transient Local. We MUST match this!
         map_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
@@ -45,7 +44,6 @@ class FindObjectNode(Node):
         self._map_sub = self.create_subscription(OccupancyGrid, '/map', self._map_callback, map_qos)
         self._path_pub = self.create_publisher(Path, '/object_path', 10)
         
-        # Publish an empty path immediately so RViz discovers the topic in the "By topic" menu!
         empty_path = Path()
         empty_path.header.frame_id = 'map'
         self._path_pub.publish(empty_path)
@@ -56,6 +54,7 @@ class FindObjectNode(Node):
         self.saved_objects = {}
         self.map_data = None
         self.last_found_object = None
+        self.navigating = False  # True when actively guiding user
         
         self.get_logger().info("Find Object Node Started! Waiting for AI to map objects...")
         
@@ -64,7 +63,7 @@ class FindObjectNode(Node):
         self.thread.start()
 
     def speak(self, text):
-        """Speak text aloud using the Piper TTS female voice (Lessac)."""
+        """Speak text aloud using Piper TTS female voice."""
         print(f"🔊 Speaking: '{text}'")
         model_path = os.path.join(SCRIPT_DIR, "en_US-lessac-medium.onnx")
         wav_path = os.path.join(SCRIPT_DIR, "temp_voice.wav")
@@ -73,11 +72,9 @@ class FindObjectNode(Node):
 
     def _marker_callback(self, msg: MarkerArray):
         for marker in msg.markers:
-            # If the vision node sends a DELETEALL, wipe our memory
-            if marker.action == 3: # Marker.DELETEALL
+            if marker.action == 3:
                 self.saved_objects.clear()
                 continue
-                
             if marker.text:
                 obj_name = marker.text.lower()
                 self.saved_objects[obj_name] = marker.pose.position
@@ -86,7 +83,6 @@ class FindObjectNode(Node):
         self.map_data = msg
 
     def find_match(self, search_term):
-        """Find an object in saved_objects by exact match or prefix match."""
         search_key = search_term.replace(" ", "_")
         if search_key in self.saved_objects:
             return search_key
@@ -95,15 +91,43 @@ class FindObjectNode(Node):
                 return key
         return None
 
-    def input_loop(self):
-        import time
-        time.sleep(2)
+    def get_robot_pose(self):
+        """Get current robot position and heading from TF."""
+        try:
+            transform = self._tf_buffer.lookup_transform('map', 'base_footprint', rclpy.time.Time())
+            rx = transform.transform.translation.x
+            ry = transform.transform.translation.y
+            q = transform.transform.rotation
+            siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+            cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+            yaw = math.atan2(siny_cosp, cosy_cosp)
+            return rx, ry, yaw
+        except Exception:
+            return None
+
+    def get_relative_direction(self, robot_yaw, target_x, target_y, robot_x, robot_y):
+        """Calculate clock-face direction and turn instruction."""
+        target_angle = math.atan2(target_y - robot_y, target_x - robot_x)
+        rel_angle = target_angle - robot_yaw
+        while rel_angle > math.pi: rel_angle -= 2 * math.pi
+        while rel_angle < -math.pi: rel_angle += 2 * math.pi
         
+        clock_hr = int(round(12 - (rel_angle * 6 / math.pi))) % 12
+        if clock_hr == 0: clock_hr = 12
+        
+        return rel_angle, clock_hr
+
+    def input_loop(self):
+        time.sleep(2)
         self.speak("System ready. Drive around to detect objects.")
         
         while rclpy.ok():
             if not self.saved_objects:
                 time.sleep(1)
+                continue
+            
+            if self.navigating:
+                time.sleep(0.5)
                 continue
                 
             print("\n" + "=" * 40)
@@ -112,18 +136,16 @@ class FindObjectNode(Node):
                 print(f"  ✅ {obj}")
             print("=" * 40)
             
-            target = input("\n🗣️ Command (find <object> / go to <object> / exit): ").strip().lower()
+            target = input("\n🗣️ Command (find / go to / exit): ").strip().lower()
             
             if target == 'exit':
                 self.speak("Shutting down.")
                 rclpy.shutdown()
                 break
                 
-            # --- FIND COMMAND ---
             if target.startswith("find "):
                 search_term = target.replace("find ", "").strip()
                 matched = self.find_match(search_term)
-                
                 if matched:
                     friendly_name = matched.replace("_", " ")
                     self.speak(f"{friendly_name} detected! Say go to {search_term}.")
@@ -131,11 +153,8 @@ class FindObjectNode(Node):
                 else:
                     self.speak(f"{search_term} has not been seen yet. Keep walking.")
                     
-            # --- GO TO COMMAND ---
             elif target.startswith("go to "):
                 dest_term = target.replace("go to ", "").strip()
-                
-                # Try last found object first
                 matched = None
                 if self.last_found_object and dest_term.replace(" ", "_") in self.last_found_object:
                     matched = self.last_found_object
@@ -144,14 +163,149 @@ class FindObjectNode(Node):
                 
                 if matched:
                     friendly_name = matched.replace("_", " ")
-                    self.speak(f"Calculating route to {friendly_name}.")
-                    self.draw_path_to(matched)
+                    self.speak(f"Starting navigation to {friendly_name}.")
+                    # Launch navigation in a separate thread so input loop stays free
+                    nav_thread = threading.Thread(target=self.navigate_to, args=(matched,))
+                    nav_thread.daemon = True
+                    nav_thread.start()
                     self.last_found_object = None
                 else:
-                    self.speak(f"I don't know where {dest_term} is. Try find {dest_term} first.")
+                    self.speak(f"I don't know where {dest_term} is.")
             else:
-                print("❓ Unknown command. Use: find <object> or go to <object>")
+                print("❓ Use: find <object> or go to <object>")
+
+    # =============================================
+    # CONTINUOUS TURN-BY-TURN NAVIGATION (like Google Maps)
+    # =============================================
+    def navigate_to(self, target_name):
+        """Continuously guide the user to the target with voice instructions."""
+        self.navigating = True
+        friendly_name = target_name.replace("_", " ")
+        
+        if self.map_data is None:
+            self.speak("No map available yet.")
+            self.navigating = False
+            return
+        
+        target_pos = self.saved_objects.get(target_name)
+        if not target_pos:
+            self.speak(f"Lost track of {friendly_name}.")
+            self.navigating = False
+            return
+            
+        tx, ty = target_pos.x, target_pos.y
+        
+        last_instruction = ""
+        recalc_counter = 0
+        arrival_threshold = 1.5  # meters — "you have arrived"
+        
+        print("\n" + "=" * 50)
+        print(f"🧭 NAVIGATING TO: {friendly_name}")
+        print("   Type 'stop' to cancel navigation")
+        print("=" * 50)
+        
+        while rclpy.ok() and self.navigating:
+            pose = self.get_robot_pose()
+            if pose is None:
+                time.sleep(0.5)
+                continue
                 
+            rx, ry, robot_yaw = pose
+            dist_to_target = math.hypot(tx - rx, ty - ry)
+            dist_ft = dist_to_target * 3.28084
+            
+            # ---- ARRIVAL CHECK ----
+            if dist_to_target < arrival_threshold:
+                self.speak(f"You have arrived at {friendly_name}. It should be within reach.")
+                self._path_pub.publish(Path(header=PoseStamped().header))  # Clear path
+                empty_path = Path()
+                empty_path.header.frame_id = 'map'
+                self._path_pub.publish(empty_path)
+                break
+            
+            # ---- RECALCULATE A* PATH every 3 cycles (1.5 seconds) ----
+            recalc_counter += 1
+            if recalc_counter % 3 == 1:
+                grid_path = self._calculate_path(rx, ry, tx, ty)
+                if grid_path:
+                    self._publish_path(grid_path)
+            
+            # ---- FIND NEXT WAYPOINT (~2m ahead on path) ----
+            if grid_path:
+                waypoint_x, waypoint_y = tx, ty
+                for (gx, gy) in grid_path:
+                    wx, wy = self.grid_to_world(gx, gy, self.map_data.info)
+                    if math.hypot(wx - rx, wy - ry) >= 2.0:
+                        waypoint_x, waypoint_y = wx, wy
+                        break
+            else:
+                waypoint_x, waypoint_y = tx, ty
+            
+            # ---- CALCULATE DIRECTION ----
+            rel_angle, clock_hr = self.get_relative_direction(robot_yaw, waypoint_x, waypoint_y, rx, ry)
+            abs_angle_deg = abs(math.degrees(rel_angle))
+            
+            # ---- GENERATE INSTRUCTION ----
+            if abs_angle_deg > 45:
+                # Big turn needed
+                direction = "left" if rel_angle > 0 else "right"
+                if dist_ft > 15:
+                    instruction = f"Turn {direction} to your {clock_hr} o clock. {int(dist_ft)} feet remaining."
+                else:
+                    instruction = f"Turn {direction} now. Almost there."
+            elif abs_angle_deg > 15:
+                # Slight correction
+                direction = "slightly left" if rel_angle > 0 else "slightly right"
+                if dist_ft > 15:
+                    instruction = f"Bear {direction}. {int(dist_ft)} feet to go."
+                else:
+                    instruction = f"Bear {direction}. Almost there."
+            else:
+                # Going straight
+                if dist_ft > 30:
+                    instruction = f"Keep going straight. {int(dist_ft)} feet remaining."
+                elif dist_ft > 10:
+                    instruction = f"Continue straight. {int(dist_ft)} feet to go."
+                else:
+                    instruction = f"Almost there. {int(dist_ft)} feet."
+            
+            # ---- SPEAK ONLY WHEN INSTRUCTION CHANGES ----
+            # (Don't spam "go straight" every 0.5 seconds)
+            instruction_type = instruction.split(".")[0]  # Compare just the first part
+            if instruction_type != last_instruction:
+                self.speak(instruction)
+                last_instruction = instruction_type
+            else:
+                # Print silently so terminal shows progress
+                print(f"  📍 {instruction}")
+            
+            time.sleep(0.5)
+        
+        self.navigating = False
+        print("\n✅ Navigation ended.\n")
+
+    def _calculate_path(self, rx, ry, tx, ty):
+        """Calculate A* path from robot to target."""
+        if self.map_data is None:
+            return None
+        start_grid = self.world_to_grid(rx, ry, self.map_data.info)
+        goal_grid = self.world_to_grid(tx, ty, self.map_data.info)
+        return self.a_star(start_grid, goal_grid, self.map_data)
+
+    def _publish_path(self, grid_path):
+        """Publish the path to RViz."""
+        path = Path()
+        path.header.frame_id = 'map'
+        path.header.stamp = self.get_clock().now().to_msg()
+        for (gx, gy) in grid_path:
+            wx, wy = self.grid_to_world(gx, gy, self.map_data.info)
+            pose = PoseStamped()
+            pose.header = path.header
+            pose.pose.position.x = wx
+            pose.pose.position.y = wy
+            path.poses.append(pose)
+        self._path_pub.publish(path)
+
     def world_to_grid(self, x, y, map_info):
         gx = int((x - map_info.origin.position.x) / map_info.resolution)
         gy = int((y - map_info.origin.position.y) / map_info.resolution)
@@ -167,21 +321,15 @@ class FindObjectNode(Node):
         h = map_msg.info.height
         data = map_msg.data
         
-        # We dilate obstacles slightly by expanding the cost to avoid wall scraping
         def is_free(gx, gy):
             if gx < 0 or gx >= w or gy < 0 or gy >= h: return False
-            
-            # Inflate obstacles by 2 cells (0.1 meters) to gently avoid walls without trapping the robot
             for dx in range(-2, 3):
                 for dy in range(-2, 3):
-                    # Check if within a circle to make smooth corners
                     if dx*dx + dy*dy > 4:
                         continue
-                        
                     nx, ny = gx + dx, gy + dy
                     if 0 <= nx < w and 0 <= ny < h:
                         val = data[ny * w + nx]
-                        # >= 50 is an obstacle. -1 is unknown space (grey area).
                         if val >= 50 or val == -1:
                             return False
             return True
@@ -191,19 +339,13 @@ class FindObjectNode(Node):
         
         open_set = []
         heapq.heappush(open_set, (0, sx, sy))
-        
         came_from = {}
         g_score = {(sx, sy): 0}
-        
-        # Track the closest node we've ever seen, so if we fail, we return the closest possible path!
         best_node = (sx, sy)
         min_dist = math.hypot(sx - gx, sy - gy)
 
         while open_set:
             _, cx, cy = heapq.heappop(open_set)
-            
-            # Since we inflated walls by 2 cells (0.1m), objects near walls are technically "blocked".
-            # Stop pathfinding safely 3 cells (0.15m) in front of the object!
             dist = math.hypot(cx - gx, cy - gy)
             
             if dist < min_dist:
@@ -219,23 +361,18 @@ class FindObjectNode(Node):
                 path.reverse()
                 return path
                 
-            # Use 8-connected routing for smooth, optimal, diagonal paths.
             for dx, dy in [(0,1), (1,0), (0,-1), (-1,0), (1,1), (-1,-1), (1,-1), (-1,1)]:
                 nx, ny = cx + dx, cy + dy
                 if not is_free(nx, ny):
                     continue
-                    
                 cost = 1.414 if dx != 0 and dy != 0 else 1.0
                 tentative_g = g_score[(cx, cy)] + cost
-                
                 if (nx, ny) not in g_score or tentative_g < g_score[(nx, ny)]:
                     came_from[(nx, ny)] = (cx, cy)
                     g_score[(nx, ny)] = tentative_g
                     f_score = tentative_g + math.hypot(gx - nx, gy - ny)
                     heapq.heappush(open_set, (f_score, nx, ny))
                     
-        # If we exhausted all options and failed, return the path to the closest node we found!
-        print("⚠️ Object is trapped inside a wall. Returning closest possible path!")
         path = []
         curr = best_node
         while curr in came_from:
@@ -243,91 +380,6 @@ class FindObjectNode(Node):
             curr = came_from[curr]
         path.reverse()
         return path
-
-    def draw_path_to(self, target_name):
-        if self.map_data is None:
-            self.speak("No map available yet. Keep walking.")
-            return
-            
-        try:
-            transform = self._tf_buffer.lookup_transform('map', 'base_footprint', rclpy.time.Time())
-            rx = transform.transform.translation.x
-            ry = transform.transform.translation.y
-            
-            target_pos = self.saved_objects[target_name]
-            tx, ty = target_pos.x, target_pos.y
-            
-            start_grid = self.world_to_grid(rx, ry, self.map_data.info)
-            goal_grid = self.world_to_grid(tx, ty, self.map_data.info)
-            
-            grid_path = self.a_star(start_grid, goal_grid, self.map_data)
-            
-            if not grid_path:
-                self.speak("Path blocked by walls. Cannot reach that object.")
-                return
-                
-            # --- PUBLISH PATH TO RVIZ ---
-            path = Path()
-            path.header.frame_id = 'map'
-            path.header.stamp = self.get_clock().now().to_msg()
-            
-            for (gx, gy) in grid_path:
-                wx, wy = self.grid_to_world(gx, gy, self.map_data.info)
-                pose = PoseStamped()
-                pose.header = path.header
-                pose.pose.position.x = wx
-                pose.pose.position.y = wy
-                path.poses.append(pose)
-                
-            self._path_pub.publish(path)
-            print("✅ Path published to RViz on /object_path")
-            
-            # --- NATURAL LANGUAGE NAVIGATION GUIDE ---
-            # 1. Calculate robot's current heading (yaw)
-            q = transform.transform.rotation
-            siny_cosp = 2 * (q.w * q.z + q.x * q.y)
-            cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
-            robot_yaw = math.atan2(siny_cosp, cosy_cosp)
-            
-            # 2. Pick a local target ~1.5m ahead on the path to guide them towards
-            target_wx, target_wy = rx, ry
-            for (gx, gy) in grid_path:
-                wx, wy = self.grid_to_world(gx, gy, self.map_data.info)
-                if math.hypot(wx - rx, wy - ry) >= 1.5:
-                    target_wx, target_wy = wx, wy
-                    break
-            else:
-                target_wx, target_wy = tx, ty  # default to the actual object
-                
-            # 3. Calculate relative angle
-            target_angle = math.atan2(target_wy - ry, target_wx - rx)
-            rel_angle = target_angle - robot_yaw
-            while rel_angle > math.pi: rel_angle -= 2 * math.pi
-            while rel_angle < -math.pi: rel_angle += 2 * math.pi
-            
-            # 4. Convert to clock face (12 = straight, 9 = left, 3 = right)
-            clock_hr = int(round(12 - (rel_angle * 6 / math.pi))) % 12
-            if clock_hr == 0: clock_hr = 12
-            
-            final_dist_m = math.hypot(tx - rx, ty - ry)
-            final_dist_ft = final_dist_m * 3.28084
-            
-            # 5. Generate and SPEAK the navigation instruction
-            friendly_name = target_name.replace("_", " ")
-            if abs(rel_angle) < 0.4:
-                nav_msg = f"Go straight ahead for {int(final_dist_ft)} feet to reach {friendly_name}."
-            else:
-                dir_str = "left" if rel_angle > 0 else "right"
-                nav_msg = f"Turn {dir_str} to your {clock_hr} o clock, then walk {int(final_dist_ft)} feet to reach {friendly_name}."
-            
-            print("\n" + "=" * 40)
-            print(f"🧭 NAVIGATION: {nav_msg}")
-            print("=" * 40)
-            self.speak(nav_msg)
-            
-        except Exception as e:
-            print(f"⚠️ Could not calculate path. Error: {e}")
-            self.speak("Error calculating route. Try again.")
 
 def main(args=None):
     rclpy.init(args=args)
