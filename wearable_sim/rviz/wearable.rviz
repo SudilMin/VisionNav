@@ -11,18 +11,30 @@ Visualization Manager:
       Name: Map
       Topic:
         Value: /map
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
     - Class: rviz_default_plugins/Path
       Enabled: true
-      Name: Path
+      Name: Navigation Path
       Topic:
         Value: /object_path
+        Reliability Policy: Reliable
       Line Style: Lines
-      Color: 0; 255; 0
+      Line Width: 0.05
+      Color: 255; 50; 50
+      Offset:
+        Z: 0.1
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
-      Name: MarkerArray
+      Name: Semantic Markers
       Topic:
         Value: /semantic_markers
+    - Class: rviz_default_plugins/TF
+      Enabled: true
+      Name: TF
+      Show Names: false
+      Show Arrows: false
+      Show Axes: true
   Global Options:
     Fixed Frame: map
     Frame Rate: 30

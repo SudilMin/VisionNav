@@ -34,11 +34,11 @@
       <geometry><box size="0.50 0.40 0.10"/></geometry>
     </collision>
     <inertial>
-      <mass value="80.0"/>
+      <mass value="1.0"/>
       <origin xyz="0 0 -0.04" rpy="0 0 0"/><!-- CoM near bottom -->
-      <inertia ixx="0.547" ixy="0" ixz="0"
-               iyy="0.440" iyz="0"
-               izz="0.947"/>
+      <inertia ixx="0.05" ixy="0" ixz="0"
+               iyy="0.04" iyz="0"
+               izz="0.09"/>
     </inertial>
   </link>
 
@@ -303,28 +303,28 @@
     <mu1>2.0</mu1><mu2>1.0</mu2><kp>1e6</kp><kd>100</kd>
   </gazebo>
   <gazebo reference="rear_left_caster">
-    <mu1>0.01</mu1><mu2>0.01</mu2>
+    <mu>0.0</mu><mu2>0.0</mu2>
   </gazebo>
   <gazebo reference="rear_right_caster">
-    <mu1>0.01</mu1><mu2>0.01</mu2>
+    <mu>0.0</mu><mu2>0.0</mu2>
   </gazebo>
 
-  <!-- Differential Drive -->
+  <!-- Kinematic Velocity Control (Guarantees movement without friction bugs) -->
   <gazebo>
-    <plugin filename="gz-sim-diff-drive-system"
-            name="gz::sim::systems::DiffDrive">
-      <left_joint>left_wheel_joint</left_joint>
-      <right_joint>right_wheel_joint</right_joint>
-      <wheel_separation>0.44</wheel_separation>
-      <wheel_radius>0.06</wheel_radius>
-      <max_linear_acceleration>1.0</max_linear_acceleration>
-      <max_angular_acceleration>2.0</max_angular_acceleration>
-      <odom_publish_frequency>50</odom_publish_frequency>
-      <topic>/cmd_vel</topic>
+    <plugin filename="gz-sim-velocity-control-system"
+            name="gz::sim::systems::VelocityControl">
+    </plugin>
+  </gazebo>
+
+  <!-- Publish Odometry and TF for SLAM -->
+  <gazebo>
+    <plugin filename="gz-sim-odometry-publisher-system"
+            name="gz::sim::systems::OdometryPublisher">
+      <odom_frame>odom</odom_frame>
+      <robot_base_frame>base_footprint</robot_base_frame>
       <odom_topic>/odom</odom_topic>
       <tf_topic>/tf</tf_topic>
-      <frame_id>odom</frame_id>
-      <child_frame_id>base_footprint</child_frame_id>
+      <odom_publish_frequency>50</odom_publish_frequency>
     </plugin>
   </gazebo>
 
