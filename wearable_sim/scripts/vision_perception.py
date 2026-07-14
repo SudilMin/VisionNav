@@ -18,7 +18,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, LaserScan
 from visualization_msgs.msg import Marker, MarkerArray
-from std_msgs.msg import ColorRGBA
+from std_msgs.msg import ColorRGBA, String
 from geometry_msgs.msg import PointStamped
 import tf2_ros
 import tf2_geometry_msgs
@@ -91,6 +91,11 @@ class VisionPerceptionNode(Node):
         delete_marker = Marker()
         delete_marker.action = Marker.DELETEALL
         self._marker_pub.publish(MarkerArray(markers=[delete_marker]))
+        
+        # Hazard Tracking
+        self._hazard_pub = self.create_publisher(String, "/hazard_warning", 10)
+        self._hazard_history = {}  # {label_id: (cx, cy, area, time)}
+        self._hazard_classes = ["person", "bicycle", "car", "motorcycle", "bus", "truck"]
 
     def _scan_callback(self, msg: LaserScan) -> None:
         self._latest_scan = msg
@@ -152,7 +157,8 @@ class VisionPerceptionNode(Node):
                 "chair", "couch", "dining table", "bed", "toilet", "tv", "laptop", "mouse", 
                 "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", 
                 "refrigerator", "book", "clock", "vase", "bottle", "wine glass", "cup", "fork", 
-                "knife", "spoon", "bowl", "potted plant"
+                "knife", "spoon", "bowl", "potted plant",
+                "person", "bicycle", "car", "motorcycle", "bus", "truck"  # Hazard classes
             ]
             
             label_name = COCO_CLASSES[class_id]
@@ -182,13 +188,16 @@ class VisionPerceptionNode(Node):
 
         self._cached_boxes = []
         
+        # Keep track of current frame hazards
+        current_hazards = {}
+        
         for idx in indices:
             x1, y1, bw_, bh_ = boxes[idx]
             x2, y2 = x1 + bw_, y1 + bh_
             cid = class_ids[idx]
             conf = confidences[idx]
             label = COCO_CLASSES[cid]
-            color = (0, 255, 0)
+            color = (0, 0, 255) if label in self._hazard_classes else (0, 255, 0)
 
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness=2)
             label_text = f"{label}: {conf * 100:.1f}%"
@@ -199,6 +208,48 @@ class VisionPerceptionNode(Node):
 
             self._cached_boxes.append((x1, y1, x2, y2, color, label_text))
             
+            # ============================================
+            # MOVING HAZARD TRACKING (Dynamic Danger Zones)
+            # ============================================
+            if label in self._hazard_classes:
+                cx_box = x1 + bw_ / 2.0
+                cy_box = y1 + bh_ / 2.0
+                area = bw_ * bh_
+                now_time = time.monotonic()
+                
+                # Check if it's in the center of the camera frame (roughly middle third)
+                if 200 < cx_box < 440:
+                    matched_id = None
+                    # Try to match with a previous hazard of the same class
+                    for h_id, (prev_cx, prev_cy, prev_area, prev_time) in self._hazard_history.items():
+                        if h_id.startswith(label):
+                            # If centers are close (tracking the same object)
+                            if math.hypot(cx_box - prev_cx, cy_box - prev_cy) < 100:
+                                matched_id = h_id
+                                break
+                    
+                    if matched_id:
+                        _, _, prev_area, prev_time = self._hazard_history[matched_id]
+                        time_diff = now_time - prev_time
+                        
+                        # If area increased by > 15% in less than 1 second, it's approaching rapidly!
+                        if area > prev_area * 1.15 and time_diff < 1.0 and area > 10000:
+                            msg = String()
+                            msg.data = f"EMERGENCY BRAKE! {label.upper()} is rapidly approaching!"
+                            self._hazard_pub.publish(msg)
+                            self.get_logger().warn(msg.data)
+                            color = (0, 0, 255) # Red box for danger!
+                            
+                        current_hazards[matched_id] = (cx_box, cy_box, area, now_time)
+                    else:
+                        # New hazard
+                        new_id = f"{label}_{len(current_hazards)}"
+                        current_hazards[new_id] = (cx_box, cy_box, area, now_time)
+            
+            # Skip physical mapping for hazards (they move!)
+            if label in self._hazard_classes:
+                continue
+
             if self._latest_scan is not None:
                 scan = self._latest_scan
                 cx = x1 + bw_ / 2.0
@@ -333,6 +384,9 @@ class VisionPerceptionNode(Node):
                     
                 except Exception:
                     pass
+
+        # Update hazard history for the next frame
+        self._hazard_history = current_hazards
 
         if self._saved_markers:
             self._marker_pub.publish(MarkerArray(markers=self._saved_markers))

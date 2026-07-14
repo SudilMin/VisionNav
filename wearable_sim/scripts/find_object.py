@@ -26,6 +26,7 @@ import time
 from visualization_msgs.msg import MarkerArray
 from nav_msgs.msg import Path, OccupancyGrid
 from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import String
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -55,6 +56,10 @@ class FindObjectNode(Node):
         self.map_data = None
         self.last_found_object = None
         self.navigating = False  # True when actively guiding user
+        self.last_hazard_time = 0.0
+        
+        # Listen for Emergency Hazards from vision node
+        self._hazard_sub = self.create_subscription(String, '/hazard_warning', self._hazard_callback, 10)
         
         self.get_logger().info("Find Object Node Started! Waiting for AI to map objects...")
         
@@ -69,6 +74,22 @@ class FindObjectNode(Node):
         wav_path = os.path.join(SCRIPT_DIR, "temp_voice.wav")
         command = f"echo '{text}' | piper --model {model_path} --output_file {wav_path} 2>/dev/null && aplay {wav_path} -q 2>/dev/null"
         subprocess.run(command, shell=True)
+
+    def _hazard_callback(self, msg: String):
+        """Emergency interrupt when a moving hazard is detected."""
+        now = time.time()
+        # Prevent TTS spam (only alert once every 3 seconds)
+        if now - self.last_hazard_time > 3.0:
+            self.last_hazard_time = now
+            # Hard stop any current navigation
+            if self.navigating:
+                self.navigating = False
+                print("\n🛑 NAVIGATION CANCELED DUE TO EMERGENCY HAZARD 🛑")
+                # Clear path from RViz
+                self._path_pub.publish(Path(header=PoseStamped().header))
+            
+            # Yell the warning
+            self.speak(msg.data)
 
     def _marker_callback(self, msg: MarkerArray):
         for marker in msg.markers:

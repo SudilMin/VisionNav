@@ -169,6 +169,14 @@
         <collision name="collision"><geometry><box><size>20 0.2 2</size></box></geometry></collision>
       </link>
     </model>
+    
+    <!-- ── Moving Hazard Test (Person) ────────────────────────────── -->
+    <include>
+      <name>test_person</name>
+      <uri>https://fuel.gazebosim.org/1.0/OpenRobotics/models/Walking person</uri>
+      <!-- Placed 8 meters directly in front of the robot (assuming robot spawns at 0,0) -->
+      <pose>8.0 0 0 0 0 -1.57</pose>
+    </include>
 
     <!-- ── Physics settings ─────────────────────────────────────────── -->
     <physics name="1ms" type="ignored">
