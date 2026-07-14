@@ -2,9 +2,16 @@
 """
 find_object.py
 --------------
-Interactive semantic navigation node. It listens for permanent AI object markers
-and uses the A* algorithm on the 2D SLAM OccupancyGrid map to calculate the 
-shortest collision-free path to the requested object!
+Interactive semantic navigation node with VOICE OUTPUT.
+Uses typed commands for input and Piper TTS for spoken turn-by-turn guidance.
+Shows A* path on the RViz map.
+
+Flow:
+  1. User drives robot with arrow_teleop → YOLO detects objects
+  2. User types: find chair
+  3. System SPEAKS: "Chair detected! Say go to chair."
+  4. User types: go to chair
+  5. System calculates A* path, draws it on RViz, and SPEAKS directions
 """
 
 import rclpy
@@ -13,10 +20,15 @@ import tf2_ros
 import threading
 import math
 import heapq
+import subprocess
+import os
 from visualization_msgs.msg import MarkerArray
 from nav_msgs.msg import Path, OccupancyGrid
 from geometry_msgs.msg import PoseStamped
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+
+# Get the directory where this script lives (for finding the Piper model)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 class FindObjectNode(Node):
     def __init__(self):
@@ -43,12 +55,21 @@ class FindObjectNode(Node):
         
         self.saved_objects = {}
         self.map_data = None
+        self.last_found_object = None
         
         self.get_logger().info("Find Object Node Started! Waiting for AI to map objects...")
         
         self.thread = threading.Thread(target=self.input_loop)
         self.thread.daemon = True
         self.thread.start()
+
+    def speak(self, text):
+        """Speak text aloud using the Piper TTS female voice (Lessac)."""
+        print(f"🔊 Speaking: '{text}'")
+        model_path = os.path.join(SCRIPT_DIR, "en_US-lessac-medium.onnx")
+        wav_path = os.path.join(SCRIPT_DIR, "temp_voice.wav")
+        command = f"echo '{text}' | piper --model {model_path} --output_file {wav_path} 2>/dev/null && aplay {wav_path} -q 2>/dev/null"
+        subprocess.run(command, shell=True)
 
     def _marker_callback(self, msg: MarkerArray):
         for marker in msg.markers:
@@ -64,73 +85,72 @@ class FindObjectNode(Node):
     def _map_callback(self, msg: OccupancyGrid):
         self.map_data = msg
 
+    def find_match(self, search_term):
+        """Find an object in saved_objects by exact match or prefix match."""
+        search_key = search_term.replace(" ", "_")
+        if search_key in self.saved_objects:
+            return search_key
+        for key in self.saved_objects.keys():
+            if key.startswith(f"{search_key}_"):
+                return key
+        return None
+
     def input_loop(self):
         import time
         time.sleep(2)
         
-        self.last_found_object = None
+        self.speak("System ready. Drive around to detect objects.")
         
         while rclpy.ok():
             if not self.saved_objects:
+                time.sleep(1)
                 continue
                 
-            print("\n==============================")
-            print("🔍 PERMANENT OBJECTS MAPPED:")
+            print("\n" + "=" * 40)
+            print("🔍 DETECTED OBJECTS:")
             for obj in self.saved_objects.keys():
-                print(f"  - {obj}")
-            print("==============================")
+                print(f"  ✅ {obj}")
+            print("=" * 40)
             
-            target = input("\n🗣️ You (Type 'find <object>' or 'go to <object>'): ").strip().lower()
+            target = input("\n🗣️ Command (find <object> / go to <object> / exit): ").strip().lower()
+            
             if target == 'exit':
+                self.speak("Shutting down.")
                 rclpy.shutdown()
                 break
                 
+            # --- FIND COMMAND ---
             if target.startswith("find "):
                 search_term = target.replace("find ", "").strip()
-                search_key = search_term.replace(" ", "_")
+                matched = self.find_match(search_term)
                 
-                matched_key = None
-                if search_key in self.saved_objects:
-                    matched_key = search_key
+                if matched:
+                    friendly_name = matched.replace("_", " ")
+                    self.speak(f"{friendly_name} detected! Say go to {search_term}.")
+                    self.last_found_object = matched
                 else:
-                    for key in self.saved_objects.keys():
-                        if key.startswith(f"{search_key}_"):
-                            matched_key = key
-                            break
-                            
-                if matched_key:
-                    print(f"🤖 System: '{search_term.capitalize()}' detected! You can now say 'go to {search_term}'.")
-                    self.last_found_object = matched_key
-                else:
-                    print(f"🤖 System: ❌ '{search_term}' has not been seen yet! Keep walking to map it.")
+                    self.speak(f"{search_term} has not been seen yet. Keep walking.")
                     
+            # --- GO TO COMMAND ---
             elif target.startswith("go to "):
                 dest_term = target.replace("go to ", "").strip()
                 
-                # Check if it matches the last found object loosely
+                # Try last found object first
+                matched = None
                 if self.last_found_object and dest_term.replace(" ", "_") in self.last_found_object:
-                    print(f"🤖 System: ✅ Route calculating for '{self.last_found_object}' using A* Obstacle Avoidance...")
-                    self.draw_path_to(self.last_found_object)
-                    self.last_found_object = None # Reset after navigation
+                    matched = self.last_found_object
                 else:
-                    # Allow direct "go to" if they know the name
-                    search_key = dest_term.replace(" ", "_")
-                    matched_key = None
-                    if search_key in self.saved_objects:
-                        matched_key = search_key
-                    else:
-                        for key in self.saved_objects.keys():
-                            if key.startswith(f"{search_key}_"):
-                                matched_key = key
-                                break
-                    if matched_key:
-                        print(f"🤖 System: ✅ Route calculating for '{matched_key}' using A* Obstacle Avoidance...")
-                        self.draw_path_to(matched_key)
-                    else:
-                        print(f"🤖 System: ❌ I don't know where '{dest_term}' is. Try saying 'find {dest_term}' first.")
-                        
+                    matched = self.find_match(dest_term)
+                
+                if matched:
+                    friendly_name = matched.replace("_", " ")
+                    self.speak(f"Calculating route to {friendly_name}.")
+                    self.draw_path_to(matched)
+                    self.last_found_object = None
+                else:
+                    self.speak(f"I don't know where {dest_term} is. Try find {dest_term} first.")
             else:
-                print("🤖 System: Unknown command. Please say 'find <object>' or 'go to <object>'.")
+                print("❓ Unknown command. Use: find <object> or go to <object>")
                 
     def world_to_grid(self, x, y, map_info):
         gx = int((x - map_info.origin.position.x) / map_info.resolution)
@@ -226,7 +246,7 @@ class FindObjectNode(Node):
 
     def draw_path_to(self, target_name):
         if self.map_data is None:
-            print("⚠️ No SLAM map received yet!")
+            self.speak("No map available yet. Keep walking.")
             return
             
         try:
@@ -243,9 +263,10 @@ class FindObjectNode(Node):
             grid_path = self.a_star(start_grid, goal_grid, self.map_data)
             
             if not grid_path:
-                print("❌ A* Algorithm Failed! The object is completely blocked by walls.")
+                self.speak("Path blocked by walls. Cannot reach that object.")
                 return
                 
+            # --- PUBLISH PATH TO RVIZ ---
             path = Path()
             path.header.frame_id = 'map'
             path.header.stamp = self.get_clock().now().to_msg()
@@ -259,6 +280,7 @@ class FindObjectNode(Node):
                 path.poses.append(pose)
                 
             self._path_pub.publish(path)
+            print("✅ Path published to RViz on /object_path")
             
             # --- NATURAL LANGUAGE NAVIGATION GUIDE ---
             # 1. Calculate robot's current heading (yaw)
@@ -290,18 +312,22 @@ class FindObjectNode(Node):
             final_dist_m = math.hypot(tx - rx, ty - ry)
             final_dist_ft = final_dist_m * 3.28084
             
-            print(f"🚀 Optimal A* Path generated! Target is {final_dist_ft:.1f}ft away.")
-            print("\n==============================")
-            print("🔊 VOICE NAVIGATION GUIDE:")
+            # 5. Generate and SPEAK the navigation instruction
+            friendly_name = target_name.replace("_", " ")
             if abs(rel_angle) < 0.4:
-                print(f"  -> 'Go straight ahead for {final_dist_ft:.1f} feet.'")
+                nav_msg = f"Go straight ahead for {int(final_dist_ft)} feet to reach {friendly_name}."
             else:
                 dir_str = "left" if rel_angle > 0 else "right"
-                print(f"  -> 'Turn {dir_str} to your {clock_hr} o'clock direction, then walk {final_dist_ft:.1f} feet.'")
-            print("==============================\n")
+                nav_msg = f"Turn {dir_str} to your {clock_hr} o clock, then walk {int(final_dist_ft)} feet to reach {friendly_name}."
+            
+            print("\n" + "=" * 40)
+            print(f"🧭 NAVIGATION: {nav_msg}")
+            print("=" * 40)
+            self.speak(nav_msg)
             
         except Exception as e:
-            print(f"⚠️ Could not calculate A* path. Error: {e}")
+            print(f"⚠️ Could not calculate path. Error: {e}")
+            self.speak("Error calculating route. Try again.")
 
 def main(args=None):
     rclpy.init(args=args)

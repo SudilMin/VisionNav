@@ -95,7 +95,7 @@ def generate_launch_description():
             '/joint_states@sensor_msgs/msg/JointState[gz.msgs.Model',
 
             # Drive command: ROS 2 → Gazebo
-            '/cmd_vel@geometry_msgs/msg/Twist]gz.msgs.Twist',
+            '/model/blind_assist_wearable/cmd_vel@geometry_msgs/msg/Twist]gz.msgs.Twist',
 
             # Odometry: Gazebo → ROS 2
             '/odom@nav_msgs/msg/Odometry[gz.msgs.Odometry',
@@ -104,7 +104,8 @@ def generate_launch_description():
             '/tf@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V',
         ],
         remappings=[
-            ('/lidar/points/points', '/lidar/points')
+            ('/lidar/points/points', '/lidar/points'),
+            ('/model/blind_assist_wearable/cmd_vel', '/cmd_vel')
         ],
         output='screen',
         parameters=[{'use_sim_time': True}]

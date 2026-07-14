@@ -1,115 +1,79 @@
 #!/usr/bin/env python3
 """
-arrow_teleop.py
-===============
-Drive the wearable human dummy with arrow keys.
-
-  ↑  Forward       ↓  Backward
-  ←  Turn left     →  Turn right
-  Space / any other key : stop
-  Q or Ctrl-C : quit
-
-Usage
------
-  python3 ~/wearable_ws/src/wearable_sim/scripts/arrow_teleop.py
+arrow_teleop.py - Arrow key teleop using curses for reliable key capture.
+Publishes Twist to /cmd_vel. Stops instantly when keys are released.
 """
-
 import curses
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
-
-LINEAR_STEP  = 0.10   # m/s increment per keypress
-ANGULAR_STEP = 0.15   # rad/s increment per keypress
-MAX_LINEAR   = 1.50   # m/s
-MAX_ANGULAR  = 2.00   # rad/s
-
+import threading
 
 class ArrowTeleop(Node):
     def __init__(self):
-        super().__init__("arrow_teleop")
-        self._pub = self.create_publisher(Twist, "/cmd_vel", 10)
-        self._lin = 0.0
-        self._ang = 0.0
+        super().__init__('arrow_teleop')
+        self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.speed = 0.8
+        self.turn = 1.2
 
-    def publish(self):
-        msg = Twist()
-        msg.linear.x  = self._lin
-        msg.angular.z = self._ang
-        self._pub.publish(msg)
+def ros_spin(node):
+    rclpy.spin(node)
 
-    def stop(self):
-        self._lin = 0.0
-        self._ang = 0.0
-        self.publish()
+def safe_addstr(stdscr, y, x, text):
+    """Write text to screen, silently ignoring if terminal is too small."""
+    try:
+        stdscr.addstr(y, x, text)
+    except curses.error:
+        pass
 
+def main(stdscr):
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    stdscr.timeout(50)
 
-def main():
     rclpy.init()
     node = ArrowTeleop()
 
-    def _run(stdscr):
-        curses.curs_set(0)
-        stdscr.nodelay(True)          # non-blocking getch
-        stdscr.timeout(100)           # refresh every 100 ms
+    spin_thread = threading.Thread(target=ros_spin, args=(node,), daemon=True)
+    spin_thread.start()
 
-        def safe_addstr(y, x, text):
-            try:
-                stdscr.addstr(y, x, text)
-            except curses.error:
-                pass
-
-        stdscr.clear()
-        safe_addstr(0, 0, "=== Arrow Key Teleop ===")
-        safe_addstr(2, 0, "  UP    arrow : forward")
-        safe_addstr(3, 0, "  DOWN  arrow : backward")
-        safe_addstr(4, 0, "  LEFT  arrow : turn left")
-        safe_addstr(5, 0, "  RIGHT arrow : turn right")
-        safe_addstr(6, 0, "  SPACE       : stop")
-        safe_addstr(7, 0, "  Q / Ctrl-C  : quit")
-        safe_addstr(9, 0, "Speed: ")
-
-        while rclpy.ok():
-            key = stdscr.getch()
-
-            if key == curses.KEY_UP:
-                node._lin = min(node._lin + LINEAR_STEP, MAX_LINEAR)
-                node._ang = 0.0
-            elif key == curses.KEY_DOWN:
-                node._lin = max(node._lin - LINEAR_STEP, -MAX_LINEAR)
-                node._ang = 0.0
-            elif key == curses.KEY_LEFT:
-                node._ang = min(node._ang + ANGULAR_STEP, MAX_ANGULAR)
-                node._lin = 0.0
-            elif key == curses.KEY_RIGHT:
-                node._ang = max(node._ang - ANGULAR_STEP, -MAX_ANGULAR)
-                node._lin = 0.0
-            elif key == ord(" "):
-                node._lin = 0.0
-                node._ang = 0.0
-            elif key in (ord("q"), ord("Q")):
-                break
-
-            node.publish()
-            rclpy.spin_once(node, timeout_sec=0)
-
-            # Status line
-            safe_addstr(9, 0,
-                f"Speed: linear={node._lin:+.2f} m/s   "
-                f"angular={node._ang:+.2f} rad/s    ")
-            stdscr.refresh()
-
-        node.stop()
+    safe_addstr(stdscr, 0, 0, "TELEOP: Arrows=Move  Q=Quit")
+    safe_addstr(stdscr, 1, 0, "----------------------------")
+    stdscr.refresh()
 
     try:
-        curses.wrapper(_run)
+        while rclpy.ok():
+            key = stdscr.getch()
+            twist = Twist()
+            status = "STOPPED        "
+
+            if key == curses.KEY_UP:
+                twist.linear.x = node.speed
+                status = "FORWARD >>>>   "
+            elif key == curses.KEY_DOWN:
+                twist.linear.x = -node.speed
+                status = "<<<< REVERSE   "
+            elif key == curses.KEY_LEFT:
+                twist.angular.z = node.turn
+                status = "<<< TURN LEFT  "
+            elif key == curses.KEY_RIGHT:
+                twist.angular.z = -node.turn
+                status = "TURN RIGHT >>> "
+            elif key == ord('q') or key == ord('Q'):
+                node.pub.publish(Twist())
+                break
+
+            node.pub.publish(twist)
+            safe_addstr(stdscr, 2, 0, status)
+            stdscr.refresh()
+
     except KeyboardInterrupt:
-        node.stop()
+        node.pub.publish(Twist())
     finally:
+        node.pub.publish(Twist())
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
 
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    curses.wrapper(main)
