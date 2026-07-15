@@ -153,17 +153,8 @@ class VisionPerceptionNode(Node):
             if confidence < CONFIDENCE_THRESHOLD:
                 continue
 
-            allowed_classes = [
-                "chair", "couch", "dining table", "bed", "toilet", "tv", "laptop", "mouse", 
-                "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", 
-                "refrigerator", "book", "clock", "vase", "bottle", "wine glass", "cup", "fork", 
-                "knife", "spoon", "bowl", "potted plant",
-                "person", "bicycle", "car", "motorcycle", "bus", "truck"  # Hazard classes
-            ]
-            
-            label_name = COCO_CLASSES[class_id]
-            if label_name not in allowed_classes:
-                continue
+            # All 80 COCO classes are now detected (no filter).
+            # Friendly name mapping happens later in the detection loop.
 
             cx = float(det[0]) * scale_x
             cy = float(det[1]) * scale_y
@@ -196,8 +187,19 @@ class VisionPerceptionNode(Node):
             x2, y2 = x1 + bw_, y1 + bh_
             cid = class_ids[idx]
             conf = confidences[idx]
-            label = COCO_CLASSES[cid]
-            color = (0, 0, 255) if label in self._hazard_classes else (0, 255, 0)
+            raw_label = COCO_CLASSES[cid]  # Original COCO name (for hazard checks)
+            
+            # Friendly name mapping for voice/display
+            FRIENDLY_NAMES = {
+                "dining table": "table", "couch": "sofa", "cell phone": "smartphone",
+                "potted plant": "plant", "wine glass": "glass", "sports ball": "ball",
+                "baseball bat": "bat", "baseball glove": "glove", "tennis racket": "racket",
+                "hair drier": "hair dryer", "tv": "television", "fire hydrant": "hydrant",
+                "parking meter": "meter", "traffic light": "signal",
+            }
+            label = FRIENDLY_NAMES.get(raw_label, raw_label)
+            
+            color = (0, 0, 255) if raw_label in self._hazard_classes else (0, 255, 0)
 
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness=2)
             label_text = f"{label}: {conf * 100:.1f}%"
@@ -211,19 +213,16 @@ class VisionPerceptionNode(Node):
             # ============================================
             # MOVING HAZARD TRACKING (Dynamic Danger Zones)
             # ============================================
-            if label in self._hazard_classes:
+            if raw_label in self._hazard_classes:
                 cx_box = x1 + bw_ / 2.0
                 cy_box = y1 + bh_ / 2.0
                 area = bw_ * bh_
                 now_time = time.monotonic()
                 
-                # Check if it's in the center of the camera frame (roughly middle third)
                 if 200 < cx_box < 440:
                     matched_id = None
-                    # Try to match with a previous hazard of the same class
                     for h_id, (prev_cx, prev_cy, prev_area, prev_time) in self._hazard_history.items():
-                        if h_id.startswith(label):
-                            # If centers are close (tracking the same object)
+                        if h_id.startswith(raw_label):
                             if math.hypot(cx_box - prev_cx, cy_box - prev_cy) < 100:
                                 matched_id = h_id
                                 break
@@ -232,22 +231,20 @@ class VisionPerceptionNode(Node):
                         _, _, prev_area, prev_time = self._hazard_history[matched_id]
                         time_diff = now_time - prev_time
                         
-                        # If area increased by > 15% in less than 1 second, it's approaching rapidly!
                         if area > prev_area * 1.15 and time_diff < 1.0 and area > 10000:
                             msg = String()
                             msg.data = f"EMERGENCY BRAKE! {label.upper()} is rapidly approaching!"
                             self._hazard_pub.publish(msg)
                             self.get_logger().warn(msg.data)
-                            color = (0, 0, 255) # Red box for danger!
+                            color = (0, 0, 255)
                             
                         current_hazards[matched_id] = (cx_box, cy_box, area, now_time)
                     else:
-                        # New hazard
-                        new_id = f"{label}_{len(current_hazards)}"
+                        new_id = f"{raw_label}_{len(current_hazards)}"
                         current_hazards[new_id] = (cx_box, cy_box, area, now_time)
             
             # Skip physical mapping for hazards (they move!)
-            if label in self._hazard_classes:
+            if raw_label in self._hazard_classes:
                 continue
 
             if self._latest_scan is not None:
@@ -268,19 +265,48 @@ class VisionPerceptionNode(Node):
                     #              = 640 / (2 * tan(0.698)) = 381.4 pixels
                     
                     FOCAL = 381.4
+                    # Approximate real-world heights (meters) for ALL 80 COCO classes
                     KNOWN_HEIGHTS = {
-                        "chair": 0.85, "couch": 0.85, "dining table": 0.75,
-                        "bed": 0.6, "toilet": 0.45, "tv": 0.5, "laptop": 0.25,
-                        "bottle": 0.25, "cup": 0.12, "bowl": 0.10,
-                        "potted plant": 0.4, "vase": 0.3, "book": 0.25,
-                        "clock": 0.3, "sink": 0.3, "refrigerator": 1.7,
-                        "microwave": 0.35, "oven": 0.6, "toaster": 0.2,
-                        "wine glass": 0.2, "fork": 0.15, "knife": 0.15,
-                        "spoon": 0.15, "remote": 0.15, "keyboard": 0.05,
-                        "cell phone": 0.12, "mouse": 0.05,
+                        # Furniture
+                        "chair": 0.85, "couch": 0.85, "dining table": 0.75, "bed": 0.6,
+                        "toilet": 0.45, "bench": 0.45,
+                        # Electronics
+                        "tv": 0.5, "laptop": 0.25, "cell phone": 0.12, "remote": 0.15,
+                        "keyboard": 0.05, "mouse": 0.05,
+                        # Kitchen
+                        "refrigerator": 1.7, "oven": 0.6, "microwave": 0.35, "toaster": 0.2,
+                        "sink": 0.3, "bottle": 0.25, "wine glass": 0.2, "cup": 0.12,
+                        "fork": 0.15, "knife": 0.15, "spoon": 0.15, "bowl": 0.10,
+                        # Household
+                        "potted plant": 0.4, "vase": 0.3, "book": 0.25, "clock": 0.3,
+                        "scissors": 0.18, "teddy bear": 0.3, "hair drier": 0.25,
+                        "toothbrush": 0.18,
+                        # Personal items
+                        "backpack": 0.45, "umbrella": 0.9, "handbag": 0.3,
+                        "tie": 0.5, "suitcase": 0.6,
+                        # Outdoor / Hazards
+                        "person": 1.7, "bicycle": 1.0, "car": 1.5, "motorcycle": 1.1,
+                        "bus": 3.0, "truck": 2.5, "train": 3.5, "boat": 1.5,
+                        "airplane": 4.0,
+                        # Animals
+                        "bird": 0.2, "cat": 0.25, "dog": 0.5, "horse": 1.6,
+                        "sheep": 0.7, "cow": 1.4, "elephant": 3.0, "bear": 1.5,
+                        "zebra": 1.4, "giraffe": 5.0,
+                        # Sports
+                        "frisbee": 0.03, "skis": 0.1, "snowboard": 0.15,
+                        "sports ball": 0.22, "kite": 0.6, "baseball bat": 0.8,
+                        "baseball glove": 0.25, "skateboard": 0.1, "surfboard": 0.1,
+                        "tennis racket": 0.68,
+                        # Food
+                        "banana": 0.15, "apple": 0.08, "sandwich": 0.08, "orange": 0.08,
+                        "broccoli": 0.15, "carrot": 0.15, "hot dog": 0.05,
+                        "pizza": 0.05, "donut": 0.05, "cake": 0.15,
+                        # Street
+                        "traffic light": 0.9, "fire hydrant": 0.6, "stop sign": 0.6,
+                        "parking meter": 1.2,
                     }
                     
-                    real_h = KNOWN_HEIGHTS.get(label, 0.5)
+                    real_h = KNOWN_HEIGHTS.get(raw_label, 0.5)
                     camera_depth = (real_h * FOCAL) / max(bh_, 10)
                     camera_depth = max(0.5, min(camera_depth, 25.0))
                     
