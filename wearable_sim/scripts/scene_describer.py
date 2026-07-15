@@ -82,26 +82,16 @@ class OfflineVLM:
             self.model_id, revision=self.revision, trust_remote_code=True
         )
         
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Force CPU because 4GB VRAM is physically too small for intermediate tensors
+        self.device = "cpu"
         
-        if self.device == "cuda":
-            quantization_config = BitsAndBytesConfig(
-                load_in_8bit=True,
-            )
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_id,
-                revision=self.revision,
-                trust_remote_code=True,
-                quantization_config=quantization_config,
-                device_map={"": "cuda"}
-            )
-        else:
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_id,
-                revision=self.revision,
-                trust_remote_code=True,
-                torch_dtype=torch.float16,
-            ).to(self.device)
+        # Load in float16 to save SYSTEM RAM (prevents OS from terminating the process)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.model_id,
+            revision=self.revision,
+            trust_remote_code=True,
+            torch_dtype=torch.float16,
+        ).to(self.device)
         self.model.eval()
         
         print(f"✅ Model loaded on {self.device.upper()}! Ready to describe anything.")
