@@ -76,25 +76,35 @@ class OfflineVLM:
         print("   This may take 1-2 minutes on first launch.")
         
         self.model_id = "vikhyatk/moondream2"
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, trust_remote_code=True)
+        self.revision = "2024-08-26" # Locked revision to fix compatibility bugs
         
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        dtype = torch.float16 if device == "cuda" else torch.float32
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model_id, revision=self.revision, trust_remote_code=True
+        )
         
+        # Force CPU because 4GB VRAM is physically too small for intermediate tensors
+        self.device = "cpu"
+        
+        # Load in float16 to save SYSTEM RAM (prevents OS from terminating the process)
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_id,
+            revision=self.revision,
             trust_remote_code=True,
-            torch_dtype=dtype,
-            device_map={"": device}
-        )
+            torch_dtype=torch.float16,
+        ).to(self.device)
         self.model.eval()
         
-        print(f"✅ Model loaded on {device.upper()}! Ready to describe anything.")
+        print(f"✅ Model loaded on {self.device.upper()}! Ready to describe anything.")
     
+    @torch.no_grad()
     def describe(self, image_np, question="Describe what you see in this image in one sentence."):
         """
         Takes a numpy BGR image and a question, returns the VLM's answer.
         """
+        # Clear CUDA cache before processing to free up any stray memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
         # Convert BGR numpy to RGB PIL
         rgb = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
         pil_img = PILImage.fromarray(rgb)
