@@ -27,14 +27,6 @@ import numpy as np
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# ── Try importing heavy ML libraries ──
-try:
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-    from PIL import Image as PILImage
-    HAS_VLM = True
-except ImportError:
-    HAS_VLM = False
 
 # ── Try importing ROS 2 ──
 try:
