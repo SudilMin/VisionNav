@@ -49,7 +49,7 @@ except ImportError:
     HAS_ROS = False
 
 import cv2
-
+import ollama
 
 def speak(text):
     """Speak text aloud using Piper TTS."""
@@ -64,57 +64,58 @@ def speak(text):
 
 
 class OfflineVLM:
-    """Moondream2 — a tiny offline Vision Language Model."""
+    """Moondream2 — using Ollama for lightning-fast 4-bit GPU inference."""
     
     def __init__(self):
-        if not HAS_VLM:
-            print("❌ Missing dependencies. Install with:")
-            print("   pip3 install --break-system-packages torch torchvision transformers einops Pillow")
+        print("🧠 Connecting to Ollama Moondream engine...")
+        try:
+            # Check if ollama is running and has moondream
+            ollama.list()
+        except Exception:
+            print("❌ Ollama is not running. Please run: curl -fsSL https://ollama.com/install.sh | sh")
             sys.exit(1)
-        
-        print("🧠 Loading moondream2 vision model (first run downloads ~3.5GB)...")
-        print("   This may take 1-2 minutes on first launch.")
-        
-        self.model_id = "vikhyatk/moondream2"
-        self.revision = "2024-08-26" # Locked revision to fix compatibility bugs
-        
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_id, revision=self.revision, trust_remote_code=True
-        )
-        
-        # Force CPU because 4GB VRAM is physically too small for intermediate tensors
-        self.device = "cpu"
-        
-        # Load in float16 to save SYSTEM RAM (prevents OS from terminating the process)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_id,
-            revision=self.revision,
-            trust_remote_code=True,
-            torch_dtype=torch.float16,
-        ).to(self.device)
-        self.model.eval()
-        
-        print(f"✅ Model loaded on {self.device.upper()}! Ready to describe anything.")
+            
+        print("⏳ Warming up the GPU (loading model into VRAM)... this takes ~30s once.")
+        try:
+            # Create a tiny 10x10 black image for warmup
+            warmup_img = np.zeros((10, 10, 3), dtype=np.uint8)
+            temp_warmup = os.path.join(SCRIPT_DIR, "_temp_warmup.jpg")
+            cv2.imwrite(temp_warmup, warmup_img)
+            
+            ollama.chat(
+                model='moondream',
+                messages=[{'role': 'user', 'content': 'test', 'images': [temp_warmup]}],
+                options={'num_predict': 1}
+            )
+        except Exception as e:
+            pass
+            
+        print(f"✅ GPU Warmed up! Model is now in memory. Ready to describe anything in ~2 seconds.")
     
-    @torch.no_grad()
     def describe(self, image_np, question="Describe what you see in this image in one sentence."):
         """
-        Takes a numpy BGR image and a question, returns the VLM's answer.
+        Takes a numpy BGR image and a question, returns the VLM's answer via Ollama.
         """
-        # Clear CUDA cache before processing to free up any stray memory
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            
-        # Convert BGR numpy to RGB PIL
-        rgb = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
-        pil_img = PILImage.fromarray(rgb)
+        # Save temp image for Ollama to read
+        temp_img_path = os.path.join(SCRIPT_DIR, "_temp_vlm_input.jpg")
+        cv2.imwrite(temp_img_path, image_np)
         
-        # Encode image
-        enc_image = self.model.encode_image(pil_img)
-        
-        # Generate answer
-        answer = self.model.answer_question(enc_image, question, self.tokenizer)
-        return answer.strip()
+        try:
+            response = ollama.chat(
+                model='moondream',
+                messages=[{
+                    'role': 'user',
+                    'content': question,
+                    'images': [temp_img_path]
+                }],
+                options={
+                    'num_predict': 40, # Limit output length for faster response
+                    'temperature': 0.1
+                }
+            )
+            return response['message']['content'].strip()
+        except Exception as e:
+            return f"Error connecting to Ollama: {e}"
 
 
 class SceneDescriberNode(Node):
@@ -144,11 +145,7 @@ class SceneDescriberNode(Node):
         # Publish the VLM's description
         self._desc_pub = self.create_publisher(String, "/scene_description", 10)
         
-        self.get_logger().info("Scene Describer ready! Waiting for camera frames...")
-        
-        # Start the input loop in a background thread
-        self.input_thread = threading.Thread(target=self._input_loop, daemon=True)
-        self.input_thread.start()
+        self.get_logger().info("Scene Describer ready! Waiting for commands from find_object...")
     
     def _image_callback(self, msg):
         try:
@@ -160,41 +157,7 @@ class SceneDescriberNode(Node):
         """Handle commands from other nodes (e.g., find_object.py)."""
         if self.latest_frame is not None:
             self._process_question(msg.data)
-    
-    def _input_loop(self):
-        """Interactive CLI for asking questions about the scene."""
-        time.sleep(3)
-        speak("Scene describer ready. You can now ask about anything you see.")
-        
-        while rclpy.ok():
-            print("\n" + "=" * 50)
-            print("🧠 OFFLINE SCENE DESCRIBER")
-            print("=" * 50)
-            print("Ask anything about what the camera sees:")
-            print("  Examples:")
-            print("    'What objects are in front of me?'")
-            print("    'Is there a door nearby?'")
-            print("    'What color is the object in the center?'")
-            print("    'Read the text on the sign'")
-            print("    'Are there any stairs ahead?'")
-            print("  Type 'exit' to quit.\n")
             
-            question = input("❓ Your question: ").strip()
-            
-            if question.lower() == 'exit':
-                speak("Scene describer shutting down.")
-                rclpy.shutdown()
-                break
-            
-            if not question:
-                continue
-                
-            if self.latest_frame is None:
-                speak("No camera frame available yet.")
-                continue
-            
-            self._process_question(question)
-    
     def _process_question(self, question):
         """Process a question about the current camera frame."""
         print("🔄 Analyzing image...")

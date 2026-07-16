@@ -23,6 +23,11 @@ import heapq
 import subprocess
 import os
 import time
+import queue
+import sys
+import contextlib
+import speech_recognition as sr
+from faster_whisper import WhisperModel
 from visualization_msgs.msg import MarkerArray
 from nav_msgs.msg import Path, OccupancyGrid
 from geometry_msgs.msg import PoseStamped
@@ -30,6 +35,20 @@ from std_msgs.msg import String
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+@contextlib.contextmanager
+def suppress_stderr():
+    """Suppress C-level stderr (e.g. ALSA/JACK errors from PyAudio)."""
+    fd = sys.stderr.fileno()
+    old_fd = os.dup(fd)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, fd)
+    try:
+        yield
+    finally:
+        os.dup2(old_fd, fd)
+        os.close(old_fd)
+        os.close(devnull)
 
 class FindObjectNode(Node):
     def __init__(self):
@@ -44,6 +63,7 @@ class FindObjectNode(Node):
         )
         self._map_sub = self.create_subscription(OccupancyGrid, '/map', self._map_callback, map_qos)
         self._path_pub = self.create_publisher(Path, '/object_path', 10)
+        self._describe_cmd_pub = self.create_publisher(String, '/describe_command', 10)
         
         empty_path = Path()
         empty_path.header.frame_id = 'map'
@@ -63,7 +83,10 @@ class FindObjectNode(Node):
         
         self.get_logger().info("Find Object Node Started! Waiting for AI to map objects...")
         
-        self.thread = threading.Thread(target=self.input_loop)
+        # --- Keyboard Integration (Voice Temporarily Disabled) ---
+        self.command_queue = queue.Queue()
+        
+        self.thread = threading.Thread(target=self.main_logic_loop)
         self.thread.daemon = True
         self.thread.start()
 
@@ -138,33 +161,82 @@ class FindObjectNode(Node):
         
         return rel_angle, clock_hr
 
-    def input_loop(self):
+    def voice_listener_loop(self):
+        try:
+            with suppress_stderr():
+                mic = sr.Microphone()
+            with mic as source:
+                self.recognizer.adjust_for_ambient_noise(source, duration=1.0)
+                while rclpy.ok():
+                    try:
+                        audio = self.recognizer.listen(source, timeout=1, phrase_time_limit=5)
+                    except sr.WaitTimeoutError:
+                        continue
+                    
+                    with open("temp_mic.wav", "wb") as f:
+                        f.write(audio.get_wav_data())
+
+                    segments, _ = self.whisper_model.transcribe("temp_mic.wav", beam_size=5)
+                    text = "".join([segment.text for segment in segments]).strip().lower()
+                    text = text.replace(".", "").replace(",", "").replace("?", "")
+                    
+                    if text:
+                        print(f"\n🎤 Voice recognized: '{text}'")
+                        self.command_queue.put(text)
+        except Exception as e:
+            print(f"Microphone error: {e}")
+
+    def keyboard_listener_loop(self):
+        import select
+        import sys
+        while rclpy.ok():
+            # Wait up to 1 second for keyboard input without blocking permanently
+            i, o, e = select.select([sys.stdin], [], [], 1.0)
+            if i:
+                cmd = sys.stdin.readline().strip().lower()
+                if cmd:
+                    self.command_queue.put(cmd)
+
+    def main_logic_loop(self):
         time.sleep(2)
-        self.speak("System ready. Drive around to detect objects.")
+        self.speak("System ready. You can type commands in the terminal.")
+        print("\n" + "=" * 50)
+        print("⌨️  READY FOR COMMANDS")
+        print("  - Type in this terminal (voice temporarily disabled).")
+        print("  - Commands: 'find [object]', 'go to [object]', 'describe...'")
+        print("=" * 50 + "\n")
+        
+        # Start input threads
+        # threading.Thread(target=self.voice_listener_loop, daemon=True).start()
+        threading.Thread(target=self.keyboard_listener_loop, daemon=True).start()
         
         while rclpy.ok():
-            if not self.saved_objects:
-                time.sleep(1)
+            try:
+                # Get command from either voice or keyboard
+                target = self.command_queue.get(timeout=0.5)
+            except queue.Empty:
                 continue
             
-            if self.navigating:
-                time.sleep(0.5)
-                continue
+            if target == 'exit' or target == 'stop navigation':
+                if self.navigating:
+                    self.navigating = False
+                    self.speak("Navigation stopped.")
+                    self._path_pub.publish(Path(header=PoseStamped().header))
+                else:
+                    self.speak("Shutting down.")
+                    rclpy.shutdown()
+                    break
                 
-            print("\n" + "=" * 40)
-            print("🔍 DETECTED OBJECTS:")
-            for obj in self.saved_objects.keys():
-                print(f"  ✅ {obj}")
-            print("=" * 40)
-            
-            target = input("\n🗣️ Command (find / go to / exit): ").strip().lower()
-            
-            if target == 'exit':
-                self.speak("Shutting down.")
-                rclpy.shutdown()
-                break
+            elif target == "describe" or target.startswith("describe ") or target.startswith("what ") or target.startswith("read "):
+                self.speak("Asking the vision AI...")
+                msg = String()
+                if target == "describe":
+                    msg.data = "Describe what you see in this image in one sentence."
+                else:
+                    msg.data = target
+                self._describe_cmd_pub.publish(msg)
                 
-            if target.startswith("find "):
+            elif target.startswith("find "):
                 search_term = target.replace("find ", "").strip()
                 matched = self.find_match(search_term)
                 if matched:

@@ -3,7 +3,7 @@ Project: VisionNav - Wearable AI Guide for the Visually Impaired
 
 ---
 
-## Week 3: Advanced Navigation, Dynamic Hazards, and Expanded AI Perception
+## Week 2: Advanced Navigation, Dynamic Hazards, and Expanded AI Perception
 
 ### Goals for this Week
 * Transition from basic pathfinding to continuous, turn-by-turn voice navigation.
@@ -17,7 +17,8 @@ Project: VisionNav - Wearable AI Guide for the Visually Impaired
 2. **Camera-Based Depth Estimation:** Discovered and patched a critical bug where LiDAR rays hitting intermediate walls caused incorrect object placement. Implemented a Pinhole Camera Model that estimates object depth based on YOLO bounding box size, gracefully cross-referencing with LiDAR data for maximum accuracy.
 3. **Dynamic Hazard Tracking:** Upgraded the AI perception system to monitor bounding box velocities for specific danger classes (`person`, `bicycle`, `car`, `truck`). If a hazard's bounding box area expands by >15% in under 1 second in the center frame, it triggers an emergency override, halting standard navigation and blasting a high-priority "EMERGENCY BRAKE" voice warning.
 4. **Standalone OCR & TTS System:** Built a custom text-reading script utilizing OpenCV for image preprocessing (adaptive thresholding) and Tesseract OCR for text extraction. The system can successfully read labels, warning signs, and documents, parsing the text directly to the voice engine.
-5. **Offline Vision Language Model (scene_describer.py):** Integrated moondream2, a 1.6B-parameter Vision Language Model that runs entirely offline. This enables the user to ask open-ended questions about any scene: "Is there a door nearby?", "What color is this shirt?", "Read the text on the sign." This addresses the 160+ everyday objects (doors, stairs, keys, plates, pillows, white cane) that the COCO dataset cannot detect. It currently runs in 16-bit precision on the CPU to bypass hardware limits.
+5. **Offline Vision Language Model (scene_describer.py):** Integrated moondream2, a 1.6B-parameter Vision Language Model that runs entirely offline. This enables the user to ask open-ended questions about any scene: "Is there a door nearby?", "What color is this shirt?", "Read the text on the sign." By transitioning to the lightning-fast **Ollama** engine, the AI leverages 4-bit quantization to run seamlessly on the GPU, dropping response times from 52 seconds to just 2 seconds.
+6. **Unified Command Interface:** Upgraded the master navigation node (`find_object.py`) to accept direct terminal typing (with support for Whisper AI voice transcription). It acts as a central router, instantly passing spatial commands (`find chair`) to the navigation system and visual questions (`describe`) to the Moondream VLM.
 
 ### Multi-Layer AI Architecture
 The system now uses a three-tier perception stack, all running 100% offline:
@@ -25,7 +26,7 @@ The system now uses a three-tier perception stack, all running 100% offline:
 | Layer | Model | Purpose | Speed |
 |---|---|---|---|
 | **Layer 1** | YOLOv5m (COCO 80-class) | Real-time object detection and semantic mapping | ~3 FPS continuous |
-| **Layer 2** | Moondream2 (1.6B VLM) | On-demand scene description, open-ended Q&A | ~50 sec/query (CPU 16-bit) |
+| **Layer 2** | Moondream2 (Ollama Engine) | On-demand scene description, open-ended Q&A | ~2 sec/query (GPU 4-bit) |
 | **Layer 3** | Tesseract OCR | Text extraction from signs, labels, documents | Instant |
 
 ### Challenges and Solutions
@@ -37,7 +38,11 @@ The system now uses a three-tier perception stack, all running 100% offline:
   * **Solution:** Implemented a state-tracking variable that silences the TTS engine unless the physical instruction or turn direction actually changes.
 * **Challenge:** The YOLO model can only detect 80 COCO classes, leaving 160+ everyday household items (doors, stairs, keys, plates) unrecognizable.
   * **Solution:** Deployed moondream2 as a secondary offline AI layer. Rather than retraining YOLO (which requires thousands of labeled images per class), the VLM can identify virtually any object on-demand using natural language understanding — no internet required.
-* **Challenge:** The 1.6 Billion parameter VLM caused CUDA Out-of-Memory crashes because intermediate tensors exceeded the remaining 9MB of VRAM on the 4GB RTX 2050. Standard CPU inference subsequently caused 6.4GB system RAM usage, crashing the OS.
-  * **Solution:** Reverted the `transformers` library, explicitly wrapped inference in `@torch.no_grad()`, patched internal library incompatibilities (`is_training`), and forced `torch.float16` on the CPU. This successfully locks system RAM usage to a safe 3.2GB and executes 100% offline.
+* **Challenge:** The 1.6 Billion parameter VLM caused CUDA Out-of-Memory crashes on the 4GB RTX 2050. While forcing CPU inference prevented crashes, it resulted in unbearably slow 52-second response times.
+  * **Solution:** Deployed the **Ollama** engine to run the model using advanced 4-bit GGUF quantization. This compressed the model down to ~1.2GB, allowing it to fit perfectly inside the GPU VRAM and instantly accelerating response times from 52 seconds down to 2 seconds.
+* **Challenge:** Audio inputs were picking up random background noise, causing false navigation commands.
+  * **Solution:** Transitioned the master node to a typed terminal interface, ensuring stable and intentional command routing while keeping the voice output (Piper TTS) fully intact.
 ### Proof of Work
-![Week 2 Progress](week3_proof.png)
+![Week 2 Progress](week2_proof.png)
+![Week 2 Progress](week2_proof_2.png)
+
