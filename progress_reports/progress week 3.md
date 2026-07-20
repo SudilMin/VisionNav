@@ -19,8 +19,6 @@ This week, the primary objective was to transition the AI perception system out 
 - Successfully rendered live semantic objects directly from the physical phone camera into the 3D RViz spatial map.
 
 ## Week 3 Proofs
-*(Insert screenshots/proofs of the working OpenCV detections and RViz 3D map here)*
-
 * ![YOLO Phone Camera Working](week3_proof_opencv.png)
 * ![RViz Real-World Map Working](week3_proof_rviz.png)
 
