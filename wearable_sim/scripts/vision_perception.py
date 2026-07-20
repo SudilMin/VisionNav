@@ -247,72 +247,59 @@ class VisionPerceptionNode(Node):
             if raw_label in self._hazard_classes:
                 continue
 
-            if self._latest_scan is not None:
-                scan = self._latest_scan
-                cx = x1 + bw_ / 2.0
-                yaw = -((cx - 320.0) / 320.0) * (1.396 / 2.0)
+            cx = x1 + bw_ / 2.0
+            yaw = -((cx - 320.0) / 320.0) * (1.396 / 2.0)
+            
+            try:
+                # ============================================
+                # CAMERA-BASED DEPTH ESTIMATION (Pinhole Model)
+                # ============================================
+                # Instead of blindly trusting LiDAR (which hits walls 
+                # between robot and object), estimate depth from the 
+                # bounding box size. Larger box = closer object.
+                #
+                # Formula: depth = (real_height * focal_length) / bbox_height
+                # focal_length = image_width / (2 * tan(hfov/2))
+                #              = 640 / (2 * tan(0.698)) = 381.4 pixels
                 
-                try:
-                    # ============================================
-                    # CAMERA-BASED DEPTH ESTIMATION (Pinhole Model)
-                    # ============================================
-                    # Instead of blindly trusting LiDAR (which hits walls 
-                    # between robot and object), estimate depth from the 
-                    # bounding box size. Larger box = closer object.
-                    #
-                    # Formula: depth = (real_height * focal_length) / bbox_height
-                    # focal_length = image_width / (2 * tan(hfov/2))
-                    #              = 640 / (2 * tan(0.698)) = 381.4 pixels
-                    
-                    FOCAL = 381.4
-                    # Approximate real-world heights (meters) for ALL 80 COCO classes
-                    KNOWN_HEIGHTS = {
-                        # Furniture
-                        "chair": 0.85, "couch": 0.85, "dining table": 0.75, "bed": 0.6,
-                        "toilet": 0.45, "bench": 0.45,
-                        # Electronics
-                        "tv": 0.5, "laptop": 0.25, "cell phone": 0.12, "remote": 0.15,
-                        "keyboard": 0.05, "mouse": 0.05,
-                        # Kitchen
-                        "refrigerator": 1.7, "oven": 0.6, "microwave": 0.35, "toaster": 0.2,
-                        "sink": 0.3, "bottle": 0.25, "wine glass": 0.2, "cup": 0.12,
-                        "fork": 0.15, "knife": 0.15, "spoon": 0.15, "bowl": 0.10,
-                        # Household
-                        "potted plant": 0.4, "vase": 0.3, "book": 0.25, "clock": 0.3,
-                        "scissors": 0.18, "teddy bear": 0.3, "hair drier": 0.25,
-                        "toothbrush": 0.18,
-                        # Personal items
-                        "backpack": 0.45, "umbrella": 0.9, "handbag": 0.3,
-                        "tie": 0.5, "suitcase": 0.6,
-                        # Outdoor / Hazards
-                        "person": 1.7, "bicycle": 1.0, "car": 1.5, "motorcycle": 1.1,
-                        "bus": 3.0, "truck": 2.5, "train": 3.5, "boat": 1.5,
-                        "airplane": 4.0,
-                        # Animals
-                        "bird": 0.2, "cat": 0.25, "dog": 0.5, "horse": 1.6,
-                        "sheep": 0.7, "cow": 1.4, "elephant": 3.0, "bear": 1.5,
-                        "zebra": 1.4, "giraffe": 5.0,
-                        # Sports
-                        "frisbee": 0.03, "skis": 0.1, "snowboard": 0.15,
-                        "sports ball": 0.22, "kite": 0.6, "baseball bat": 0.8,
-                        "baseball glove": 0.25, "skateboard": 0.1, "surfboard": 0.1,
-                        "tennis racket": 0.68,
-                        # Food
-                        "banana": 0.15, "apple": 0.08, "sandwich": 0.08, "orange": 0.08,
-                        "broccoli": 0.15, "carrot": 0.15, "hot dog": 0.05,
-                        "pizza": 0.05, "donut": 0.05, "cake": 0.15,
-                        # Street
-                        "traffic light": 0.9, "fire hydrant": 0.6, "stop sign": 0.6,
-                        "parking meter": 1.2,
-                    }
-                    
-                    real_h = KNOWN_HEIGHTS.get(raw_label, 0.5)
-                    camera_depth = (real_h * FOCAL) / max(bh_, 10)
-                    camera_depth = max(0.5, min(camera_depth, 25.0))
-                    
-                    # Cross-check with LiDAR: if LiDAR agrees, use it (more precise)
-                    # If LiDAR disagrees (probably hitting a wall), trust the camera
-                    depth = camera_depth
+                FOCAL = 381.4
+                # Approximate real-world heights (meters) for ALL 80 COCO classes
+                KNOWN_HEIGHTS = {
+                    "chair": 0.85, "couch": 0.85, "dining table": 0.75, "bed": 0.6,
+                    "toilet": 0.45, "bench": 0.45, "tv": 0.5, "laptop": 0.25, 
+                    "cell phone": 0.12, "remote": 0.15, "keyboard": 0.05, "mouse": 0.05,
+                    "refrigerator": 1.7, "oven": 0.6, "microwave": 0.35, "toaster": 0.2,
+                    "sink": 0.3, "bottle": 0.25, "wine glass": 0.2, "cup": 0.12,
+                    "fork": 0.15, "knife": 0.15, "spoon": 0.15, "bowl": 0.10,
+                    "potted plant": 0.4, "vase": 0.3, "book": 0.25, "clock": 0.3,
+                    "scissors": 0.18, "teddy bear": 0.3, "hair drier": 0.25,
+                    "toothbrush": 0.18, "backpack": 0.45, "umbrella": 0.9, "handbag": 0.3,
+                    "tie": 0.5, "suitcase": 0.6, "person": 1.7, "bicycle": 1.0, 
+                    "car": 1.5, "motorcycle": 1.1, "bus": 3.0, "truck": 2.5, "train": 3.5, 
+                    "boat": 1.5, "airplane": 4.0, "bird": 0.2, "cat": 0.25, "dog": 0.5, 
+                    "horse": 1.6, "sheep": 0.7, "cow": 1.4, "elephant": 3.0, "bear": 1.5,
+                    "zebra": 1.4, "giraffe": 5.0, "frisbee": 0.03, "skis": 0.1, 
+                    "snowboard": 0.15, "sports ball": 0.22, "kite": 0.6, "baseball bat": 0.8,
+                    "baseball glove": 0.25, "skateboard": 0.1, "surfboard": 0.1,
+                    "tennis racket": 0.68, "banana": 0.15, "apple": 0.08, "sandwich": 0.08, 
+                    "orange": 0.08, "broccoli": 0.15, "carrot": 0.15, "hot dog": 0.05,
+                    "pizza": 0.05, "donut": 0.05, "cake": 0.15, "traffic light": 0.9, 
+                    "fire hydrant": 0.6, "stop sign": 0.6, "parking meter": 1.2,
+                }
+                
+                real_h = KNOWN_HEIGHTS.get(raw_label, 0.5)
+                camera_depth = (real_h * FOCAL) / max(bh_, 10)
+                camera_depth = max(0.5, min(camera_depth, 25.0))
+                
+                depth = camera_depth
+                frame_id = "camera_link"
+                stamp = self.get_clock().now().to_msg()
+                
+                # Cross-check with LiDAR if available
+                if self._latest_scan is not None:
+                    scan = self._latest_scan
+                    frame_id = scan.header.frame_id
+                    stamp = scan.header.stamp
                     idx_scan = int((yaw - scan.angle_min) / scan.angle_increment)
                     r_vals = []
                     for di in [-1, 0, 1]:
@@ -326,93 +313,98 @@ class VisionPerceptionNode(Node):
                         # If LiDAR and camera agree within 2m, trust LiDAR (it's more precise)
                         if abs(lidar_depth - camera_depth) < 2.0:
                             depth = lidar_depth
-                    
-                    mx = depth * math.cos(yaw)
-                    my = depth * math.sin(yaw)
-                    
-                    pt_local = PointStamped()
-                    pt_local.header.frame_id = scan.header.frame_id
-                    pt_local.header.stamp = scan.header.stamp
-                    pt_local.point.x = mx
-                    pt_local.point.y = my
-                    pt_local.point.z = 0.5 + ((cid % 5) * 0.15)
-                    
-                    try:
-                        pt_global = self._tf_buffer.transform(pt_local, 'map', rclpy.duration.Duration(seconds=0.5))
-                    except Exception:
-                        continue
-                    
-                    px, py = pt_global.point.x, pt_global.point.y
-                    
-                    is_duplicate = False
-                    for i, mapped in enumerate(self._mapped_locations):
-                        if len(mapped) == 3: mapped = (*mapped, 0.0, 0, "")
-                        if len(mapped) == 5: mapped = (*mapped, "")
-                        mapped_cid, m_x, m_y, m_conf, m_idx, m_label = mapped
-                        
-                        if math.hypot(px - m_x, py - m_y) < 3.0:
-                            is_duplicate = True
-                            if conf > m_conf and m_idx < len(self._saved_markers):
-                                if cid != mapped_cid:
-                                    if not hasattr(self, '_class_counts'): self._class_counts = {}
-                                    self._class_counts[cid] = self._class_counts.get(cid, 0) + 1
-                                    m_label = f"{label.replace(' ', '_')}_{self._class_counts[cid]}"
-                                    
-                                self._mapped_locations[i] = (cid, px, py, conf, m_idx, m_label)
-                                self._saved_markers[m_idx].text = m_label
-                                self._saved_markers[m_idx].pose.position.x = px
-                                self._saved_markers[m_idx].pose.position.y = py
-                                if m_idx + 1 < len(self._saved_markers):
-                                    self._saved_markers[m_idx + 1].pose.position.x = px
-                                    self._saved_markers[m_idx + 1].pose.position.y = py
-                            break
-                            
-                    if is_duplicate:
-                        continue
-                        
-                    if not hasattr(self, '_class_counts'): self._class_counts = {}
-                    self._class_counts[cid] = self._class_counts.get(cid, 0) + 1
-                    final_label = f"{label.replace(' ', '_')}_{self._class_counts[cid]}"
-                    
-                    m_idx = len(self._saved_markers)
-                    self._mapped_locations.append((cid, px, py, conf, m_idx, final_label))
-                    
-                    marker = Marker()
-                    marker.header.frame_id = 'map'
-                    marker.header.stamp = self.get_clock().now().to_msg()
-                    marker.ns = "yolo_semantic_labels"
-                    marker.id = len(self._saved_markers) * 2
-                    marker.type = Marker.TEXT_VIEW_FACING
-                    marker.action = Marker.ADD
-                    marker.pose.position.x = px
-                    marker.pose.position.y = py
-                    marker.pose.position.z = pt_global.point.z
-                    marker.scale.z = 0.2
-                    marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
-                    marker.text = final_label
-                    self._saved_markers.append(marker)
-                    
-                    dot_marker = Marker()
-                    dot_marker.header.frame_id = 'map'
-                    dot_marker.header.stamp = self.get_clock().now().to_msg()
-                    dot_marker.ns = "yolo_semantic_anchors"
-                    dot_marker.id = (len(self._saved_markers) * 2) + 1
-                    dot_marker.type = Marker.SPHERE
-                    dot_marker.action = Marker.ADD
-                    dot_marker.pose.position.x = px
-                    dot_marker.pose.position.y = py
-                    dot_marker.pose.position.z = 0.1
-                    dot_marker.scale.x = 0.15
-                    dot_marker.scale.y = 0.15
-                    dot_marker.scale.z = 0.15
-                    dot_marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
-                    self._saved_markers.append(dot_marker)
-                    
+                mx = depth * math.cos(yaw)
+                my = depth * math.sin(yaw)
+                
+                pt_local = PointStamped()
+                pt_local.header.frame_id = frame_id
+                pt_local.header.stamp = stamp
+                pt_local.point.x = mx
+                pt_local.point.y = my
+                pt_local.point.z = 0.5 + ((cid % 5) * 0.15)
+                
+                try:
+                    pt_global = self._tf_buffer.transform(pt_local, 'map', rclpy.duration.Duration(seconds=0.5))
                 except Exception:
-                    pass
+                    continue
+                px, py = pt_global.point.x, pt_global.point.y
+                
+                is_duplicate = False
+                for i, mapped in enumerate(self._mapped_locations):
+                    if len(mapped) == 3: mapped = (*mapped, 0.0, 0, "")
+                    if len(mapped) == 5: mapped = (*mapped, "")
+                    mapped_cid, m_x, m_y, m_conf, m_idx, m_label = mapped
+                    
+                    if math.hypot(px - m_x, py - m_y) < 3.0:
+                        is_duplicate = True
+                        if conf > m_conf and m_idx < len(self._saved_markers):
+                            if cid != mapped_cid:
+                                if not hasattr(self, '_class_counts'): self._class_counts = {}
+                                self._class_counts[cid] = self._class_counts.get(cid, 0) + 1
+                                m_label = f"{label.replace(' ', '_')}_{self._class_counts[cid]}"
+                                
+                            self._mapped_locations[i] = (cid, px, py, conf, m_idx, m_label)
+                            self._saved_markers[m_idx].text = m_label
+                            self._saved_markers[m_idx].pose.position.x = px
+                            self._saved_markers[m_idx].pose.position.y = py
+                            if m_idx + 1 < len(self._saved_markers):
+                                self._saved_markers[m_idx + 1].pose.position.x = px
+                                self._saved_markers[m_idx + 1].pose.position.y = py
+                        break
+                        
+                if is_duplicate:
+                    continue
+                    
+                if not hasattr(self, '_class_counts'): self._class_counts = {}
+                self._class_counts[cid] = self._class_counts.get(cid, 0) + 1
+                final_label = f"{label.replace(' ', '_')}_{self._class_counts[cid]}"
+                
+                m_idx = len(self._saved_markers)
+                self._mapped_locations.append((cid, px, py, conf, m_idx, final_label))
+                
+                marker = Marker()
+                marker.header.frame_id = 'map'
+                marker.header.stamp = self.get_clock().now().to_msg()
+                marker.ns = "yolo_semantic_labels"
+                marker.id = len(self._saved_markers) * 2
+                marker.type = Marker.TEXT_VIEW_FACING
+                marker.action = Marker.ADD
+                marker.pose.position.x = px
+                marker.pose.position.y = py
+                marker.pose.position.z = pt_global.point.z
+                marker.scale.z = 0.2
+                marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
+                marker.text = final_label
+                self._saved_markers.append(marker)
+                
+                dot_marker = Marker()
+                dot_marker.header.frame_id = 'map'
+                dot_marker.header.stamp = self.get_clock().now().to_msg()
+                dot_marker.ns = "yolo_semantic_anchors"
+                dot_marker.id = (len(self._saved_markers) * 2) + 1
+                dot_marker.type = Marker.SPHERE
+                dot_marker.action = Marker.ADD
+                dot_marker.pose.position.x = px
+                dot_marker.pose.position.y = py
+                dot_marker.pose.position.z = 0.1
+                dot_marker.scale.x = 0.15
+                dot_marker.scale.y = 0.15
+                dot_marker.scale.z = 0.15
+                dot_marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
+                self._saved_markers.append(dot_marker)
+                    
+            except Exception:
+                pass
 
         # Update hazard history for the next frame
         self._hazard_history = current_hazards
+
+        # Prevent Out-Of-Memory (OOM) if odometry is static and markers smear infinitely
+        if len(self._saved_markers) > 200:
+            self._saved_markers.clear()
+            self._mapped_locations.clear()
+            if hasattr(self, '_class_counts'):
+                self._class_counts.clear()
 
         if self._saved_markers:
             self._marker_pub.publish(MarkerArray(markers=self._saved_markers))

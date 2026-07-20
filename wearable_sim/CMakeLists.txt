@@ -67,8 +67,8 @@ install(PROGRAMS
   scripts/download_model.py
   scripts/vision_perception.py
   scripts/find_object.py
-  scripts/text_reader.py
   scripts/scene_describer.py
+  scripts/phone_camera.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
