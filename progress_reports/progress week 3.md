@@ -21,8 +21,8 @@ This week, the primary objective was to transition the AI perception system out 
 ## Week 3 Proofs
 *(Insert screenshots/proofs of the working OpenCV detections and RViz 3D map here)*
 
-* `[week3_proof_opencv.png]`
-* `[week3_proof_rviz.png]`
+* ![YOLO Phone Camera Working](week3_proof_opencv.png)
+* ![RViz Real-World Map Working](week3_proof_rviz.png)
 
 ## Next Steps
 - Implement physical haptic feedback (vibration motors) or audio cues based on the real-world camera detections.
