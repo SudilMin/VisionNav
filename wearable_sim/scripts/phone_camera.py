@@ -28,17 +28,19 @@ class PhoneCameraNode(Node):
         self.publisher_ = self.create_publisher(Image, '/camera/image_raw', realtime_qos)
         self.bridge = CvBridge()
         
-        # Try to open the default camera (/dev/video0)
-        # If your laptop has a built-in webcam, the phone might be 2 or 4.
-        self.cap = cv2.VideoCapture(0)
-        
-        # If 0 fails, try 2 (common for laptops with built-in webcams)
-        if not self.cap.isOpened():
-            self.get_logger().info("/dev/video0 failed, trying /dev/video2...")
-            self.cap = cv2.VideoCapture(2)
-            
-        if not self.cap.isOpened():
-            self.get_logger().error("Could not open ANY camera. Make sure the phone is plugged in and set to Webcam mode!")
+        self.cap = None
+        for index in [0, 1, 2, 3, 4, 5, 6]:
+            candidate = cv2.VideoCapture(index)
+            if candidate.isOpened():
+                ret, frame = candidate.read()
+                if ret and frame is not None:
+                    self.cap = candidate
+                    self.get_logger().info(f"Camera opened at /dev/video{index}")
+                    break
+            candidate.release()
+
+        if self.cap is None:
+            self.get_logger().error("Could not open any /dev/video0..6 camera. Check USB webcam mode and permissions.")
             import sys; sys.exit(1)
             
         # Optional: Set resolution to 640x480 for faster AI processing
