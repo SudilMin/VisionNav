@@ -1,3 +1,5 @@
 {
-    "cmake.sourceDirectory": "/home/sudil-minthaka/wearable_ws/src/wearable_sim"
+    "git.ignoredRepositories": [
+        "/home/sudil-minthaka/wearable_ws/src/ldlidar_stl_ros2"
+    ]
 }
