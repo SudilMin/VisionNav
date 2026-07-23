@@ -23,35 +23,38 @@ def generate_launch_description():
                 {'product_name': 'LDLiDAR_LD19'},
                 {'topic_name': 'scan'},
                 {'frame_id': 'laser'},
-                {'port_name': '/dev/ttyUSB0'},
+                {'port_name': '/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0'},
                 {'port_baudrate': 230400},
                 {'laser_scan_dir': True},
                 {'enable_angle_crop_func': False}
             ]
         ),
 
-        # 2. Fake Odometry (Locks odom to base_footprint)
+        # 2. Kobuki Python Driver (Handles serial comms & Odometry TF)
         Node(
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            name='fake_odom',
-            arguments=['--x', '0', '--y', '0', '--z', '0', '--yaw', '0', '--pitch', '0', '--roll', '0', '--frame-id', 'odom', '--child-frame-id', 'base_footprint']
-        ),
-        
-        # 3. Chest Camera Mount (Places the camera 1.3m high)
-        Node(
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            name='fake_camera_mount',
-            arguments=['--x', '0.0', '--y', '0.0', '--z', '1.3', '--yaw', '0', '--pitch', '0', '--roll', '0', '--frame-id', 'base_footprint', '--child-frame-id', 'camera_link']
+            package='wearable_sim',
+            executable='kobuki_driver.py',
+            name='kobuki_driver',
+            output='screen',
+            parameters=[
+                {'serial_port': '/dev/serial/by-id/usb-Yujin_Robot_iClebo_Kobuki_kobuki_AI02MTI8-if00-port0'}
+            ]
         ),
 
-        # 4. Chest LiDAR Mount (Places the LiDAR 1.2m high, flat on the chest)
+        # 3. Fake LiDAR Mount (Places the LiDAR 1.2m high, flat on the chest)
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
             name='fake_lidar_mount',
             arguments=['--x', '0.0', '--y', '0.0', '--z', '1.2', '--yaw', '0', '--pitch', '0', '--roll', '0', '--frame-id', 'base_footprint', '--child-frame-id', 'laser']
+        ),
+
+        # 4. Fake Camera Mount (Places the camera 1.3m high)
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='fake_camera_mount',
+            arguments=['--x', '0.0', '--y', '0.0', '--z', '1.3', '--yaw', '0', '--pitch', '0', '--roll', '0', '--frame-id', 'base_footprint', '--child-frame-id', 'camera_link']
         ),
 
         # 5. USB Camera Publisher (Commented out to run separately)

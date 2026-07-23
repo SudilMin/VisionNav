@@ -13,6 +13,8 @@ import cv2
 import math
 import time
 import numpy as np
+import threading
+import copy
 import rclpy
 from cv_bridge import CvBridge, CvBridgeError
 from rclpy.node import Node
@@ -122,6 +124,16 @@ class VisionPerceptionNode(Node):
         self._camera_watchdog = self.create_timer(3.0, self._camera_watchdog_callback)
         self._image_pub = self.create_publisher(Image, "/vision/debug_image", 10)
         
+        self._inference_lock = threading.Lock()
+        self._latest_frame = None
+        self._latest_frame_stamp = None
+        self._inference_results = None
+        self._inference_busy = False
+        self._inference_thread = threading.Thread(target=self._yolo_worker, daemon=True)
+        self._inference_thread.start()
+        
+        self._tracking_timer = self.create_timer(0.05, self._tracking_callback)
+        
         self._latest_scan = None
         self._scan_sub = self.create_subscription(
             LaserScan, "/scan", self._scan_callback, qos_profile_sensor_data,
@@ -152,7 +164,7 @@ class VisionPerceptionNode(Node):
         self._next_static_track_id = {}
         self._static_box_tracks = {}
         self._static_smoothing_alpha = float(os.environ.get("WEARABLE_STATIC_SMOOTHING_ALPHA", "0.05"))
-        self._static_bbox_alpha = float(os.environ.get("WEARABLE_STATIC_BBOX_ALPHA", "0.12"))
+        self._static_bbox_alpha = float(os.environ.get("WEARABLE_STATIC_BBOX_ALPHA", "1.0"))
         self._static_bbox_assoc_px = float(os.environ.get("WEARABLE_STATIC_BBOX_ASSOC_PX", "180.0"))
         self._static_association_distance = float(os.environ.get("WEARABLE_STATIC_ASSOC_DISTANCE", "1.50"))
         self._static_track_timeout = float(os.environ.get("WEARABLE_STATIC_TRACK_TIMEOUT", "15.0"))
@@ -161,7 +173,7 @@ class VisionPerceptionNode(Node):
         self._next_dynamic_track_id = {}
         self._dynamic_box_tracks = {}
         self._dynamic_smoothing_alpha = float(os.environ.get("WEARABLE_DYNAMIC_SMOOTHING_ALPHA", "0.30"))
-        self._dynamic_bbox_alpha = float(os.environ.get("WEARABLE_DYNAMIC_BBOX_ALPHA", "0.30"))
+        self._dynamic_bbox_alpha = float(os.environ.get("WEARABLE_DYNAMIC_BBOX_ALPHA", "1.0"))
         self._dynamic_bbox_assoc_px = float(os.environ.get("WEARABLE_DYNAMIC_BBOX_ASSOC_PX", "250.0"))
         self._dynamic_association_distance = float(os.environ.get("WEARABLE_DYNAMIC_ASSOC_DISTANCE", "2.0"))
         self._dynamic_track_timeout = float(os.environ.get("WEARABLE_DYNAMIC_TRACK_TIMEOUT", "2.0"))
@@ -377,85 +389,129 @@ class VisionPerceptionNode(Node):
         except CvBridgeError as exc:
             return
 
-        now = time.monotonic()
-        if now - self._last_save_time >= 5.0:
-            cv2.imwrite("/tmp/vision_frame.jpg", frame)
-            self._last_save_time = now
-
-        if not hasattr(self, '_cached_boxes'):
-            self._cached_boxes = []
-            
-        if self._frame_count % DETECTION_FRAME_STRIDE != 0:
+        with self._inference_lock:
+            if not self._inference_busy:
+                self._latest_frame = frame.copy()
+                self._latest_frame_stamp = msg.header.stamp
+                
+        if self._show_window:
             self._draw_cached_boxes(frame)
-            return
+            cv2.imshow("Wearable Vision System", frame)
+            cv2.waitKey(1)
+            
+        try:
+            debug_msg = Image()
+            debug_msg.header.stamp = self.get_clock().now().to_msg()
+            debug_msg.height, debug_msg.width = frame.shape[:2]
+            debug_msg.encoding = "bgr8"
+            debug_msg.step = frame.shape[1] * 3
+            debug_msg.data = np.ascontiguousarray(frame).tobytes()
+            self._image_pub.publish(debug_msg)
+        except Exception:
+            pass
 
-        blob = cv2.dnn.blobFromImage(
-            frame, scalefactor=1.0 / 255.0, size=(INPUT_W, INPUT_H),
-            mean=(0.0, 0.0, 0.0), swapRB=True, crop=False,
-        )
-        self._net.setInput(blob)
-        raw_output = self._net.forward(self._net.getUnconnectedOutLayersNames())[0]
-
-        h, w = frame.shape[:2]
-        scale_x = w / INPUT_W
-        scale_y = h / INPUT_H
-        predictions = raw_output[0]
-
-        boxes, confidences, class_ids = [], [], []
-
-        for det in predictions:
-            obj_conf = float(det[4])
-            if obj_conf < 0.30:
+    def _yolo_worker(self):
+        while rclpy.ok():
+            frame = None
+            stamp = None
+            with self._inference_lock:
+                if self._latest_frame is not None:
+                    frame = self._latest_frame
+                    stamp = self._latest_frame_stamp
+                    self._latest_frame = None
+                    self._inference_busy = True
+            
+            if frame is None:
+                time.sleep(0.01)
                 continue
+                
+            blob = cv2.dnn.blobFromImage(
+                frame, scalefactor=1.0 / 255.0, size=(INPUT_W, INPUT_H),
+                mean=(0.0, 0.0, 0.0), swapRB=True, crop=False,
+            )
+            self._net.setInput(blob)
+            raw_output = self._net.forward(self._net.getUnconnectedOutLayersNames())[0]
 
-            class_scores = det[5:]
-            class_id = int(np.argmax(class_scores))
-            confidence = obj_conf * float(class_scores[class_id])
+            h, w = frame.shape[:2]
+            scale_x = w / INPUT_W
+            scale_y = h / INPUT_H
+            predictions = raw_output[0]
 
-            if confidence < CONFIDENCE_THRESHOLD:
-                continue
+            boxes, confidences, class_ids = [], [], []
 
-            # All 80 COCO classes are now detected (no filter).
-            # Friendly name mapping happens later in the detection loop.
+            for det in predictions:
+                obj_conf = float(det[4])
+                if obj_conf < 0.30:
+                    continue
 
-            cx = float(det[0]) * scale_x
-            cy = float(det[1]) * scale_y
-            bw_ = float(det[2]) * scale_x
-            bh_ = float(det[3]) * scale_y
+                class_scores = det[5:]
+                class_id = int(np.argmax(class_scores))
+                confidence = obj_conf * float(class_scores[class_id])
 
-            x1 = max(0, int(cx - bw_ / 2))
-            y1 = max(0, int(cy - bh_ / 2))
-            bw_ = min(w - x1, int(bw_))
-            bh_ = min(h - y1, int(bh_))
+                if confidence < CONFIDENCE_THRESHOLD:
+                    continue
 
-            boxes.append([x1, y1, bw_, bh_])
-            confidences.append(confidence)
-            class_ids.append(class_id)
+                cx = float(det[0]) * scale_x
+                cy = float(det[1]) * scale_y
+                bw_ = float(det[2]) * scale_x
+                bh_ = float(det[3]) * scale_y
 
-        if boxes:
-            indices = cv2.dnn.NMSBoxes(boxes, confidences, CONFIDENCE_THRESHOLD, NMS_THRESHOLD)
-            if len(indices) > 0:
-                indices = indices.flatten()
-        else:
-            indices = []
+                x1 = max(0, int(cx - bw_ / 2))
+                y1 = max(0, int(cy - bh_ / 2))
+                bw_ = min(w - x1, int(bw_))
+                bh_ = min(h - y1, int(bh_))
 
-        self._cached_boxes = []
+                boxes.append([x1, y1, bw_, bh_])
+                confidences.append(confidence)
+                class_ids.append(class_id)
+
+            if boxes:
+                indices = cv2.dnn.NMSBoxes(boxes, confidences, CONFIDENCE_THRESHOLD, NMS_THRESHOLD)
+                if len(indices) > 0:
+                    indices = indices.flatten()
+            else:
+                indices = []
+                
+            with self._inference_lock:
+                self._inference_results = (stamp, boxes, confidences, class_ids, indices, frame)
+                self._inference_busy = False
+
+    def _tracking_callback(self):
+        now = time.monotonic()
         
-        # Current-frame markers replace the previous semantic overlay in RViz.
+        new_results = None
+        with self._inference_lock:
+            if self._inference_results is not None:
+                new_results = self._inference_results
+                self._inference_results = None
+                
+        if new_results is not None:
+            stamp, boxes, confidences, class_ids, indices, frame = new_results
+            self._process_detections(stamp, boxes, confidences, class_ids, indices, frame, now)
+        else:
+            # Predict step for smooth interpolation
+            for label, tracks in self._dynamic_tracks.items():
+                for track in tracks:
+                    track.predict(now)
+            for label, tracks in self._static_tracks.items():
+                for track in tracks:
+                    track.predict(now)
+                    
+        self._publish_markers(now)
+
+    def _process_detections(self, msg_stamp, boxes, confidences, class_ids, indices, frame, now):
+        h, w = frame.shape[:2]
+        self._cached_boxes = []
         current_hazards = {}
-        current_markers = []
-        current_class_counts = {}
+        
         self._static_tracks_used = {}
         self._static_box_tracks_used = {}
         self._dynamic_tracks_used = {}
         self._dynamic_box_tracks_used = {}
-        marker_seq = 0
-        now_msg = msg.header.stamp
-        marker_lifetime = rclpy.duration.Duration(seconds=1.5).to_msg()
         
-        delete_marker = Marker()
-        delete_marker.action = Marker.DELETEALL
-        current_markers.append(delete_marker)
+        from geometry_msgs.msg import PointStamped
+        from std_msgs.msg import ColorRGBA
+        from visualization_msgs.msg import Marker, MarkerArray
         
         for idx in indices:
             raw_x1, raw_y1, raw_bw, raw_bh = boxes[idx]
@@ -466,9 +522,8 @@ class VisionPerceptionNode(Node):
             
             cid = class_ids[idx]
             conf = confidences[idx]
-            raw_label = COCO_CLASSES[cid]  # Original COCO name (for hazard checks)
+            raw_label = COCO_CLASSES[cid]
             
-            # Friendly name mapping for voice/display
             FRIENDLY_NAMES = {
                 "dining table": "table", "couch": "sofa", "cell phone": "smartphone",
                 "potted plant": "plant", "wine glass": "glass", "sports ball": "ball",
@@ -488,88 +543,30 @@ class VisionPerceptionNode(Node):
             y1 = max(0, min(y1, h - 1))
             bw_ = max(1, min(bw_, w - x1))
             bh_ = max(1, min(bh_, h - y1))
-            x2, y2 = x1 + bw_, y1 + bh_
-
-            color = (0, 0, 255) if is_dynamic else (0, 255, 0)
-
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness=2)
-            label_text = f"{label}: {conf * 100:.1f}%"
-            (tw, th), bl = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-            ly = max(y1, th + bl + 4)
-            cv2.rectangle(frame, (x1, ly - th - bl - 4), (x1 + tw, ly), color, cv2.FILLED)
-            cv2.putText(frame, label_text, (x1, ly - bl - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
-
-            self._cached_boxes.append((x1, y1, x2, y2, color, label_text))
             
-            # ============================================
-            # MOVING HAZARD TRACKING (Dynamic Danger Zones)
-            # ============================================
-            if raw_label in self._hazard_classes:
-                cx_box = x1 + bw_ / 2.0
-                cy_box = y1 + bh_ / 2.0
-                area = bw_ * bh_
-                now_time = time.monotonic()
-                
-                if 200 < cx_box < 440:
-                    matched_id = None
-                    for h_id, (prev_cx, prev_cy, prev_area, prev_time) in self._hazard_history.items():
-                        if h_id.startswith(raw_label):
-                            if math.hypot(cx_box - prev_cx, cy_box - prev_cy) < 100:
-                                matched_id = h_id
-                                break
-                    
-                    if matched_id:
-                        _, _, prev_area, prev_time = self._hazard_history[matched_id]
-                        time_diff = now_time - prev_time
-                        
-                        if area > prev_area * 1.15 and time_diff < 1.0 and area > 10000:
-                            msg = String()
-                            msg.data = f"EMERGENCY BRAKE! {label.upper()} is rapidly approaching!"
-                            self._hazard_pub.publish(msg)
-                            self.get_logger().warn(msg.data)
-                            color = (0, 0, 255)
-                            
-                        current_hazards[matched_id] = (cx_box, cy_box, area, now_time)
-                    else:
-                        new_id = f"{raw_label}_{len(current_hazards)}"
-                        current_hazards[new_id] = (cx_box, cy_box, area, now_time)
-            
-            self.get_logger().info(f'LIVE MAP: {label} conf={conf:.2f} bbox=({x1},{y1},{x2},{y2})', throttle_duration_sec=0.5)
+            if is_dynamic:
+                self._cached_boxes.append((x1, y1, x1 + bw_, y1 + bh_, (0, 0, 255), label))
+            else:
+                self._cached_boxes.append((x1, y1, x1 + bw_, y1 + bh_, (255, 0, 0), label))
 
+            image_center_x = w / 2.0
             cx = x1 + bw_ / 2.0
-            image_center_x = max(w / 2.0, 1.0)
-            pixel_offset = (cx - image_center_x) / image_center_x
-            yaw_sign = 1.0 if self._mirror_camera_x else -1.0
-            yaw = yaw_sign * pixel_offset * (self._camera_hfov / 2.0) + self._camera_yaw_offset
-            half_width_angle = max(
-                math.radians(1.0),
-                (max(float(bw_), 1.0) / max(float(w), 1.0)) * (self._camera_hfov / 2.0),
-            )
-            
-            # ============================================
-            # CAMERA-BASED DEPTH ESTIMATION (Pinhole Model)
-            # ============================================
+            cy = y1 + bh_ / 2.0
+            angle_offset = ((cx - image_center_x) / image_center_x) * (self._camera_hfov / 2.0)
+
+            if self._mirror_camera_x:
+                angle_offset = -angle_offset
+
+            yaw = self._camera_yaw_offset - angle_offset
+            half_width_angle = (bw_ / w) * (self._camera_hfov / 2.0)
+
             KNOWN_HEIGHTS = {
-                "chair": 0.85, "couch": 0.85, "dining table": 0.75, "bed": 0.6,
-                "toilet": 0.45, "bench": 0.45, "tv": 0.5, "laptop": 0.25, 
-                "cell phone": 0.12, "remote": 0.15, "keyboard": 0.05, "mouse": 0.05,
-                "refrigerator": 1.7, "oven": 0.6, "microwave": 0.35, "toaster": 0.2,
-                "sink": 0.3, "bottle": 0.25, "wine glass": 0.2, "cup": 0.12,
-                "fork": 0.15, "knife": 0.15, "spoon": 0.15, "bowl": 0.10,
-                "potted plant": 0.4, "vase": 0.3, "book": 0.25, "clock": 0.3,
-                "scissors": 0.18, "teddy bear": 0.3, "hair drier": 0.25,
-                "toothbrush": 0.18, "backpack": 0.45, "umbrella": 0.9, "handbag": 0.3,
-                "tie": 0.5, "suitcase": 0.6, "person": 1.7, "bicycle": 1.0, 
-                "car": 1.5, "motorcycle": 1.1, "bus": 3.0, "truck": 2.5, "train": 3.5, 
-                "boat": 1.5, "airplane": 4.0, "bird": 0.2, "cat": 0.25, "dog": 0.5, 
-                "horse": 1.6, "sheep": 0.7, "cow": 1.4, "elephant": 3.0, "bear": 1.5,
-                "zebra": 1.4, "giraffe": 5.0, "frisbee": 0.03, "skis": 0.1, 
-                "snowboard": 0.15, "sports ball": 0.22, "kite": 0.6, "baseball bat": 0.8,
-                "baseball glove": 0.25, "skateboard": 0.1, "surfboard": 0.1,
-                "tennis racket": 0.68, "banana": 0.15, "apple": 0.08, "sandwich": 0.08, 
-                "orange": 0.08, "broccoli": 0.15, "carrot": 0.15, "hot dog": 0.05,
-                "pizza": 0.05, "donut": 0.05, "cake": 0.15, "traffic light": 0.9, 
-                "fire hydrant": 0.6, "stop sign": 0.6, "parking meter": 1.2,
+                "dining table": 0.8, "chair": 0.9, "couch": 0.9, "bed": 0.6,
+                "refrigerator": 1.8, "tv": 0.6, "laptop": 0.25, "sink": 0.9,
+                "toilet": 0.4, "door": 2.1, "window": 1.5, "stairs": 1.0,
+                "cup": 0.1, "bottle": 0.2, "bowl": 0.1, "book": 0.25,
+                "cell phone": 0.15, "mouse": 0.05, "keyboard": 0.03, "remote": 0.2,
+                "person": 1.7, "car": 1.5,
             }
             
             real_h = KNOWN_HEIGHTS.get(raw_label, 0.5)
@@ -597,10 +594,9 @@ class VisionPerceptionNode(Node):
             mx = depth * math.cos(yaw)
             my = depth * math.sin(yaw)
             
-            # Transform to map frame with fallback
             pt_local = PointStamped()
             pt_local.header.frame_id = "camera_link"
-            pt_local.header.stamp = msg.header.stamp
+            pt_local.header.stamp = msg_stamp
             pt_local.point.x = mx
             pt_local.point.y = my
             pt_local.point.z = 0.5 + ((cid % 5) * 0.15)
@@ -614,90 +610,93 @@ class VisionPerceptionNode(Node):
                     pass
             
             if pt_global is None:
-                # Fallback: use raw local coordinates
-                pt_global = pt_local
-                pt_global.header.frame_id = 'map'
-                self.get_logger().warn(f'TF unavailable, placing {label} with raw coords')
-            
+                continue
+                
             px, py = pt_global.point.x, pt_global.point.y
-            self.get_logger().info(
-                f'PLACED {label} at ({px:.2f}, {py:.2f}) yaw={math.degrees(yaw):.1f}deg '
-                f'depth={depth:.2f} source={depth_source} camera_depth={camera_depth:.2f} '
-                f'lidar_depth={lidar_depth if lidar_depth is not None else -1.0:.2f}'
-            )
-            
             final_label, px, py = self._stabilize_object(label, px, py, conf, now, is_dynamic)
 
-            label_text = final_label
-            marker_color = ColorRGBA(r=1.0, g=0.1, b=0.1, a=1.0) if is_dynamic else ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
-            anchor_scale = 0.35 if is_dynamic else 0.20
-            label_height = 0.75 if is_dynamic else 0.55
-            marker_ns_prefix = "yolo_dynamic" if is_dynamic else "yolo_static"
-
-            pin_marker = Marker()
-            pin_marker.header.frame_id = 'map'
-            pin_marker.header.stamp = now_msg
-            pin_marker.ns = f"{marker_ns_prefix}_pins"
-            pin_marker.id = marker_seq
-            marker_seq += 1
-            pin_marker.type = Marker.CYLINDER
-            pin_marker.action = Marker.ADD
-            pin_marker.pose.position.x = px
-            pin_marker.pose.position.y = py
-            pin_marker.pose.position.z = label_height / 2.0
-            pin_marker.scale.x = 0.08 if is_dynamic else 0.05
-            pin_marker.scale.y = 0.08 if is_dynamic else 0.05
-            pin_marker.scale.z = label_height
-            pin_marker.color = marker_color
-            pin_marker.lifetime = marker_lifetime
-            current_markers.append(pin_marker)
-
-            marker = Marker()
-            marker.header.frame_id = 'map'
-            marker.header.stamp = now_msg
-            marker.ns = f"{marker_ns_prefix}_labels"
-            marker.id = marker_seq
-            marker_seq += 1
-            marker.type = Marker.TEXT_VIEW_FACING
-            marker.action = Marker.ADD
-            marker.pose.position.x = px
-            marker.pose.position.y = py
-            marker.pose.position.z = label_height + 0.20
-            marker.scale.z = 0.35 if is_dynamic else 0.28
-            marker.color = marker_color
-            marker.text = label_text
-            marker.lifetime = marker_lifetime
-            current_markers.append(marker)
-
-            dot_marker = Marker()
-            dot_marker.header.frame_id = 'map'
-            dot_marker.header.stamp = now_msg
-            dot_marker.ns = f"{marker_ns_prefix}_anchors"
-            dot_marker.id = marker_seq
-            marker_seq += 1
-            dot_marker.type = Marker.SPHERE
-            dot_marker.action = Marker.ADD
-            dot_marker.pose.position.x = px
-            dot_marker.pose.position.y = py
-            dot_marker.pose.position.z = 0.12
-            dot_marker.scale.x = anchor_scale
-            dot_marker.scale.y = anchor_scale
-            dot_marker.scale.z = anchor_scale
-            dot_marker.color = marker_color
-            dot_marker.lifetime = marker_lifetime
-            current_markers.append(dot_marker)
-
-            self.get_logger().info(
-                f'LIVE MARKER: {label_text} at ({px:.2f}, {py:.2f}) dynamic={is_dynamic}',
-                throttle_duration_sec=0.5,
-            )
-
-        # Update hazard history for the next frame
+            if raw_label in self._hazard_classes:
+                area = bw_ * bh_
+                current_hazards[final_label] = (cx, cy, area, now)
+                
         self._hazard_history = current_hazards
-
+        
+    def _publish_markers(self, now):
+        from visualization_msgs.msg import Marker, MarkerArray
+        current_markers = []
+        marker_seq = 0
+        now_msg = self.get_clock().now().to_msg()
+        marker_lifetime = rclpy.duration.Duration(seconds=0.5).to_msg()
+        
+        delete_marker = Marker()
+        delete_marker.action = Marker.DELETEALL
+        current_markers.append(delete_marker)
+        
+        for label, tracks in self._dynamic_tracks.items():
+            for track in tracks:
+                if now - track.last_seen > self._dynamic_track_timeout:
+                    continue
+                final_label = f"{label.replace(' ', '_')}_{track.id}"
+                marker_seq = self._add_track_marker(
+                    current_markers, marker_seq, track, final_label, now_msg, marker_lifetime, True
+                )
+                
+        for label, tracks in self._static_tracks.items():
+            for track in tracks:
+                if now - track.last_seen > self._static_track_timeout:
+                    continue
+                final_label = f"{label.replace(' ', '_')}_{track.id}"
+                marker_seq = self._add_track_marker(
+                    current_markers, marker_seq, track, final_label, now_msg, marker_lifetime, False
+                )
+                
         self._marker_pub.publish(MarkerArray(markers=current_markers))
+        
+    def _add_track_marker(self, current_markers, marker_seq, track, label_text, now_msg, marker_lifetime, is_dynamic):
+        from std_msgs.msg import ColorRGBA
+        from visualization_msgs.msg import Marker
+        px, py = track.x[0], track.x[1]
+        marker_color = ColorRGBA(r=1.0, g=0.1, b=0.1, a=1.0) if is_dynamic else ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
+        anchor_scale = 0.35 if is_dynamic else 0.20
+        label_height = 0.75 if is_dynamic else 0.55
+        marker_ns_prefix = "yolo_dynamic" if is_dynamic else "yolo_static"
 
-        self._draw_cached_boxes(frame)
+        marker = Marker()
+        marker.header.frame_id = 'map'
+        marker.header.stamp = now_msg
+        marker.ns = f"{marker_ns_prefix}_labels"
+        marker.id = marker_seq
+        marker_seq += 1
+        marker.type = Marker.TEXT_VIEW_FACING
+        marker.action = Marker.ADD
+        marker.pose.position.x = px
+        marker.pose.position.y = py
+        marker.pose.position.z = label_height + 0.20
+        marker.scale.z = 0.35 if is_dynamic else 0.28
+        marker.color = marker_color
+        marker.text = label_text
+        marker.lifetime = marker_lifetime
+        current_markers.append(marker)
+
+        dot_marker = Marker()
+        dot_marker.header.frame_id = 'map'
+        dot_marker.header.stamp = now_msg
+        dot_marker.ns = f"{marker_ns_prefix}_anchors"
+        dot_marker.id = marker_seq
+        marker_seq += 1
+        dot_marker.type = Marker.SPHERE
+        dot_marker.action = Marker.ADD
+        dot_marker.pose.position.x = px
+        dot_marker.pose.position.y = py
+        dot_marker.pose.position.z = 0.12
+        dot_marker.scale.x = anchor_scale
+        dot_marker.scale.y = anchor_scale
+        dot_marker.scale.z = anchor_scale
+        dot_marker.color = marker_color
+        dot_marker.lifetime = marker_lifetime
+        current_markers.append(dot_marker)
+        
+        return marker_seq
 
     def _draw_cached_boxes(self, frame):
         for (x1, y1, x2, y2, color, label_text) in getattr(self, '_cached_boxes', []):
@@ -706,21 +705,6 @@ class VisionPerceptionNode(Node):
             ly = max(y1, th + bl + 4)
             cv2.rectangle(frame, (x1, ly - th - bl - 4), (x1 + tw, ly), color, cv2.FILLED)
             cv2.putText(frame, label_text, (x1, ly - bl - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
-            
-        if self._show_window:
-            cv2.imshow("Wearable Vision System", frame)
-            cv2.waitKey(1)
-        
-        try:
-            debug_msg = Image()
-            debug_msg.header.stamp = self.get_clock().now().to_msg()
-            debug_msg.height, debug_msg.width = frame.shape[:2]
-            debug_msg.encoding = "bgr8"
-            debug_msg.step = frame.shape[1] * 3
-            debug_msg.data = np.ascontiguousarray(frame).tobytes()
-            self._image_pub.publish(debug_msg)
-        except Exception:
-            pass
 
 def main(args=None) -> None:
     rclpy.init(args=args)
@@ -728,7 +712,8 @@ def main(args=None) -> None:
         rclpy.spin(VisionPerceptionNode())
     except KeyboardInterrupt:
         pass
-    if rclpy.ok():
+    finally:
+        cv2.destroyAllWindows()
         rclpy.shutdown()
 
 if __name__ == "__main__":

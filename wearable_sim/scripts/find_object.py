@@ -217,7 +217,7 @@ class FindObjectNode(Node):
             except queue.Empty:
                 continue
             
-            if target == 'exit' or target == 'stop navigation':
+            if target == 'exit' or target == 'stop navigation' or target == 'stop':
                 if self.navigating:
                     self.navigating = False
                     self.speak("Navigation stopped.")
@@ -289,8 +289,10 @@ class FindObjectNode(Node):
         tx, ty = target_pos.x, target_pos.y
         
         last_instruction = ""
+        last_speech_time = 0
         recalc_counter = 0
-        arrival_threshold = 1.5  # meters — "you have arrived"
+        arrival_threshold = 0.8  # meters — stop closer to the object
+        current_grid_path = None
         
         print("\n" + "=" * 50)
         print(f"🧭 NAVIGATING TO: {friendly_name}")
@@ -300,7 +302,7 @@ class FindObjectNode(Node):
         while rclpy.ok() and self.navigating:
             pose = self.get_robot_pose()
             if pose is None:
-                time.sleep(0.5)
+                time.sleep(0.1)
                 continue
                 
             rx, ry, robot_yaw = pose
@@ -310,29 +312,43 @@ class FindObjectNode(Node):
             # ---- ARRIVAL CHECK ----
             if dist_to_target < arrival_threshold:
                 self.speak(f"You have arrived at {friendly_name}. It should be within reach.")
-                self._path_pub.publish(Path(header=PoseStamped().header))  # Clear path
                 empty_path = Path()
                 empty_path.header.frame_id = 'map'
                 self._path_pub.publish(empty_path)
                 break
-            
-            # ---- RECALCULATE A* PATH every 3 cycles (1.5 seconds) ----
+                
+            # ---- RECALCULATE A* PATH every 1.0 second (10 cycles) ----
+            if recalc_counter % 10 == 0:
+                new_path = self._calculate_path(rx, ry, tx, ty)
+                if new_path:
+                    current_grid_path = new_path
             recalc_counter += 1
-            if recalc_counter % 3 == 1:
-                grid_path = self._calculate_path(rx, ry, tx, ty)
-                if grid_path:
-                    self._publish_path(grid_path)
+            
+            # ---- DYNAMIC PATH PUBLISHING (10 Hz) ----
+            # Strip waypoints that we have already passed
+            if current_grid_path:
+                # Find the closest waypoint to the robot
+                min_idx = 0
+                min_d = float('inf')
+                for i, (gx, gy) in enumerate(current_grid_path):
+                    wx, wy = self.grid_to_world(gx, gy, self.map_data.info)
+                    d = math.hypot(wx - rx, wy - ry)
+                    if d < min_d:
+                        min_d = d
+                        min_idx = i
+                # Keep only waypoints from the closest one onwards
+                current_grid_path = current_grid_path[min_idx:]
+                # Publish perfectly anchored to the robot's real-time position
+                self._publish_path(current_grid_path, rx, ry, tx, ty)
             
             # ---- FIND NEXT WAYPOINT (~2m ahead on path) ----
-            if grid_path:
-                waypoint_x, waypoint_y = tx, ty
-                for (gx, gy) in grid_path:
+            waypoint_x, waypoint_y = tx, ty
+            if current_grid_path:
+                for (gx, gy) in current_grid_path:
                     wx, wy = self.grid_to_world(gx, gy, self.map_data.info)
                     if math.hypot(wx - rx, wy - ry) >= 2.0:
                         waypoint_x, waypoint_y = wx, wy
                         break
-            else:
-                waypoint_x, waypoint_y = tx, ty
             
             # ---- CALCULATE DIRECTION ----
             rel_angle, clock_hr = self.get_relative_direction(robot_yaw, waypoint_x, waypoint_y, rx, ry)
@@ -340,21 +356,18 @@ class FindObjectNode(Node):
             
             # ---- GENERATE INSTRUCTION ----
             if abs_angle_deg > 45:
-                # Big turn needed
                 direction = "left" if rel_angle > 0 else "right"
                 if dist_ft > 15:
                     instruction = f"Turn {direction} to your {clock_hr} o clock. {int(dist_ft)} feet remaining."
                 else:
                     instruction = f"Turn {direction} now. Almost there."
             elif abs_angle_deg > 15:
-                # Slight correction
                 direction = "slightly left" if rel_angle > 0 else "slightly right"
                 if dist_ft > 15:
                     instruction = f"Bear {direction}. {int(dist_ft)} feet to go."
                 else:
                     instruction = f"Bear {direction}. Almost there."
             else:
-                # Going straight
                 if dist_ft > 30:
                     instruction = f"Keep going straight. {int(dist_ft)} feet remaining."
                 elif dist_ft > 10:
@@ -362,20 +375,35 @@ class FindObjectNode(Node):
                 else:
                     instruction = f"Almost there. {int(dist_ft)} feet."
             
-            # ---- SPEAK ONLY WHEN INSTRUCTION CHANGES ----
-            # (Don't spam "go straight" every 0.5 seconds)
-            instruction_type = instruction.split(".")[0]  # Compare just the first part
-            if instruction_type != last_instruction:
+            # ---- SPEAK INSTRUCTION ----
+            instruction_type = instruction.split(".")[0]
+            now = time.time()
+            if instruction_type != last_instruction or (now - last_speech_time > 8.0):
                 self.speak(instruction)
                 last_instruction = instruction_type
-            else:
-                # Print silently so terminal shows progress
+                last_speech_time = now
                 print(f"  📍 {instruction}")
             
-            time.sleep(0.5)
+            time.sleep(0.1)
         
         self.navigating = False
         print("\n✅ Navigation ended.\n")
+
+    def smooth_path_chaikin(self, path, iterations=3):
+        """Smooth a list of points using Chaikin's corner cutting algorithm (Tesla-like curves)."""
+        if len(path) <= 2:
+            return path
+        for _ in range(iterations):
+            new_path = [path[0]]
+            for i in range(len(path) - 1):
+                p0 = path[i]
+                p1 = path[i+1]
+                q = (0.75 * p0[0] + 0.25 * p1[0], 0.75 * p0[1] + 0.25 * p1[1])
+                r = (0.25 * p0[0] + 0.75 * p1[0], 0.25 * p0[1] + 0.75 * p1[1])
+                new_path.extend([q, r])
+            new_path.append(path[-1])
+            path = new_path
+        return path
 
     def _calculate_path(self, rx, ry, tx, ty):
         """Calculate A* path from robot to target."""
@@ -383,20 +411,40 @@ class FindObjectNode(Node):
             return None
         start_grid = self.world_to_grid(rx, ry, self.map_data.info)
         goal_grid = self.world_to_grid(tx, ty, self.map_data.info)
-        return self.a_star(start_grid, goal_grid, self.map_data)
+        raw_path = self.a_star(start_grid, goal_grid, self.map_data)
+        if raw_path:
+            return self.smooth_path_chaikin(raw_path, iterations=3)
+        return None
 
-    def _publish_path(self, grid_path):
-        """Publish the path to RViz."""
+    def _publish_path(self, grid_path, rx, ry, tx, ty):
+        """Publish the path to RViz, perfectly anchored to the robot and target."""
         path = Path()
         path.header.frame_id = 'map'
         path.header.stamp = self.get_clock().now().to_msg()
+        
+        # Add exact robot position
+        pose = PoseStamped()
+        pose.header = path.header
+        pose.pose.position.x = float(rx)
+        pose.pose.position.y = float(ry)
+        path.poses.append(pose)
+        
+        # Add grid waypoints
         for (gx, gy) in grid_path:
             wx, wy = self.grid_to_world(gx, gy, self.map_data.info)
             pose = PoseStamped()
             pose.header = path.header
-            pose.pose.position.x = wx
-            pose.pose.position.y = wy
+            pose.pose.position.x = float(wx)
+            pose.pose.position.y = float(wy)
             path.poses.append(pose)
+            
+        # Add exact target position
+        pose = PoseStamped()
+        pose.header = path.header
+        pose.pose.position.x = float(tx)
+        pose.pose.position.y = float(ty)
+        path.poses.append(pose)
+        
         self._path_pub.publish(path)
 
     def world_to_grid(self, x, y, map_info):
@@ -414,29 +462,64 @@ class FindObjectNode(Node):
         h = map_msg.info.height
         data = map_msg.data
         
-        def is_free(gx, gy):
-            if gx < 0 or gx >= w or gy < 0 or gy >= h: return False
-            for dx in range(-2, 3):
-                for dy in range(-2, 3):
-                    if dx*dx + dy*dy > 4:
-                        continue
-                    nx, ny = gx + dx, gy + dy
-                    if 0 <= nx < w and 0 <= ny < h:
-                        val = data[ny * w + nx]
-                        if val >= 50 or val == -1:
-                            return False
+        def is_free(gx, gy, radius=4):
+            if gx < radius or gx >= w - radius or gy < radius or gy >= h - radius: return False
+            # Check bounding box (square is faster than circle in Python)
+            for dy in range(-radius, radius + 1):
+                row_idx = (gy + dy) * w
+                for dx in range(-radius, radius + 1):
+                    val = data[row_idx + gx + dx]
+                    if val >= 50 or val == -1:
+                        return False
             return True
             
+        def line_of_sight(p1, p2):
+            x0, y0 = p1
+            x1, y1 = p2
+            dx = abs(x1 - x0)
+            dy = abs(y1 - y0)
+            sx = 1 if x0 < x1 else -1
+            sy = 1 if y0 < y1 else -1
+            err = dx - dy
+            
+            while True:
+                if not is_free(x0, y0, radius=3): return False
+                if x0 == x1 and y0 == y1: break
+                e2 = 2 * err
+                if e2 > -dy:
+                    err -= dy
+                    x0 += sx
+                if e2 < dx:
+                    err += dx
+                    y0 += sy
+            return True
+
         sx, sy = start_idx
         gx, gy = goal_idx
         
+        # Try to find a nearby free spot if start is stuck in a wall
+        if not is_free(sx, sy, 3):
+            found_free = False
+            for r in range(1, 10):
+                for dx in range(-r, r+1):
+                    for dy in range(-r, r+1):
+                        if is_free(sx+dx, sy+dy, 3):
+                            sx += dx
+                            sy += dy
+                            found_free = True
+                            break
+                    if found_free: break
+                if found_free: break
+        
         open_set = []
+        import heapq
         heapq.heappush(open_set, (0, sx, sy))
         came_from = {}
         g_score = {(sx, sy): 0}
         best_node = (sx, sy)
         min_dist = math.hypot(sx - gx, sy - gy)
 
+        raw_path = []
         while open_set:
             _, cx, cy = heapq.heappop(open_set)
             dist = math.hypot(cx - gx, cy - gy)
@@ -446,17 +529,16 @@ class FindObjectNode(Node):
                 best_node = (cx, cy)
                 
             if dist <= 3:
-                path = []
                 curr = (cx, cy)
                 while curr in came_from:
-                    path.append(curr)
+                    raw_path.append(curr)
                     curr = came_from[curr]
-                path.reverse()
-                return path
+                raw_path.reverse()
+                break
                 
             for dx, dy in [(0,1), (1,0), (0,-1), (-1,0), (1,1), (-1,-1), (1,-1), (-1,1)]:
                 nx, ny = cx + dx, cy + dy
-                if not is_free(nx, ny):
+                if not is_free(nx, ny, radius=4):
                     continue
                 cost = 1.414 if dx != 0 and dy != 0 else 1.0
                 tentative_g = g_score[(cx, cy)] + cost
@@ -466,13 +548,26 @@ class FindObjectNode(Node):
                     f_score = tentative_g + math.hypot(gx - nx, gy - ny)
                     heapq.heappush(open_set, (f_score, nx, ny))
                     
-        path = []
-        curr = best_node
-        while curr in came_from:
-            path.append(curr)
-            curr = came_from[curr]
-        path.reverse()
-        return path
+        if not raw_path:
+            curr = best_node
+            while curr in came_from:
+                raw_path.append(curr)
+                curr = came_from[curr]
+            raw_path.reverse()
+            
+        if len(raw_path) <= 2:
+            return raw_path
+            
+        # Path Smoothing (String Pulling)
+        smoothed_path = [raw_path[0]]
+        current = raw_path[0]
+        for i in range(1, len(raw_path)):
+            if not line_of_sight(current, raw_path[i]):
+                smoothed_path.append(raw_path[i-1])
+                current = raw_path[i-1]
+        smoothed_path.append(raw_path[-1])
+        
+        return smoothed_path
 
 def main(args=None):
     rclpy.init(args=args)

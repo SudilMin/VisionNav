@@ -64,6 +64,7 @@ install(
 # Makes each script in scripts/ executable via `ros2 run wearable_sim <name>`
 install(PROGRAMS
   scripts/arrow_teleop.py
+  scripts/kobuki_driver.py
   scripts/download_model.py
   scripts/vision_perception.py
   scripts/find_object.py

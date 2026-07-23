@@ -1,79 +1,85 @@
 #!/usr/bin/env python3
 """
-arrow_teleop.py - Arrow key teleop using curses for reliable key capture.
-Publishes Twist to /cmd_vel. Stops instantly when keys are released.
+Arrow-Key Teleop for ROS 2 – drive with arrow keys, stop on release.
 """
 import curses
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
-import threading
+
+LINEAR_SPEED  = 0.3
+ANGULAR_SPEED = 1.0
+
 
 class ArrowTeleop(Node):
     def __init__(self):
         super().__init__('arrow_teleop')
         self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.speed = 0.8
-        self.turn = 1.2
 
-def ros_spin(node):
-    rclpy.spin(node)
+    def send(self, linear: float, angular: float):
+        t = Twist()
+        t.linear.x = linear
+        t.angular.z = angular
+        self.pub.publish(t)
 
-def safe_addstr(stdscr, y, x, text):
-    """Write text to screen, silently ignoring if terminal is too small."""
-    try:
-        stdscr.addstr(y, x, text)
-    except curses.error:
-        pass
+    def stop(self):
+        self.send(0.0, 0.0)
 
-def main(stdscr):
-    curses.curs_set(0)
-    stdscr.nodelay(True)
-    stdscr.timeout(50)
 
-    rclpy.init()
+def main(args=None):
+    rclpy.init(args=args)
     node = ArrowTeleop()
 
-    spin_thread = threading.Thread(target=ros_spin, args=(node,), daemon=True)
-    spin_thread.start()
-
-    safe_addstr(stdscr, 0, 0, "TELEOP: Arrows=Move  Q=Quit")
-    safe_addstr(stdscr, 1, 0, "----------------------------")
-    stdscr.refresh()
+    stdscr = curses.initscr()
+    curses.noecho()
+    curses.cbreak()
+    stdscr.keypad(True)
+    stdscr.nodelay(True)
+    stdscr.timeout(100)
 
     try:
-        while rclpy.ok():
+        stdscr.addstr(0, 0, '=== Arrow-Key Teleop ===')
+        stdscr.addstr(1, 0, 'Up/Down = forward/back   Left/Right = turn')
+        stdscr.addstr(2, 0, 'q = quit')
+        stdscr.addstr(4, 0, 'Status: READY')
+
+        while True:
             key = stdscr.getch()
-            twist = Twist()
-            status = "STOPPED        "
-
-            if key == curses.KEY_UP:
-                twist.linear.x = node.speed
-                status = "FORWARD >>>>   "
-            elif key == curses.KEY_DOWN:
-                twist.linear.x = -node.speed
-                status = "<<<< REVERSE   "
-            elif key == curses.KEY_LEFT:
-                twist.angular.z = node.turn
-                status = "<<< TURN LEFT  "
-            elif key == curses.KEY_RIGHT:
-                twist.angular.z = -node.turn
-                status = "TURN RIGHT >>> "
-            elif key == ord('q') or key == ord('Q'):
-                node.pub.publish(Twist())
+            if key == ord('q'):
                 break
+            elif key == curses.KEY_UP:
+                node.send(LINEAR_SPEED, 0.0)
+                status = 'FORWARD'
+            elif key == curses.KEY_DOWN:
+                node.send(-LINEAR_SPEED, 0.0)
+                status = 'BACKWARD'
+            elif key == curses.KEY_LEFT:
+                node.send(0.0, ANGULAR_SPEED)
+                status = 'TURN LEFT'
+            elif key == curses.KEY_RIGHT:
+                node.send(0.0, -ANGULAR_SPEED)
+                status = 'TURN RIGHT'
+            else:
+                node.stop()
+                status = 'STOPPED'
 
-            node.pub.publish(twist)
-            safe_addstr(stdscr, 2, 0, status)
+            stdscr.move(4, 0)
+            stdscr.clrtoeol()
+            stdscr.addstr(4, 0, f'Status: {status}')
             stdscr.refresh()
 
     except KeyboardInterrupt:
-        node.pub.publish(Twist())
+        pass
     finally:
-        node.pub.publish(Twist())
+        node.stop()
+        curses.nocbreak()
+        stdscr.keypad(False)
+        curses.echo()
+        curses.endwin()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
 
+
 if __name__ == '__main__':
-    curses.wrapper(main)
+    main()
