@@ -13,6 +13,8 @@ from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
+import os
+
 class PhoneCameraNode(Node):
     def __init__(self):
         super().__init__('phone_camera')
@@ -29,19 +31,36 @@ class PhoneCameraNode(Node):
         self.bridge = CvBridge()
         
         self.cap = None
-        for index in [0, 1, 2, 3, 4, 5, 6]:
-            candidate = cv2.VideoCapture(index)
+        
+        # 1. Check if user specified an IP Webcam URL (via environment variable CAMERA_URL)
+        camera_url = os.environ.get('CAMERA_URL', '').strip()
+        if camera_url:
+            self.get_logger().info(f"Connecting to wireless IP Webcam stream at: {camera_url}...")
+            candidate = cv2.VideoCapture(camera_url)
             if candidate.isOpened():
                 ret, frame = candidate.read()
                 if ret and frame is not None:
                     self.cap = candidate
-                    self.get_logger().info(f"Camera opened at /dev/video{index}")
-                    break
-            candidate.release()
-
-        if self.cap is None:
-            self.get_logger().error("Could not open any /dev/video0..6 camera. Check USB webcam mode and permissions.")
-            import sys; sys.exit(1)
+                    self.get_logger().info(f"✅ Successfully linked to IP Webcam stream!")
+            if self.cap is None:
+                self.get_logger().error(f"Failed to open IP Webcam stream at {camera_url}. Check Wi-Fi connection and URL.")
+                import sys; sys.exit(1)
+        else:
+            # 2. Fall back to scanning local hardware video devices 0..34
+            self.get_logger().info("No CAMERA_URL set. Scanning local USB hardware webcams...")
+            for index in range(0, 35):
+                candidate = cv2.VideoCapture(index)
+                if candidate.isOpened():
+                    ret, frame = candidate.read()
+                    if ret and frame is not None:
+                        self.cap = candidate
+                        self.get_logger().info(f"Camera opened at /dev/video{index}")
+                        break
+                candidate.release()
+            
+            if self.cap is None:
+                self.get_logger().error("Could not open any camera device or IP stream. Set CAMERA_URL or check USB permissions.")
+                import sys; sys.exit(1)
             
         # Optional: Set resolution to 640x480 for faster AI processing
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)

@@ -81,12 +81,22 @@ class KalmanTracker:
         self.P = self.F @ self.P @ self.F.T + self.Q
         
     def update(self, px: float, py: float, conf: float, now: float):
-        z = np.array([px, py], dtype=np.float64)
-        y = z - (self.H @ self.x)
-        S = self.H @ self.P @ self.H.T + self.R
-        K = self.P @ self.H.T @ np.linalg.inv(S)
-        self.x = self.x + (K @ y)
-        self.P = (np.eye(4) - K @ self.H) @ self.P
+        dist_jump = math.hypot(px - self.x[0], py - self.x[1])
+        # If position shift is under 15 cm (typical sensor/AI jitter), lock pose firmly in place
+        if dist_jump < 0.15 and not self.is_dynamic:
+            self.x[0] = 0.95 * self.x[0] + 0.05 * px
+            self.x[1] = 0.95 * self.x[1] + 0.05 * py
+        elif dist_jump < 0.10 and self.is_dynamic:
+            self.x[0] = 0.90 * self.x[0] + 0.10 * px
+            self.x[1] = 0.90 * self.x[1] + 0.10 * py
+        else:
+            # Object is actively translating; apply real-time Kalman tracking
+            z = np.array([px, py], dtype=np.float64)
+            y = z - (self.H @ self.x)
+            S = self.H @ self.P @ self.H.T + self.R
+            K = self.P @ self.H.T @ np.linalg.inv(S)
+            self.x = self.x + (K @ y)
+            self.P = (np.eye(4) - K @ self.H) @ self.P
         self.conf = max(self.conf * 0.95, conf)
         self.last_seen = now
 
@@ -164,7 +174,7 @@ class VisionPerceptionNode(Node):
         self._next_static_track_id = {}
         self._static_box_tracks = {}
         self._static_smoothing_alpha = float(os.environ.get("WEARABLE_STATIC_SMOOTHING_ALPHA", "0.05"))
-        self._static_bbox_alpha = float(os.environ.get("WEARABLE_STATIC_BBOX_ALPHA", "1.0"))
+        self._static_bbox_alpha = float(os.environ.get("WEARABLE_STATIC_BBOX_ALPHA", "0.35"))
         self._static_bbox_assoc_px = float(os.environ.get("WEARABLE_STATIC_BBOX_ASSOC_PX", "180.0"))
         self._static_association_distance = float(os.environ.get("WEARABLE_STATIC_ASSOC_DISTANCE", "1.50"))
         self._static_track_timeout = float(os.environ.get("WEARABLE_STATIC_TRACK_TIMEOUT", "15.0"))
@@ -173,7 +183,7 @@ class VisionPerceptionNode(Node):
         self._next_dynamic_track_id = {}
         self._dynamic_box_tracks = {}
         self._dynamic_smoothing_alpha = float(os.environ.get("WEARABLE_DYNAMIC_SMOOTHING_ALPHA", "0.30"))
-        self._dynamic_bbox_alpha = float(os.environ.get("WEARABLE_DYNAMIC_BBOX_ALPHA", "1.0"))
+        self._dynamic_bbox_alpha = float(os.environ.get("WEARABLE_DYNAMIC_BBOX_ALPHA", "0.50"))
         self._dynamic_bbox_assoc_px = float(os.environ.get("WEARABLE_DYNAMIC_BBOX_ASSOC_PX", "250.0"))
         self._dynamic_association_distance = float(os.environ.get("WEARABLE_DYNAMIC_ASSOC_DISTANCE", "2.0"))
         self._dynamic_track_timeout = float(os.environ.get("WEARABLE_DYNAMIC_TRACK_TIMEOUT", "2.0"))
@@ -312,6 +322,8 @@ class VisionPerceptionNode(Node):
             tracks.append(best_track)
         else:
             alpha = max(0.0, min(self._static_bbox_alpha, 1.0))
+            if math.hypot(cx - best_track["cx"], cy - best_track["cy"]) < 8.0:
+                alpha *= 0.15
             best_track["cx"] = (1.0 - alpha) * best_track["cx"] + alpha * cx
             best_track["cy"] = (1.0 - alpha) * best_track["cy"] + alpha * cy
             best_track["bw"] = (1.0 - alpha) * best_track["bw"] + alpha * float(bw)
@@ -360,6 +372,8 @@ class VisionPerceptionNode(Node):
             tracks.append(best_track)
         else:
             alpha = max(0.0, min(self._dynamic_bbox_alpha, 1.0))
+            if math.hypot(cx - best_track["cx"], cy - best_track["cy"]) < 10.0:
+                alpha *= 0.20
             best_track["cx"] = (1.0 - alpha) * best_track["cx"] + alpha * cx
             best_track["cy"] = (1.0 - alpha) * best_track["cy"] + alpha * cy
             best_track["bw"] = (1.0 - alpha) * best_track["bw"] + alpha * float(bw)
@@ -575,21 +589,13 @@ class VisionPerceptionNode(Node):
             camera_depth = max(0.5, min(camera_depth, 25.0))
 
             lidar_depth = self._estimate_lidar_depth(yaw, half_width_angle)
-            max_lidar_diff = self._lidar_camera_max_diff if is_dynamic else self._static_lidar_camera_max_diff
             
-            if is_truncated and lidar_depth is not None:
-                depth = lidar_depth
-                depth_source = "lidar_truncated_override"
-            elif (
-                self._trust_lidar_depth
-                and lidar_depth is not None
-                and abs(lidar_depth - camera_depth) <= max_lidar_diff
-            ):
+            if lidar_depth is not None:
                 depth = lidar_depth
                 depth_source = "lidar"
             else:
                 depth = camera_depth
-                depth_source = "camera" if lidar_depth is None else "camera_lidar_rejected"
+                depth_source = "camera_fallback"
                     
             mx = depth * math.cos(yaw)
             my = depth * math.sin(yaw)

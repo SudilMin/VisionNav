@@ -13,20 +13,19 @@ def generate_launch_description():
     slam_params_file = os.path.join(pkg_dir, 'config', 'slam_params_real.yaml')
 
     return LaunchDescription([
-        # 1. LDROBOT STL-19P Driver (Baudrate 230400)
+        # 1. Slamtec RPLiDAR C1 Driver (Baudrate 460800)
         Node(
-            package='ldlidar_stl_ros2',
-            executable='ldlidar_stl_ros2_node',
-            name='LD19',
+            package='rplidar_ros',
+            executable='rplidar_composition',
+            name='rplidar_c1',
             output='screen',
             parameters=[
-                {'product_name': 'LDLiDAR_LD19'},
-                {'topic_name': 'scan'},
+                {'serial_port': '/dev/ttyUSB0'},
+                {'serial_baudrate': 460800},
                 {'frame_id': 'laser'},
-                {'port_name': '/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0'},
-                {'port_baudrate': 230400},
-                {'laser_scan_dir': True},
-                {'enable_angle_crop_func': False}
+                {'inverted': False},
+                {'angle_compensate': True},
+                {'scan_mode': 'Standard'}
             ]
         ),
 
