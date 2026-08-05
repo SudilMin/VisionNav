@@ -171,10 +171,36 @@ class SceneDescriberNode(Node):
 
 
 def main_ros():
-    """Run as a ROS 2 node (connects to the live camera topic)."""
+    """Run as a ROS 2 node (connects to the live camera topic and allows terminal triggers)."""
     vlm = OfflineVLM()
     rclpy.init()
     node = SceneDescriberNode(vlm)
+    
+    # Background thread allowing instant frame capture and description by simply pressing ENTER!
+    def keyboard_trigger_loop():
+        time.sleep(1)
+        print("\n" + "="*65)
+        print("💡 TIP: Press [ENTER] right here in this terminal at any time")
+        print("   to capture the current camera frame and describe the scene!")
+        print("   (Or type a custom question like 'Read this sign' and hit Enter)")
+        print("="*65 + "\n")
+        while rclpy.ok():
+            try:
+                user_q = input()
+                if not user_q.strip():
+                    user_q = "Describe what you see in this image in a clear, natural sentence."
+                if node.latest_frame is not None:
+                    node._process_question(user_q)
+                else:
+                    print("⚠️ No camera frame received on /camera/image_raw yet! Make sure your camera stream is running in Terminal 1.")
+            except EOFError:
+                break
+            except Exception:
+                pass
+
+    kb_thread = threading.Thread(target=keyboard_trigger_loop, daemon=True)
+    kb_thread.start()
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

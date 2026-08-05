@@ -70,6 +70,7 @@ install(PROGRAMS
   scripts/find_object.py
   scripts/scene_describer.py
   scripts/phone_camera.py
+  scripts/esp32_bridge.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
