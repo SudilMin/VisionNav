@@ -182,7 +182,17 @@ class VisionPerceptionNode(Node):
 
         cv2.setNumThreads(1)
         self._window_name = f"VisionNav AI [{self._mode.upper()}]"
-        self._show_window = os.environ.get("WEARABLE_SHOW_WINDOW", "1") != "0"
+        
+        # Auto-detect headless environment
+        has_display = "DISPLAY" in os.environ or "WAYLAND_DISPLAY" in os.environ
+        show_window_env = os.environ.get("WEARABLE_SHOW_WINDOW", "1")
+        if show_window_env != "0" and has_display:
+            self._show_window = True
+        else:
+            self._show_window = False
+            if show_window_env != "0":
+                self.get_logger().warn("No display detected. Forcing WEARABLE_SHOW_WINDOW=0 (Headless Mode).")
+
         if self._show_window:
             cv2.namedWindow(self._window_name, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(self._window_name, 800, 600)
@@ -199,7 +209,8 @@ class VisionPerceptionNode(Node):
             history=HistoryPolicy.KEEP_LAST
         )
 
-        # ── DIRECT CAMERA OWNERSHIP (ZERO-LAG) ─────────────────────────────────
+        # ── CAMERA ACQUISITION MODE (Direct USB or ROS Wi-Fi) ──
+        self._camera_mode = os.environ.get("WEARABLE_CAMERA_MODE", "direct").lower()
         self._camera_pub = self.create_publisher(Image, '/camera/image_raw', realtime_qos)
         self._image_pub = self.create_publisher(Image, "/vision/debug_image", 10)
         
@@ -215,16 +226,24 @@ class VisionPerceptionNode(Node):
         self._hud_lock = threading.Lock()
         self._hud_tracks = {}
         
-        # High-speed background USB capture thread (flushes kernel buffer)
         self._gui_frame = None
-        self._direct_cap = self._open_direct_camera()
-        if self._direct_cap is not None:
-            self.get_logger().info("✅ Direct camera active! High-speed V4L2 capture enabled.")
-            self._cam_drain_thread = threading.Thread(
-                target=self._cam_drain_loop, daemon=True)
-            self._cam_drain_thread.start()
+        
+        if self._camera_mode == "ros":
+            # Distributed Mode: Listen to the Pi 5's camera over Wi-Fi
+            self.get_logger().info("📡 Distributed Mode: Subscribing to /camera/image_raw over ROS.")
+            self._image_sub = self.create_subscription(
+                Image, '/camera/image_raw', self._ros_camera_callback, realtime_qos
+            )
         else:
-            self.get_logger().error("Failed to open any camera. Check USB connection.")
+            # Direct Mode: High-speed background USB capture thread
+            self._direct_cap = self._open_direct_camera()
+            if self._direct_cap is not None:
+                self.get_logger().info("✅ Direct camera active! High-speed V4L2 capture enabled.")
+                self._cam_drain_thread = threading.Thread(
+                    target=self._cam_drain_loop, daemon=True)
+                self._cam_drain_thread.start()
+            else:
+                self.get_logger().error("Failed to open any camera. Check USB connection.")
         
         # Tracking and TF2 timer (runs in background ROS thread)
         self._tracking_timer = self.create_timer(0.05, self._tracking_callback)
@@ -485,6 +504,24 @@ class VisionPerceptionNode(Node):
                         self._camera_pub.publish(msg)
                 except Exception:
                     pass
+
+    def _ros_camera_callback(self, msg: Image) -> None:
+        """Callback for Distributed Mode: Receives image over Wi-Fi."""
+        try:
+            frame = self._bridge.imgmsg_to_cv2(msg, "bgr8")
+        except Exception as e:
+            self.get_logger().error(f"CV Bridge Error: {e}")
+            return
+            
+        self._frame_count += 1
+        now_mono = time.monotonic()
+        self._last_image_time = now_mono
+        self._gui_frame = frame
+        
+        with self._inference_lock:
+            if not self._inference_busy:
+                self._latest_frame = frame.copy()
+                self._latest_frame_stamp = msg.header.stamp
 
     def _scan_callback(self, msg: LaserScan) -> None:
         self._latest_scan = msg

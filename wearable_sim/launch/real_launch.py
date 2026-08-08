@@ -7,12 +7,22 @@ from launch.substitutions import PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
+from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
+from launch.substitutions import LaunchConfiguration
+
 def generate_launch_description():
     pkg_dir = get_package_share_directory('wearable_sim')
     rviz_config = os.path.join(pkg_dir, 'rviz', 'wearable.rviz')
     slam_params_file = os.path.join(pkg_dir, 'config', 'slam_params_real.yaml')
 
+    use_rviz = LaunchConfiguration('use_rviz')
+    declare_use_rviz = DeclareLaunchArgument(
+        'use_rviz', default_value='true', description='Launch RViz for visualization'
+    )
+
     return LaunchDescription([
+        declare_use_rviz,
         # 1. Slamtec RPLiDAR C1 via sllidar_ros2 (works with C1 firmware)
         Node(
             package='sllidar_ros2',
@@ -76,6 +86,7 @@ def generate_launch_description():
             executable='rviz2',
             name='rviz2',
             arguments=['-d', rviz_config],
-            output='screen'
+            output='screen',
+            condition=IfCondition(use_rviz)
         )
     ])
