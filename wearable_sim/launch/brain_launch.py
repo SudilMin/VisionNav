@@ -21,7 +21,37 @@ def generate_launch_description():
     return LaunchDescription([
         declare_use_rviz,
 
-        # 1. SLAM Toolbox
+        # 1. odom → base_footprint
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='odom_to_base',
+            arguments=['--x', '0.0', '--y', '0.0', '--z', '0.0',
+                        '--roll', '0.0', '--pitch', '0.0', '--yaw', '0.0',
+                        '--frame-id', 'odom', '--child-frame-id', 'base_footprint']
+        ),
+
+        # 2. LiDAR Mount
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='fake_lidar_mount',
+            arguments=['--x', '0.0', '--y', '0.0', '--z', '1.2',
+                        '--roll', '0.0', '--pitch', '0.0', '--yaw', '0.0',
+                        '--frame-id', 'base_footprint', '--child-frame-id', 'laser']
+        ),
+
+        # 3. Camera Mount
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='fake_camera_mount',
+            arguments=['--x', '0.0', '--y', '0.0', '--z', '1.3',
+                        '--roll', '-1.57079632679', '--pitch', '0.0', '--yaw', '-1.57079632679',
+                        '--frame-id', 'base_footprint', '--child-frame-id', 'camera_link']
+        ),
+
+        # 4. SLAM Toolbox
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 PathJoinSubstitution([FindPackageShare('slam_toolbox'), 'launch', 'online_async_launch.py'])
@@ -32,7 +62,7 @@ def generate_launch_description():
             }.items()
         ),
 
-        # 2. RViz for Visualization
+        # 5. RViz for Visualization
         Node(
             package='rviz2',
             executable='rviz2',

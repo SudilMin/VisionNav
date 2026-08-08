@@ -30,35 +30,5 @@ def generate_launch_description():
                 {'image_size': [640, 480]},
                 {'camera_frame_id': 'camera_link'}
             ]
-        ),
-
-        # 3. odom → base_footprint
-        Node(
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            name='odom_to_base',
-            arguments=['--x', '0.0', '--y', '0.0', '--z', '0.0',
-                        '--roll', '0.0', '--pitch', '0.0', '--yaw', '0.0',
-                        '--frame-id', 'odom', '--child-frame-id', 'base_footprint']
-        ),
-
-        # 4. LiDAR Mount
-        Node(
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            name='fake_lidar_mount',
-            arguments=['--x', '0.0', '--y', '0.0', '--z', '1.2',
-                        '--roll', '0.0', '--pitch', '0.0', '--yaw', '0.0',
-                        '--frame-id', 'base_footprint', '--child-frame-id', 'laser']
-        ),
-
-        # 5. Camera Mount
-        Node(
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            name='fake_camera_mount',
-            arguments=['--x', '0.0', '--y', '0.0', '--z', '1.3',
-                        '--roll', '-1.57079632679', '--pitch', '0.0', '--yaw', '-1.57079632679',
-                        '--frame-id', 'base_footprint', '--child-frame-id', 'camera_link']
-        ),
+        )
     ])
