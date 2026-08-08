@@ -13,66 +13,53 @@ def generate_launch_description():
     slam_params_file = os.path.join(pkg_dir, 'config', 'slam_params_real.yaml')
 
     return LaunchDescription([
-        # 1. Slamtec RPLiDAR C1 Driver (Baudrate 460800)
+        # 1. Slamtec RPLiDAR C1 via sllidar_ros2 (works with C1 firmware)
         Node(
-            package='rplidar_ros',
-            executable='rplidar_composition',
-            name='rplidar_c1',
+            package='sllidar_ros2',
+            executable='sllidar_node',
+            name='sllidar_node',
             output='screen',
             parameters=[
+                {'channel_type': 'serial'},
                 {'serial_port': '/dev/ttyUSB0'},
                 {'serial_baudrate': 460800},
                 {'frame_id': 'laser'},
-                {'inverted': False},
                 {'angle_compensate': True},
-                {'scan_mode': 'Standard'}
+                {'scan_mode': 'Standard'},
             ]
         ),
 
-        # 2. Kobuki Python Driver (Handles serial comms & Odometry TF)
+        # 2. odom → base_footprint (identity transform)
         Node(
-            package='wearable_sim',
-            executable='kobuki_driver.py',
-            name='kobuki_driver',
-            output='screen',
-            parameters=[
-                {'serial_port': '/dev/serial/by-id/usb-Yujin_Robot_iClebo_Kobuki_kobuki_AI02MTI8-if00-port0'}
-            ]
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='odom_to_base',
+            arguments=['--x', '0.0', '--y', '0.0', '--z', '0.0',
+                        '--roll', '0.0', '--pitch', '0.0', '--yaw', '0.0',
+                        '--frame-id', 'odom', '--child-frame-id', 'base_footprint']
         ),
 
-        # 3. Fake LiDAR Mount (Places the LiDAR 1.2m high, flat on the chest)
+        # 3. LiDAR Mount (1.2m high on chest)
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
             name='fake_lidar_mount',
-            arguments=['--x', '0.0', '--y', '0.0', '--z', '1.2', '--yaw', '0', '--pitch', '0', '--roll', '0', '--frame-id', 'base_footprint', '--child-frame-id', 'laser']
+            arguments=['--x', '0.0', '--y', '0.0', '--z', '1.2',
+                        '--roll', '0.0', '--pitch', '0.0', '--yaw', '0.0',
+                        '--frame-id', 'base_footprint', '--child-frame-id', 'laser']
         ),
 
-        # 4. Fake Camera Mount (Places the camera 1.3m high)
+        # 4. Camera Mount (1.3m high, rotated to match camera optical convention)
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
             name='fake_camera_mount',
-            arguments=['--x', '0.0', '--y', '0.0', '--z', '1.3', '--yaw', '0', '--pitch', '0', '--roll', '0', '--frame-id', 'base_footprint', '--child-frame-id', 'camera_link']
+            arguments=['--x', '0.0', '--y', '0.0', '--z', '1.3',
+                        '--roll', '-1.57079632679', '--pitch', '0.0', '--yaw', '-1.57079632679',
+                        '--frame-id', 'base_footprint', '--child-frame-id', 'camera_link']
         ),
 
-        # 5. USB Camera Publisher (Commented out to run separately)
-        # Node(
-        #     package='wearable_sim',
-        #     executable='phone_camera.py',
-        #     name='phone_camera',
-        #     output='screen'
-        # ),
-        # 
-        # # 6. Vision Perception and Semantic Marker Publisher (Commented out to run separately)
-        # Node(
-        #     package='wearable_sim',
-        #     executable='vision_perception.py',
-        #     name='vision_perception',
-        #     output='screen'
-        # ),
-
-        # 7. SLAM Toolbox
+        # 5. SLAM Toolbox
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 PathJoinSubstitution([FindPackageShare('slam_toolbox'), 'launch', 'online_async_launch.py'])
@@ -83,7 +70,7 @@ def generate_launch_description():
             }.items()
         ),
 
-        # 8. RViz for Visualization
+        # 6. RViz for Visualization
         Node(
             package='rviz2',
             executable='rviz2',
