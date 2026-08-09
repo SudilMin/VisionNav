@@ -9,7 +9,7 @@ and publishes it to the ROS 2 `/camera/image_raw` topic so the AI can process it
 import cv2
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage
 from cv_bridge import CvBridge
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 import threading
@@ -28,7 +28,7 @@ class PhoneCameraNode(Node):
             history=HistoryPolicy.KEEP_LAST
         )
         
-        self.publisher_ = self.create_publisher(Image, '/camera/image_raw', realtime_qos)
+        self.publisher_ = self.create_publisher(CompressedImage, '/camera/image_raw/compressed', realtime_qos)
         self.bridge = CvBridge()
         self.publish_fps = float(os.environ.get("CAMERA_PUBLISH_FPS", "15"))
         self.publish_interval = 1.0 / max(self.publish_fps, 1.0)
@@ -101,14 +101,11 @@ class PhoneCameraNode(Node):
                 continue
 
             self._last_publish_time = now
-            msg = Image()
+            # Use cv_bridge to safely encode and format the compressed image
+            msg = self.bridge.cv2_to_compressed_imgmsg(frame, dst_format='jpg')
             msg.header.stamp = self.get_clock().now().to_msg()
             msg.header.frame_id = "camera_link"
-            msg.height, msg.width = frame.shape[:2]
-            msg.encoding = "bgr8"
-            msg.step = frame.shape[1] * 3
             
-            msg.data = np.ascontiguousarray(frame).tobytes()
             self.publisher_.publish(msg)
 
 def main(args=None):

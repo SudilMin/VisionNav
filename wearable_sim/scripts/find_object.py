@@ -99,20 +99,8 @@ class FindObjectNode(Node):
         subprocess.run(command, shell=True)
 
     def _hazard_callback(self, msg: String):
-        """Emergency interrupt when a moving hazard is detected."""
-        now = time.time()
-        # Prevent TTS spam (only alert once every 3 seconds)
-        if now - self.last_hazard_time > 3.0:
-            self.last_hazard_time = now
-            # Hard stop any current navigation
-            if self.navigating:
-                self.navigating = False
-                print("\n🛑 NAVIGATION CANCELED DUE TO EMERGENCY HAZARD 🛑")
-                # Clear path from RViz
-                self._path_pub.publish(Path(header=PoseStamped().header))
-            
-            # Yell the warning
-            self.speak(msg.data)
+        """Hazard warnings are disabled here so they don't interrupt your typing."""
+        pass
 
     def _marker_callback(self, msg: MarkerArray):
         for marker in msg.markers:
@@ -291,7 +279,7 @@ class FindObjectNode(Node):
         last_instruction = ""
         last_speech_time = 0
         recalc_counter = 0
-        arrival_threshold = 0.8  # meters — stop closer to the object
+        arrival_threshold = 0.15  # meters — lowered so you can navigate right up to the object
         current_grid_path = None
         
         print("\n" + "=" * 50)
@@ -414,7 +402,7 @@ class FindObjectNode(Node):
         raw_path = self.a_star(start_grid, goal_grid, self.map_data)
         if raw_path:
             return self.smooth_path_chaikin(raw_path, iterations=3)
-        return None
+        return [start_grid, goal_grid]  # Fallback to straight line if A* fails
 
     def _publish_path(self, grid_path, rx, ry, tx, ty):
         """Publish the path to RViz, perfectly anchored to the robot and target."""
@@ -469,7 +457,7 @@ class FindObjectNode(Node):
                 row_idx = (gy + dy) * w
                 for dx in range(-radius, radius + 1):
                     val = data[row_idx + gx + dx]
-                    if val >= 50 or val == -1:
+                    if val >= 50:  # Allow -1 (unknown space) to be traversed
                         return False
             return True
             

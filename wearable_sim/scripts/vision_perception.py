@@ -24,7 +24,7 @@ import rclpy
 from cv_bridge import CvBridge, CvBridgeError
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import Image, LaserScan
+from sensor_msgs.msg import Image, LaserScan, CompressedImage
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import ColorRGBA, String
 from geometry_msgs.msg import PointStamped
@@ -230,9 +230,9 @@ class VisionPerceptionNode(Node):
         
         if self._camera_mode == "ros":
             # Distributed Mode: Listen to the Pi 5's camera over Wi-Fi
-            self.get_logger().info("📡 Distributed Mode: Subscribing to /camera/image_raw over ROS.")
+            self.get_logger().info("📡 Distributed Mode: Subscribing to /camera/image_raw/compressed over ROS.")
             self._image_sub = self.create_subscription(
-                Image, '/camera/image_raw', self._ros_camera_callback, realtime_qos
+                CompressedImage, '/camera/image_raw/compressed', self._ros_camera_callback, realtime_qos
             )
         else:
             # Direct Mode: High-speed background USB capture thread
@@ -367,32 +367,14 @@ class VisionPerceptionNode(Node):
 
     # ── SPATIAL MEMORY PERSISTENCE (Indoor Mode) ──
     def _load_spatial_memory(self):
-        """Load persistent spatial memory from JSON file."""
-        if not os.path.isfile(SPATIAL_MEMORY_FILE):
-            self.get_logger().info("No existing spatial memory found. Starting fresh.")
-            return
-        try:
-            with open(SPATIAL_MEMORY_FILE, 'r') as f:
-                data = json.load(f)
-            with self._memory_lock:
-                self._spatial_memory = data
-            self.get_logger().info(f"📂 Loaded {len(data)} objects from spatial memory.")
-        except Exception as e:
-            self.get_logger().warn(f"Failed to load spatial memory: {e}")
+        """Spatial memory is now session-only. Cleared on startup."""
+        self.get_logger().info("Starting with a fresh spatial memory for this session.")
+        with self._memory_lock:
+            self._spatial_memory = {}
 
     def _save_spatial_memory(self):
-        """Save spatial memory to JSON file."""
-        if self._mode != "indoor":
-            return
-        try:
-            os.makedirs(SPATIAL_MEMORY_DIR, exist_ok=True)
-            with self._memory_lock:
-                data = copy.deepcopy(self._spatial_memory)
-            with open(SPATIAL_MEMORY_FILE, 'w') as f:
-                json.dump(data, f, indent=2)
-            self.get_logger().info(f"💾 Saved {len(data)} objects to spatial memory.")
-        except Exception as e:
-            self.get_logger().warn(f"Failed to save spatial memory: {e}")
+        """Spatial memory is session-only, no longer saving to disk to prevent stacking."""
+        pass
 
     def _auto_save_memory(self):
         """Timer callback to auto-save spatial memory periodically."""
@@ -505,10 +487,10 @@ class VisionPerceptionNode(Node):
                 except Exception:
                     pass
 
-    def _ros_camera_callback(self, msg: Image) -> None:
+    def _ros_camera_callback(self, msg: CompressedImage) -> None:
         """Callback for Distributed Mode: Receives image over Wi-Fi."""
         try:
-            frame = self._bridge.imgmsg_to_cv2(msg, "bgr8")
+            frame = self._bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
         except Exception as e:
             self.get_logger().error(f"CV Bridge Error: {e}")
             return
@@ -1327,6 +1309,10 @@ def main(args=None) -> None:
     
     # ── MAIN THREAD: High-speed OpenCV GUI loop (maximum FPS, 0ms delay) ──
     try:
+        waiting_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.putText(waiting_frame, "Waiting for camera feed...", (80, 240),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+        
         while rclpy.ok():
             frame = node._gui_frame
             if frame is not None:
@@ -1334,10 +1320,9 @@ def main(args=None) -> None:
                 node._draw_cached_boxes(display_frame)
                 cv2.imshow(node._window_name, display_frame)
             else:
-                time.sleep(0.005)
-                continue
+                cv2.imshow(node._window_name, waiting_frame)
             
-            key = cv2.waitKey(1) & 0xFF
+            key = cv2.waitKey(30) & 0xFF
             if key == 27 or key == ord('q'):
                 break
     except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):

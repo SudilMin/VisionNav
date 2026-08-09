@@ -32,7 +32,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 try:
     import rclpy
     from rclpy.node import Node
-    from sensor_msgs.msg import Image
+    from sensor_msgs.msg import Image, CompressedImage
     from std_msgs.msg import String
     from cv_bridge import CvBridge
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -126,7 +126,7 @@ class SceneDescriberNode(Node):
         )
         
         self._image_sub = self.create_subscription(
-            Image, "/camera/image_raw", self._image_callback, realtime_qos
+            CompressedImage, "/camera/image_raw/compressed", self._image_callback, realtime_qos
         )
         
         # Listen for describe commands from the user
@@ -141,7 +141,7 @@ class SceneDescriberNode(Node):
     
     def _image_callback(self, msg):
         try:
-            self.latest_frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            self.latest_frame = self.bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
         except Exception:
             pass
     

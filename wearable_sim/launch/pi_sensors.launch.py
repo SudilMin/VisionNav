@@ -4,7 +4,7 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     return LaunchDescription([
-        # Only LiDAR — camera is handled directly by sensor_sender.py
+        # Slamtec RPLiDAR C1 via sllidar_ros2
         Node(
             package='sllidar_ros2',
             executable='sllidar_node',
@@ -18,5 +18,5 @@ def generate_launch_description():
                 {'angle_compensate': True},
                 {'scan_mode': 'Standard'},
             ]
-        ),
+        )
     ])

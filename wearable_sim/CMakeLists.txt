@@ -69,6 +69,8 @@ install(PROGRAMS
   scripts/scene_describer.py
   scripts/phone_camera.py
   scripts/esp32_bridge.py
+  scripts/sensor_sender.py
+  scripts/sensor_receiver.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
