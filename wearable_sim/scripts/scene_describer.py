@@ -67,7 +67,7 @@ class OfflineVLM:
             print("❌ Ollama is not running. Please run: curl -fsSL https://ollama.com/install.sh | sh")
             sys.exit(1)
             
-        print("⏳ Warming up the GPU (loading model into VRAM)... this takes ~30s once.")
+        print("⏳ Warming up the GPU (loading model into VRAM)... this takes ~s once.")
         try:
             # Create a tiny 10x10 black image for warmup
             warmup_img = np.zeros((10, 10, 3), dtype=np.uint8)
@@ -180,23 +180,24 @@ def main_ros():
     def keyboard_trigger_loop():
         time.sleep(1)
         print("\n" + "="*65)
-        print("💡 TIP: Press [ENTER] right here in this terminal at any time")
-        print("   to capture the current camera frame and describe the scene!")
-        print("   (Or type a custom question like 'Read this sign' and hit Enter)")
+        print("🤖 MOONDREAM AI READY")
+        print("   Type a question about what the camera sees and press Enter.")
+        print("   (Or just press Enter without typing to get a general description)")
         print("="*65 + "\n")
         while rclpy.ok():
             try:
-                user_q = input()
+                user_q = input("\n👉 Ask a question: ")
                 if not user_q.strip():
                     user_q = "Describe what you see in this image in a clear, natural sentence."
+                
                 if node.latest_frame is not None:
                     node._process_question(user_q)
                 else:
-                    print("⚠️ No camera frame received on /camera/image_raw yet! Make sure your camera stream is running in Terminal 1.")
+                    print("⚠️ No camera frame received yet! Check the camera stream.")
             except EOFError:
                 break
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Error: {e}")
 
     kb_thread = threading.Thread(target=keyboard_trigger_loop, daemon=True)
     kb_thread.start()
