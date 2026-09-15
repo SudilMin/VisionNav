@@ -4,7 +4,7 @@ scene_describer.py
 ------------------
 Offline Vision-Language Model (VLM) for identifying ANY object.
 
-Uses moondream2 (1.6B params) running 100% locally on GPU.
+Uses Qwen3-VL 2B (2 Billion params) running 100% locally on GPU via Ollama.
 When the user says "what is this?", the system:
   1. Grabs the latest camera frame
   2. Feeds it to the VLM
@@ -14,8 +14,7 @@ This handles ALL 160+ objects that YOLO/COCO cannot detect:
   doors, stairs, keys, plates, pillows, white cane, etc.
 
 First-time setup:
-  pip3 install --break-system-packages torch torchvision transformers einops Pillow
-  # The model (~3.5GB) downloads automatically on first run.
+  ollama pull qwen3-vl:2b
 """
 
 import os
@@ -32,7 +31,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 try:
     import rclpy
     from rclpy.node import Node
-    from sensor_msgs.msg import Image
+    from sensor_msgs.msg import Image, CompressedImage
     from std_msgs.msg import String
     from cv_bridge import CvBridge
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -55,13 +54,17 @@ def speak(text):
     subprocess.run(command, shell=True)
 
 
+# ── VLM Model Configuration ──
+VLM_MODEL = os.environ.get("WEARABLE_VLM_MODEL", "moondream")
+
+
 class OfflineVLM:
-    """Moondream2 — using Ollama for lightning-fast 4-bit GPU inference."""
+    """Qwen3-VL 2B — using Ollama for lightning-fast 4-bit GPU inference."""
     
     def __init__(self):
-        print("🧠 Connecting to Ollama Moondream engine...")
+        print(f"🧠 Connecting to Ollama VLM engine (model: {VLM_MODEL})...")
         try:
-            # Check if ollama is running and has moondream
+            # Check if ollama is running
             ollama.list()
         except Exception:
             print("❌ Ollama is not running. Please run: curl -fsSL https://ollama.com/install.sh | sh")
@@ -75,9 +78,9 @@ class OfflineVLM:
             cv2.imwrite(temp_warmup, warmup_img)
             
             ollama.chat(
-                model='moondream',
+                model=VLM_MODEL,
                 messages=[{'role': 'user', 'content': 'test', 'images': [temp_warmup]}],
-                options={'num_predict': 1}
+                options={'num_predict': 1, 'think': False}
             )
         except Exception as e:
             pass
@@ -92,20 +95,31 @@ class OfflineVLM:
         temp_img_path = os.path.join(SCRIPT_DIR, "_temp_vlm_input.jpg")
         cv2.imwrite(temp_img_path, image_np)
         
+        # Prepend /no_think to disable Qwen3's internal reasoning mode,
+        # which otherwise consumes all tokens on hidden <think> tags.
+        prompt_with_directive = question
+        
         try:
             response = ollama.chat(
-                model='moondream',
+                model=VLM_MODEL,
                 messages=[{
                     'role': 'user',
-                    'content': question,
+                    'content': prompt_with_directive,
                     'images': [temp_img_path]
                 }],
                 options={
-                    'num_predict': 40, # Limit output length for faster response
-                    'temperature': 0.1
+                    'num_predict': 150,
+                    'temperature': 0.3,
+                    'think': False,
                 }
             )
             return response['message']['content'].strip()
+            answer = response['message']['content'].strip()
+            # Fallback: strip any leaked <think>...</think> tags if they appear
+            if '<think>' in answer:
+                import re
+                answer = re.sub(r'<think>.*?</think>', '', answer, flags=re.DOTALL).strip()
+            return answer if answer else "I can see the scene but couldn't generate a description. Please try again."
         except Exception as e:
             return f"Error connecting to Ollama: {e}"
 
@@ -126,7 +140,7 @@ class SceneDescriberNode(Node):
         )
         
         self._image_sub = self.create_subscription(
-            Image, "/camera/image_raw", self._image_callback, realtime_qos
+            CompressedImage, "/camera/image_raw/compressed", self._image_callback, realtime_qos
         )
         
         # Listen for describe commands from the user
@@ -141,7 +155,7 @@ class SceneDescriberNode(Node):
     
     def _image_callback(self, msg):
         try:
-            self.latest_frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            self.latest_frame = self.bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
         except Exception:
             pass
     
@@ -171,10 +185,37 @@ class SceneDescriberNode(Node):
 
 
 def main_ros():
-    """Run as a ROS 2 node (connects to the live camera topic)."""
+    """Run as a ROS 2 node (connects to the live camera topic and allows terminal triggers)."""
     vlm = OfflineVLM()
     rclpy.init()
     node = SceneDescriberNode(vlm)
+    
+    # Background thread allowing instant frame capture and description by simply pressing ENTER!
+    def keyboard_trigger_loop():
+        time.sleep(1)
+        print("\n" + "="*65)
+        print(f"🤖 QWEN-VL AI READY (model: {VLM_MODEL})")
+        print("   Type a question about what the camera sees and press Enter.")
+        print("   (Or just press Enter without typing to get a general description)")
+        print("="*65 + "\n")
+        while rclpy.ok():
+            try:
+                user_q = input("\n👉 Ask a question: ")
+                if not user_q.strip():
+                    user_q = "Describe what you see in this image in a clear, natural sentence."
+                
+                if node.latest_frame is not None:
+                    node._process_question(user_q)
+                else:
+                    print("⚠️ No camera frame received yet! Check the camera stream.")
+            except EOFError:
+                break
+            except Exception as e:
+                print(f"Error: {e}")
+
+    kb_thread = threading.Thread(target=keyboard_trigger_loop, daemon=True)
+    kb_thread.start()
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

@@ -16,8 +16,8 @@
     use_map_saver: true
     mode: mapping
 
-    # Time
-    use_sim_time: true
+    # Time - CRITICAL: Must be false for real-world hardware!
+    use_sim_time: false
 
     # Debug
     debug_logging: false
@@ -25,12 +25,12 @@
     transform_publish_period: 0.02
     map_update_interval: 5.0
 
-    # Scan matching
+    # Scan matching (tuned for STL-19P at 5kHz, 12m range)
     resolution: 0.05
     min_laser_range: 0.1
-    max_laser_range: 20.0
-    minimum_travel_distance: 0.10
-    minimum_travel_heading: 0.175
+    max_laser_range: 12.0
+    minimum_travel_distance: 0.05
+    minimum_travel_heading: 0.1
     scan_buffer_size: 10
     scan_buffer_maximum_scan_distance: 10.0
     link_match_minimum_response_fine: 0.1

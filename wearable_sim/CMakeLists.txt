@@ -63,12 +63,14 @@ install(
 # ── Python scripts (vision nodes) ────────────────────────────────────────────
 # Makes each script in scripts/ executable via `ros2 run wearable_sim <name>`
 install(PROGRAMS
-  scripts/arrow_teleop.py
   scripts/download_model.py
   scripts/vision_perception.py
   scripts/find_object.py
-  scripts/text_reader.py
   scripts/scene_describer.py
+  scripts/phone_camera.py
+  scripts/esp32_bridge.py
+  scripts/sensor_sender.py
+  scripts/sensor_receiver.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -78,6 +80,16 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/scripts/yolov5m.onnx")
   install(
     FILES
       scripts/yolov5m.onnx
+    DESTINATION lib/${PROJECT_NAME}
+  )
+endif()
+
+# ── Piper TTS Voice Model ────────────────────────────────────────────────────
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/scripts/en_US-lessac-medium.onnx")
+  install(
+    FILES
+      scripts/en_US-lessac-medium.onnx
+      scripts/en_US-lessac-medium.onnx.json
     DESTINATION lib/${PROJECT_NAME}
   )
 endif()
