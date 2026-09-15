@@ -108,7 +108,8 @@ class FindObjectNode(Node):
                 self.saved_objects.clear()
                 continue
             if marker.text:
-                obj_name = marker.text.lower()
+                # Strip out the height tags like "(0.2m)" and "[MEM]" tags so we just get "chair_1"
+                obj_name = marker.text.split('(')[0].replace("[MEM]", "").strip().lower()
                 self.saved_objects[obj_name] = marker.pose.position
 
     def _map_callback(self, msg: OccupancyGrid):
@@ -209,7 +210,10 @@ class FindObjectNode(Node):
                 if self.navigating:
                     self.navigating = False
                     self.speak("Navigation stopped.")
-                    self._path_pub.publish(Path(header=PoseStamped().header))
+                    cancel_path = Path()
+                    cancel_path.header.frame_id = "map"
+                    cancel_path.header.stamp = self.get_clock().now().to_msg()
+                    self._path_pub.publish(cancel_path)
                 else:
                     self.speak("Shutting down.")
                     rclpy.shutdown()
@@ -228,7 +232,7 @@ class FindObjectNode(Node):
                 search_term = target.replace("find ", "").strip()
                 matched = self.find_match(search_term)
                 if matched:
-                    friendly_name = matched.replace("_", " ")
+                    friendly_name = ''.join(c for c in matched if not c.isdigit()).replace("_", "").strip()
                     self.speak(f"{friendly_name} detected! Say go to {search_term}.")
                     self.last_found_object = matched
                 else:
@@ -261,7 +265,7 @@ class FindObjectNode(Node):
     def navigate_to(self, target_name):
         """Continuously guide the user to the target with voice instructions."""
         self.navigating = True
-        friendly_name = target_name.replace("_", " ")
+        friendly_name = ''.join(c for c in target_name if not c.isdigit()).replace("_", "").strip()
         
         if self.map_data is None:
             self.speak("No map available yet.")
@@ -279,7 +283,7 @@ class FindObjectNode(Node):
         last_instruction = ""
         last_speech_time = 0
         recalc_counter = 0
-        arrival_threshold = 0.15  # meters — lowered so you can navigate right up to the object
+        arrival_threshold = 0.60  # meters — safe arm's reach distance for visually impaired users
         current_grid_path = None
         
         print("\n" + "=" * 50)
@@ -288,6 +292,11 @@ class FindObjectNode(Node):
         print("=" * 50)
         
         while rclpy.ok() and self.navigating:
+            # Dynamically update target position if the vision system refines it!
+            target_pos = self.saved_objects.get(target_name)
+            if target_pos:
+                tx, ty = target_pos.x, target_pos.y
+                
             pose = self.get_robot_pose()
             if pose is None:
                 time.sleep(0.1)

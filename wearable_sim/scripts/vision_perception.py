@@ -55,35 +55,120 @@ _SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 MODEL_PATH  = os.path.join(_SCRIPT_DIR, "yolov5m.onnx")
 DETECTION_FRAME_STRIDE = max(1, int(os.environ.get("WEARABLE_DETECTION_STRIDE", "3")))
 
-NMS_THRESHOLD = 0.45
+NMS_THRESHOLD = 0.15
+
+# ── KNOWN REAL-WORLD MAXIMUM PHYSICAL SIZES (width_m, height_m) ──
+# Used to clamp estimated sizes to prevent wildly oversized RViz markers
+# when LiDAR depth overshoots past the object.
+OBJECT_MAX_SIZES = {
+    # Small objects
+    "mouse":        (0.12, 0.05),
+    "remote":       (0.20, 0.06),
+    "cell phone":   (0.10, 0.18),
+    "smartphone":   (0.10, 0.18),
+    "toothbrush":   (0.03, 0.20),
+    "scissors":     (0.10, 0.20),
+    "fork":         (0.03, 0.20),
+    "knife":        (0.03, 0.25),
+    "spoon":        (0.04, 0.20),
+    "cup":          (0.12, 0.15),
+    "glass":        (0.10, 0.20),
+    "bottle":       (0.10, 0.30),
+    "apple":        (0.10, 0.10),
+    "orange":       (0.10, 0.10),
+    "banana":       (0.05, 0.22),
+    "book":         (0.25, 0.35),
+    "clock":        (0.35, 0.35),
+    "vase":         (0.20, 0.40),
+    "keyboard":     (0.50, 0.20),
+    # Medium objects
+    "laptop":       (0.40, 0.30),
+    "bowl":         (0.25, 0.12),
+    "backpack":     (0.40, 0.55),
+    "handbag":      (0.40, 0.35),
+    "umbrella":     (0.15, 1.00),
+    "teddy bear":   (0.40, 0.50),
+    "hair dryer":   (0.15, 0.30),
+    "toaster":      (0.30, 0.25),
+    "microwave":    (0.55, 0.35),
+    "plant":        (0.50, 0.80),
+    "potted plant": (0.50, 0.80),
+    "toilet":       (0.50, 0.70),
+    "sink":         (0.60, 0.30),
+    "tv":           (1.20, 0.80),
+    "television":   (1.20, 0.80),
+    "chair":        (0.60, 1.20),
+    # Large objects
+    "table":        (1.80, 0.85),
+    "dining table": (1.80, 0.85),
+    "sofa":         (2.20, 1.00),
+    "couch":        (2.20, 1.00),
+    "bed":          (2.20, 1.00),
+    "refrigerator": (0.80, 1.80),
+    "oven":         (0.70, 0.90),
+    # Dynamic objects
+    "person":       (0.70, 1.90),
+    "bicycle":      (1.80, 1.10),
+    "car":          (4.50, 1.60),
+    "motorcycle":   (2.20, 1.30),
+    "bus":          (12.0, 3.50),
+    "truck":        (8.00, 3.50),
+    "dog":          (0.80, 0.70),
+    "cat":          (0.50, 0.35),
+}
+# Default max size for unknown objects
+OBJECT_MAX_SIZE_DEFAULT = (1.50, 1.50)
+
+# ── SEMANTIC 2D ASPECT RATIO LIMITS (Height / Width) ──
+# Prevents YOLO from drawing massive vertical boxes around flat objects (like confusing a wall for a laptop)
+OBJECT_MAX_ASPECT_RATIOS = {
+    "laptop": 0.85, "mouse": 0.60, "keyboard": 0.40, 
+    "tv": 0.85, "television": 0.85, "bed": 0.70, 
+    "couch": 0.85, "sofa": 0.85, "car": 0.80, 
+    "truck": 0.80, "bowl": 0.60, "sink": 0.70,
+    "book": 1.50, "cell phone": 2.0
+}
+
+# ── SEMANTIC Z-AXIS ELEVATIONS (Meters) ──
+# If YOLO doesn't detect the table, we still want desktop objects to hover at table height
+# so the 3D map is realistic instead of placing laptops and coffee cups on the floor.
+OBJECT_ELEVATIONS = {
+    "laptop": 0.75, "mouse": 0.75, "keyboard": 0.75, "cup": 0.75, 
+    "bowl": 0.75, "bottle": 0.75, "apple": 0.75, "orange": 0.75, 
+    "banana": 0.75, "sandwich": 0.75, "fork": 0.75, "knife": 0.75, 
+    "spoon": 0.75, "scissors": 0.75, "book": 0.75, "remote": 0.75, 
+    "cell phone": 0.75, "smartphone": 0.75, "vase": 0.75,
+    "microwave": 0.90, "toaster": 0.90, "sink": 0.85,
+    "tv": 0.60, "television": 0.60, "clock": 1.50
+}
 
 # ── MODE-SPECIFIC PERCEPTION PARAMETERS ──
 # Indoor: high memory, low noise, persistent mapping
 # Outdoor: short memory, responsive tracking, collision focus
 MODE_PARAMS = {
     "indoor": {
-        "conf_threshold":       0.35,
+        "conf_threshold":       0.50,  # Greatly increased to stop random hallucinations
         "static_timeout":       120.0,   # 2 min memory while indoors
         "dynamic_timeout":      5.0,
-        "static_assoc":         1.50,
-        "dynamic_assoc":        2.00,
-        "static_alpha":         0.03,
-        "dynamic_alpha":        0.25,
-        "static_bbox_alpha":    0.25,
-        "dynamic_bbox_alpha":   0.45,
+        "static_assoc":         3.00,    # Increased heavily to merge jittery detections
+        "dynamic_assoc":        3.50,
+        "static_alpha":         0.25,
+        "dynamic_alpha":        0.50,
+        "static_bbox_alpha":    0.65,
+        "dynamic_bbox_alpha":   0.75,
         "danger_distance":      1.5,     # Indoor danger threshold
         "collision_corridor_w": 0.8,     # Narrow indoor corridor
     },
     "outdoor": {
-        "conf_threshold":       0.45,    # Higher threshold to reduce false positives
+        "conf_threshold":       0.55,    # Higher threshold to reduce false positives
         "static_timeout":       3.0,     # Very short memory outdoors
         "dynamic_timeout":      2.0,
-        "static_assoc":         2.00,
-        "dynamic_assoc":        2.50,
-        "static_alpha":         0.15,
-        "dynamic_alpha":        0.35,
-        "static_bbox_alpha":    0.40,
-        "dynamic_bbox_alpha":   0.55,
+        "static_assoc":         3.00,
+        "dynamic_assoc":        3.50,
+        "static_alpha":         0.30,
+        "dynamic_alpha":        0.55,
+        "static_bbox_alpha":    0.65,
+        "dynamic_bbox_alpha":   0.75,
         "danger_distance":      2.0,     # Outdoor needs earlier warnings
         "collision_corridor_w": 1.2,     # Shoulder-width walking corridor
     },
@@ -92,7 +177,7 @@ MODE_PARAMS = {
 # Spatial memory persistence path
 SPATIAL_MEMORY_DIR  = os.path.expanduser("~/.wearable_nav")
 SPATIAL_MEMORY_FILE = os.path.join(SPATIAL_MEMORY_DIR, "indoor_map.json")
-SPATIAL_DEDUP_RADIUS = 0.8   # meters — prevents duplicate entries for same object
+SPATIAL_DEDUP_RADIUS = 2.5   # meters — heavily increased to prevent duplicate ghost markers
 MEMORY_SAVE_INTERVAL = 30.0  # seconds between auto-saves
 
 
@@ -111,7 +196,9 @@ class KalmanTracker:
         self.width = max(0.1, float(width))
         self.height = max(0.1, float(height))
         self.velocity = 0.0
+        self.dist = 0.0  # Distance from camera/system
         self.is_moving = False
+        self.update_count = 0  # Track how many times this object has been observed
         
         self.F = np.eye(4, dtype=np.float64)
         self.H = np.zeros((2, 4), dtype=np.float64)
@@ -123,9 +210,9 @@ class KalmanTracker:
             self.R = np.eye(2, dtype=np.float64) * 0.15
             self.Q = np.eye(4, dtype=np.float64) * 0.08
         else:
-            # Low noise for static obstacles (furniture, doors, walls)
-            self.R = np.eye(2, dtype=np.float64) * 0.40
-            self.Q = np.eye(4, dtype=np.float64) * 0.001
+            # Moderate measurement noise for static obstacles — responsive but stable
+            self.R = np.eye(2, dtype=np.float64) * 1.0
+            self.Q = np.eye(4, dtype=np.float64) * 0.005
 
     def predict(self, now: float):
         dt = max(0.001, min(0.5, now - self.last_seen))
@@ -144,13 +231,36 @@ class KalmanTracker:
 
         z = np.array([px, py], dtype=np.float64)
         y = z - (self.H @ self.x)
+        
+        # --- ENHANCED STABILIZATION LOGIC ("Still Point" Anchor) ---
+        if not self.is_dynamic:
+            dist_moved = math.hypot(y[0], y[1])
+            self.update_count += 1
+            
+            if self.update_count >= 5:
+                # Well-established object: only accept large movements (> 1.5m)
+                # that indicate the object was truly moved (e.g., someone picked up a chair).
+                # Camera tilt and LiDAR jitter are always < 1.5m.
+                if dist_moved < 1.5:
+                    y = y * 0.0  # Fully lock position — zero innovation
+                # else: let it update normally (object genuinely relocated)
+            elif dist_moved < 1.0:
+                # New object still stabilizing: heavily dampen small movements
+                # Camera tilt typically causes < 1.0m apparent shifts
+                y = y * 0.01
+            # else: large movement on new object, let it update normally
+        else:
+            self.update_count += 1
+        # ------------------------------------------------------
+        
         S = self.H @ self.P @ self.H.T + self.R
         K = self.P @ self.H.T @ np.linalg.inv(S)
         self.x = self.x + (K @ y)
         self.P = (np.eye(4) - K @ self.H) @ self.P
         
         # Update physical dimensions with smooth exponential filter
-        dim_alpha = 0.20 if self.is_dynamic else 0.10
+        # Use very low alpha for static objects so sizes lock quickly
+        dim_alpha = 0.40 if self.is_dynamic else 0.25
         self.width = (1.0 - dim_alpha) * self.width + dim_alpha * max(0.05, float(width))
         self.height = (1.0 - dim_alpha) * self.height + dim_alpha * max(0.05, float(height))
         
@@ -212,7 +322,6 @@ class VisionPerceptionNode(Node):
         # ── CAMERA ACQUISITION MODE (Direct USB or ROS Wi-Fi) ──
         self._camera_mode = os.environ.get("WEARABLE_CAMERA_MODE", "direct").lower()
         self._camera_pub = self.create_publisher(Image, '/camera/image_raw', realtime_qos)
-        self._image_pub = self.create_publisher(Image, "/vision/debug_image", 10)
         
         self._inference_lock = threading.Lock()
         self._latest_frame = None
@@ -270,7 +379,7 @@ class VisionPerceptionNode(Node):
         self._camera_hfov = math.radians(float(os.environ.get("WEARABLE_CAMERA_HFOV_DEG", "70.0")))
         self._camera_yaw_offset = math.radians(float(os.environ.get("WEARABLE_CAMERA_YAW_OFFSET_DEG", "0.0")))
         self._lidar_yaw_offset = math.radians(float(os.environ.get("WEARABLE_LIDAR_YAW_OFFSET_DEG", "0.0")))
-        self._mirror_camera_x = os.environ.get("WEARABLE_CAMERA_MIRROR_X", "0") == "1"
+        self._mirror_camera_x = os.environ.get("WEARABLE_CAMERA_MIRROR_X", "1") == "1"  # Default ON: ROS camera is mirrored
         self._trust_lidar_depth = os.environ.get("WEARABLE_TRUST_LIDAR_DEPTH", "1") != "0"
         self._lidar_camera_max_diff = float(os.environ.get("WEARABLE_LIDAR_CAMERA_MAX_DIFF", "1.75"))
         self._static_lidar_camera_max_diff = float(os.environ.get("WEARABLE_STATIC_LIDAR_CAMERA_MAX_DIFF", "0.75"))
@@ -278,11 +387,13 @@ class VisionPerceptionNode(Node):
         self._next_static_track_id = {}
         self._static_box_tracks = {}
         self._static_bbox_assoc_px = float(os.environ.get("WEARABLE_STATIC_BBOX_ASSOC_PX", "180.0"))
+        self._next_static_box_id = 0
         
         self._dynamic_tracks = {}
         self._next_dynamic_track_id = {}
         self._dynamic_box_tracks = {}
         self._dynamic_bbox_assoc_px = float(os.environ.get("WEARABLE_DYNAMIC_BBOX_ASSOC_PX", "250.0"))
+        self._next_dynamic_box_id = 0
 
         # ── SPATIAL MEMORY (Indoor Mode) ──
         self._spatial_memory = {}  # key: "label_x_y" -> {class, x, y, w, h, conf, first_seen, last_seen}
@@ -359,6 +470,7 @@ class VisionPerceptionNode(Node):
                     cv2.destroyWindow(self._window_name)
                 except Exception:
                     pass
+
                 self._window_name = f"VisionNav AI [{self._mode.upper()}]"
                 cv2.namedWindow(self._window_name, cv2.WINDOW_NORMAL)
                 cv2.resizeWindow(self._window_name, 800, 600)
@@ -487,6 +599,7 @@ class VisionPerceptionNode(Node):
                 except Exception:
                     pass
 
+
     def _ros_camera_callback(self, msg: CompressedImage) -> None:
         """Callback for Distributed Mode: Receives image over Wi-Fi."""
         try:
@@ -516,28 +629,36 @@ class VisionPerceptionNode(Node):
         """Extract foreground surface depth from LiDAR multi-ray scan cone across the bounding box."""
         if self._latest_scan is None:
             return None
-
+            
         scan = self._latest_scan
-        if scan.angle_increment == 0.0:
-            return None
-
-        min_ang = self._angle_wrap(min(left_angle, right_angle) + self._lidar_yaw_offset)
-        max_ang = self._angle_wrap(max(left_angle, right_angle) + self._lidar_yaw_offset)
         
-        angle_min = scan.angle_min
-        angle_max = scan.angle_min + scan.angle_increment * (len(scan.ranges) - 1)
-
-        idx1 = int(round((min_ang - angle_min) / scan.angle_increment))
-        idx2 = int(round((max_ang - angle_min) / scan.angle_increment))
+        # Calculate the angular distance. We want to traverse from right to left.
+        diff = left_angle - right_angle
+        # If difference is negative, we crossed the PI/-PI boundary
+        while diff < 0:
+            diff += 2.0 * math.pi
+        while diff > 2.0 * math.pi:
+            diff -= 2.0 * math.pi
+            
+        # Sample points along the arc to avoid array index wrap-around bugs
+        samples = int(max(10, min(100, diff / scan.angle_increment)))
+        angle_step = diff / max(1, samples)
         
-        start_idx = max(0, min(idx1, idx2))
-        end_idx = min(len(scan.ranges) - 1, max(idx1, idx2))
-
         valid_ranges = []
-        for i in range(start_idx, end_idx + 1):
-            r = scan.ranges[i]
-            if scan.range_min <= r <= scan.range_max and not math.isinf(r) and not math.isnan(r):
-                valid_ranges.append(r)
+        for i in range(samples + 1):
+            a = right_angle + i * angle_step
+            
+            # Normalize 'a' to match the raw scan array bounds
+            while a < scan.angle_min: 
+                a += 2.0 * math.pi
+            while a >= scan.angle_min + 2.0 * math.pi: 
+                a -= 2.0 * math.pi
+                
+            idx = int(round((a - scan.angle_min) / scan.angle_increment))
+            if 0 <= idx < len(scan.ranges):
+                r = scan.ranges[idx]
+                if scan.range_min <= r <= scan.range_max and not math.isinf(r) and not math.isnan(r):
+                    valid_ranges.append(r)
 
         if not valid_ranges:
             return None
@@ -548,7 +669,7 @@ class VisionPerceptionNode(Node):
         return float(valid_ranges[p15_idx])
 
     def _stabilize_object(
-        self, label: str, px: float, py: float, width_m: float, height_m: float, conf: float, now: float, is_dynamic: bool
+        self, label: str, px: float, py: float, width_m: float, height_m: float, conf: float, now: float, is_dynamic: bool, dist: float = 0.0
     ) -> tuple[str, float, float, float, float, float, bool, float]:
         """Continuous Kalman spatial tracking with position, velocity, and size estimation."""
         tracks_dict = self._dynamic_tracks if is_dynamic else self._static_tracks
@@ -568,9 +689,9 @@ class VisionPerceptionNode(Node):
         for track in tracks:
             if track.id in used_tracks_dict.get(label, set()):
                 continue
-            dist = math.hypot(px - track.x[0], py - track.x[1])
-            if dist < best_dist:
-                best_dist = dist
+            assoc_d = math.hypot(px - track.x[0], py - track.x[1])
+            if assoc_d < best_dist:
+                best_dist = assoc_d
                 best_track = track
 
         if best_track is None or best_dist > association_dist:
@@ -579,9 +700,11 @@ class VisionPerceptionNode(Node):
             while track_id in existing_ids:
                 track_id += 1
             best_track = KalmanTracker(track_id, px, py, width_m, height_m, conf, now, is_dynamic=is_dynamic)
+            best_track.dist = dist
             tracks.append(best_track)
         else:
             best_track.update(px, py, width_m, height_m, conf, now)
+            best_track.dist = 0.7 * best_track.dist + 0.3 * dist  # Smooth distance updates
 
         used_tracks_dict.setdefault(label, set()).add(best_track.id)
         final_label = f"{label.replace(' ', '_')}_{best_track.id}"
@@ -591,7 +714,7 @@ class VisionPerceptionNode(Node):
             float(best_track.x[1]),
             float(best_track.width),
             float(best_track.height),
-            float(best_track.distance),
+            float(best_track.dist),
             bool(best_track.is_moving),
             float(best_track.velocity),
         )
@@ -616,7 +739,8 @@ class VisionPerceptionNode(Node):
                 best_track = track
 
         if best_track is None or best_dist > self._static_bbox_assoc_px:
-            track_id = len(tracks) + 1
+            self._next_static_box_id += 1
+            track_id = self._next_static_box_id
             best_track = {
                 "id": track_id,
                 "cx": cx,
@@ -666,7 +790,8 @@ class VisionPerceptionNode(Node):
                 best_track = track
 
         if best_track is None or best_dist > self._dynamic_bbox_assoc_px:
-            track_id = len(tracks) + 1
+            self._next_dynamic_box_id += 1
+            track_id = self._next_dynamic_box_id
             best_track = {
                 "id": track_id,
                 "cx": cx,
@@ -743,6 +868,20 @@ class VisionPerceptionNode(Node):
                 if confidence < self._conf_threshold:
                     continue
 
+                raw_label = COCO_CLASSES[class_id]
+                
+                # ── TESLA-STYLE WHITELIST ──
+                # Stop AI from detecting shadows/clothes as dogs, cats, surfboards.
+                # Only allow structured indoor obstacles through.
+                INDOOR_WHITELIST = {
+                    "person", "chair", "laptop", "bottle", "cup", "keyboard", "mouse", 
+                    "cell phone", "book", "tv", "dining table", "couch", "bed", "door",
+                    "refrigerator", "microwave", "oven", "sink", "vase", "clock",
+                    "teddy bear", "backpack", "umbrella"
+                }
+                if raw_label not in INDOOR_WHITELIST:
+                    continue
+
                 cx = float(det[0]) * scale_x
                 cy = float(det[1]) * scale_y
                 bw_ = float(det[2]) * scale_x
@@ -752,6 +891,18 @@ class VisionPerceptionNode(Node):
                 y1 = max(0, int(cy - bh_ / 2))
                 bw_ = min(w - x1, int(bw_))
                 bh_ = min(h - y1, int(bh_))
+                y2_initial = y1 + bh_
+                
+                # ── SEMANTIC 2D ASPECT RATIO CORRECTION ──
+                # Slices off hallucinated tall bounding boxes for flat objects
+                # (e.g. YOLO including the pink wall in the laptop bounding box)
+                raw_label = COCO_CLASSES[class_id] if class_id < len(COCO_CLASSES) else "unknown"
+                max_aspect = OBJECT_MAX_ASPECT_RATIOS.get(raw_label, 100.0)
+                current_aspect = bh_ / float(max(1, bw_))
+                
+                if current_aspect > max_aspect:
+                    bh_ = int(bw_ * max_aspect)
+                    y1 = max(0, int(y2_initial - bh_))  # Anchor to the bottom (desk/floor) and slice the top off!
 
                 boxes.append([x1, y1, bw_, bh_])
                 confidences.append(confidence)
@@ -761,6 +912,38 @@ class VisionPerceptionNode(Node):
                 indices = cv2.dnn.NMSBoxes(boxes, confidences, self._conf_threshold, NMS_THRESHOLD)
                 if len(indices) > 0:
                     indices = indices.flatten()
+                else:
+                    indices = []
+                    
+                # ── CROSS-CLASS NMS: Remove duplicate detections of different classes ──
+                # e.g. same object detected as both "laptop" AND "television"
+                if len(indices) > 1:
+                    keep = []
+                    suppressed = set()
+                    for i_pos, i_idx in enumerate(indices):
+                        if i_idx in suppressed:
+                            continue
+                        keep.append(i_idx)
+                        bx1, by1, bw1, bh1 = boxes[i_idx]
+                        for j_pos in range(i_pos + 1, len(indices)):
+                            j_idx = indices[j_pos]
+                            if j_idx in suppressed:
+                                continue
+                            bx2, by2, bw2, bh2 = boxes[j_idx]
+                            # Calculate IoU
+                            ix1 = max(bx1, bx2)
+                            iy1 = max(by1, by2)
+                            ix2 = min(bx1 + bw1, bx2 + bw2)
+                            iy2 = min(by1 + bh1, by2 + bh2)
+                            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                            area1 = bw1 * bh1
+                            area2 = bw2 * bh2
+                            union = area1 + area2 - inter
+                            iou = inter / max(union, 1)
+                            if iou > 0.35:
+                                # Suppress the lower-confidence duplicate
+                                suppressed.add(j_idx)
+                    indices = keep
             else:
                 indices = []
                 
@@ -802,9 +985,9 @@ class VisionPerceptionNode(Node):
         
         # Thread-safe persistent HUD tracks cache with temporal hysteresis
         with self._hud_lock:
-            # Purge expired tracks
-            hud_timeout_dyn = 1.2 if self._mode == "indoor" else 0.8
-            hud_timeout_sta = 3.0 if self._mode == "indoor" else 1.5
+            # Purge expired tracks (Increased timeouts to prevent flickering on slower CPUs)
+            hud_timeout_dyn = 3.0 if self._mode == "indoor" else 2.0
+            hud_timeout_sta = 5.0 if self._mode == "indoor" else 3.0
             self._hud_tracks = {
                 k: v for k, v in self._hud_tracks.items()
                 if now - v['last_seen'] <= (hud_timeout_dyn if v['is_dynamic'] else hud_timeout_sta)
@@ -832,7 +1015,7 @@ class VisionPerceptionNode(Node):
                 "dining table": "table", "couch": "sofa", "cell phone": "smartphone",
                 "potted plant": "plant", "wine glass": "glass", "sports ball": "ball",
                 "baseball bat": "bat", "baseball glove": "glove", "tennis racket": "racket",
-                "hair drier": "hair dryer", "tv": "television", "fire hydrant": "hydrant",
+                "hair drier": "hair dryer", "tv": "laptop", "fire hydrant": "hydrant",
                 "parking meter": "meter", "traffic light": "signal",
             }
             label = FRIENDLY_NAMES.get(raw_label, raw_label)
@@ -866,29 +1049,83 @@ class VisionPerceptionNode(Node):
             yaw_right = self._camera_yaw_offset - angle_right
 
             # ── 1. SENSOR DEPTH ESTIMATION (LiDAR + Pinhole Optics) ──
-            lidar_depth = self._estimate_lidar_depth(yaw_left, yaw_right)
+            # CRITICAL FIX: The physical LiDAR is mounted with the cable pointing forward.
+            # We rotated the TF map 180 degrees to face forward, which means the LiDAR's internal 
+            # local Y-axis is now physically pointing Right instead of Left.
+            # We MUST negate the yaw query to correctly align the camera's Left with the physical Left!
+            lidar_query_left = -yaw_right
+            lidar_query_right = -yaw_left
+            lidar_depth = self._estimate_lidar_depth(lidar_query_left, lidar_query_right)
             
-            # Optical baseline from pinhole projection
+            # ── INTELLIGENT OPTICAL DEPTH (Pinhole + Size Priors) ──
+            import os
+            camera_height = float(os.environ.get("WEARABLE_CAMERA_HEIGHT", "0.80")) # Default 0.8m for testing on a desk
+            
+            # 1. Ground Plane Intersection (works well if camera is high and object is on floor)
             elevation_rad = math.atan2(max(1.0, y2 - image_center_y), focal_py)
-            optical_ground_depth = 1.30 / max(math.tan(elevation_rad), 0.05) if y2 > image_center_y + 20 else 3.5
+            
+            # Table Heuristic: If it's a desktop object, it's not on the floor! 
+            # Subtract table height (0.75m) from camera height to get true drop distance.
+            table_objects = ["laptop", "mouse", "keyboard", "cup", "bottle", "bowl", "tv", "monitor", "book", "vase", "scissors"]
+            if label in table_objects and camera_height > 1.0:
+                effective_h = max(0.1, camera_height - 0.75)
+            else:
+                effective_h = camera_height
+                
+            optical_ground_depth = effective_h / max(math.tan(elevation_rad), 0.05)
+            
+            # 2. Known-Size Prior (Crucial for objects on tables where camera is also on table)
+            max_w, max_h = OBJECT_MAX_SIZES.get(label, OBJECT_MAX_SIZES.get(raw_label, OBJECT_MAX_SIZE_DEFAULT))
+            typ_w = max_w * 0.75  # Assume average object is ~75% of its absolute max size
+            typ_h = max_h * 0.75
+            depth_from_width = (typ_w * focal_px) / max(1.0, bw_)
+            depth_from_height = (typ_h * focal_py) / max(1.0, bh_)
+            optical_size_depth = min(depth_from_width, depth_from_height)
+            
+            # If object is near horizon (y2 is close to center), ground depth goes to infinity.
+            # In that case, trust the size prior!
+            if y2 < image_center_y + 40:
+                optical_depth = optical_size_depth
+            else:
+                optical_depth = min(optical_ground_depth, optical_size_depth * 1.5)
 
             box_coverage = (bw_ * bh_) / float(max(w * h, 1))
 
             if lidar_depth is not None and (0.25 <= lidar_depth <= 16.0):
-                if box_coverage > 0.10 and y2 > h * 0.70 and lidar_depth > optical_ground_depth * 1.5:
-                    depth = min(lidar_depth, optical_ground_depth)
+                # Smart LiDAR/Optical fusion based on object class
+                # Small objects: LiDAR beam often misses them and hits the wall behind
+                # Large objects: LiDAR reliably hits them
+                small_objects = ["bottle", "cup", "mouse", "keyboard", "cell phone", 
+                                 "remote", "scissors", "book", "vase", "bowl", "apple", "orange"]
+                
+                if raw_label in small_objects:
+                    # For small objects: trust optical depth primarily (LiDAR often overshoots)
+                    depth = min(optical_depth, lidar_depth)
+                elif box_coverage > 0.25 and lidar_depth > optical_depth * 2.5:
+                    # Object fills the screen but LiDAR hits the wall — trust optical
+                    depth = optical_depth
                 else:
+                    # For large objects (chair, person, door): trust LiDAR
                     depth = lidar_depth
             else:
-                depth = optical_ground_depth
+                depth = optical_depth
 
-            depth = max(0.35, min(depth, 15.0))
+            # Hard cap for LiDAR overshoots
+            max_physical_width = max_w * 1.5
+            max_depth_by_width = max_physical_width * focal_px / max(bw_, 1.0)
+            depth = min(depth, max_depth_by_width)
+
+            depth = max(0.35, min(depth, 10.0))
 
             # ── 2. ACTUAL PHYSICAL SIZE ESTIMATION (Width & Height in meters) ──
             width_meters = depth * (bw_ / focal_px)
             height_meters = depth * (bh_ / focal_py)
             width_meters = max(0.05, min(width_meters, 5.0))
             height_meters = max(0.05, min(height_meters, 4.0))
+            # Per-category size clamping using known real-world dimensions
+            max_w, max_h = OBJECT_MAX_SIZES.get(label, OBJECT_MAX_SIZES.get(raw_label, OBJECT_MAX_SIZE_DEFAULT))
+            width_meters = max(0.05, min(width_meters, max_w))
+            height_meters = max(0.05, min(height_meters, max_h))
 
             # ── 3. 3D POSITION ──
             mx = depth * math.cos(yaw)
@@ -899,7 +1136,7 @@ class VisionPerceptionNode(Node):
                 # Indoor: transform to map frame for persistent spatial registration
                 pt_local = PointStamped()
                 pt_local.header.frame_id = "base_footprint"
-                pt_local.header.stamp = msg_stamp
+                pt_local.header.stamp = rclpy.time.Time().to_msg()  # Use latest available TF to prevent dropped detections
                 pt_local.point.x = mx
                 pt_local.point.y = my
                 pt_local.point.z = 0.0
@@ -910,7 +1147,7 @@ class VisionPerceptionNode(Node):
                         pt_global = self._tf_buffer.transform(pt_local, target_frame, rclpy.duration.Duration(seconds=0.3))
                         break
                     except Exception:
-                        pass
+                    pass
                 
                 if pt_global is None:
                     continue
@@ -920,8 +1157,15 @@ class VisionPerceptionNode(Node):
                 # Outdoor: stay in base_footprint (no TF2 needed, minimum latency)
                 px, py = mx, my
 
+            
+            # Semantic Size Enforcement (Fixes occlusion shrinking)
+            # If a chair is occluded by a desk, its bounding box is small, making it look shorter than a laptop.
+            # We force known objects to their typical real-world heights.
+            if label in ["chair", "person", "refrigerator", "door"]:
+                height_meters = max_h  # Force to 90% of max height if occluded
+                
             final_label, kx, ky, kw, kh, kdist, is_moving, vel = self._stabilize_object(
-                label, px, py, width_meters, height_meters, conf, now, is_dynamic
+                label, px, py, width_meters, height_meters, conf, now, is_dynamic, dist=depth
             )
 
             # Directional relative position for blind assistance
@@ -946,7 +1190,7 @@ class VisionPerceptionNode(Node):
             with self._hud_lock:
                 prev_hud = self._hud_tracks.get(track_key)
                 if prev_hud is not None:
-                    alpha = 0.35 if is_dynamic else 0.15
+                    alpha = 0.70 if is_dynamic else 0.55
                     x1_s = int(round((1 - alpha) * prev_hud['x1'] + alpha * x1))
                     y1_s = int(round((1 - alpha) * prev_hud['y1'] + alpha * y1))
                     x2_s = int(round((1 - alpha) * prev_hud['x2'] + alpha * (x1 + bw_)))
@@ -957,7 +1201,7 @@ class VisionPerceptionNode(Node):
 
                 self._hud_tracks[track_key] = {
                     'x1': x1_s, 'y1': y1_s, 'x2': x2_s, 'y2': y2_s,
-                    'label': label, 'conf': conf, 'is_dynamic': is_dynamic,
+                    'label': final_label, 'conf': conf, 'is_dynamic': is_dynamic,
                     'depth': depth_s, 'cx': cx, 'img_w': w,
                     'kw': kw, 'kh': kh, 'is_moving': is_moving, 'vel': vel,
                     'rel_pos': rel_pos_text, 'last_seen': now
@@ -999,7 +1243,7 @@ class VisionPerceptionNode(Node):
                     continue
                 final_label = f"{label.replace(' ', '_')}_{track.id}"
                 self._add_track_marker(
-                    current_markers, track, final_label, now_msg, marker_lifetime, True, marker_frame
+                    current_markers, track, final_label, now_msg, marker_lifetime, True, marker_frame, distance=track.dist
                 )
                 
         for label, tracks in self._static_tracks.items():
@@ -1008,14 +1252,21 @@ class VisionPerceptionNode(Node):
                     continue
                 final_label = f"{label.replace(' ', '_')}_{track.id}"
                 self._add_track_marker(
-                    current_markers, track, final_label, now_msg, marker_lifetime, False, marker_frame
+                    current_markers, track, final_label, now_msg, marker_lifetime, False, marker_frame, distance=track.dist
                 )
 
         # ── INDOOR: Also publish remembered objects from spatial memory ──
         if self._mode == "indoor":
             mem_lifetime = rclpy.duration.Duration(seconds=5.0).to_msg()
             with self._memory_lock:
+                keys_to_delete = []
                 for key, entry in self._spatial_memory.items():
+                    # 1. Garbage Collection: Remove false positives (seen < 5 times and hasn't been seen in 15 seconds)
+                    age = time.time() - entry["last_seen"]
+                    if age > 15.0 and entry.get("seen_count", 0) < 5:
+                        keys_to_delete.append(key)
+                        continue
+                        
                     # Skip objects that are currently being tracked live
                     # (they already have markers from the loop above)
                     base_class = entry.get("class", "")
@@ -1031,8 +1282,15 @@ class VisionPerceptionNode(Node):
                     
                     # Ghost marker for remembered (not currently visible) objects
                     mem_id = abs(hash(key)) % 1000000
+                    mem_w = max(0.05, entry.get("w", 0.3))
+                    mem_h = max(0.05, entry.get("h", 0.3))
                     
-                    # Text label
+                    # Safety-net for ghost markers (clamps old bad data in JSON)
+                    max_w, max_h = OBJECT_MAX_SIZES.get(base_class, OBJECT_MAX_SIZE_DEFAULT)
+                    mem_w = min(mem_w, max_w)
+                    mem_h = min(mem_h, max_h)
+                    
+                    # Text label floating above the ghost cube
                     marker = Marker()
                     marker.header.frame_id = 'map'
                     marker.header.stamp = now_msg
@@ -1040,54 +1298,90 @@ class VisionPerceptionNode(Node):
                     marker.id = mem_id
                     marker.type = Marker.TEXT_VIEW_FACING
                     marker.action = Marker.ADD
+                    base_z = OBJECT_ELEVATIONS.get(base_class, 0.0)
                     marker.pose.position.x = entry["x"]
                     marker.pose.position.y = entry["y"]
-                    marker.pose.position.z = 0.35
-                    marker.scale.z = 0.20
-                    marker.color = ColorRGBA(r=0.6, g=0.6, b=0.6, a=0.5)  # Translucent grey
-                    marker.text = f"[MEM] {base_class}"
+                    marker.pose.position.z = base_z + mem_h + 0.10  # Float above the ghost cube
+                    marker.scale.z = 0.18
+                    marker.color = ColorRGBA(r=0.7, g=0.7, b=0.7, a=0.5)  # Translucent grey
+                    marker.text = base_class
                     marker.lifetime = mem_lifetime
                     current_markers.append(marker)
                     
-                    # Ghost sphere
+                    # Ghost 3D CUBE (semi-transparent, remembered object)
                     dot = Marker()
                     dot.header.frame_id = 'map'
                     dot.header.stamp = now_msg
-                    dot.ns = "memory_anchors"
+                    dot.ns = "memory_cubes"
                     dot.id = mem_id + 1
-                    dot.type = Marker.SPHERE
+                    dot.type = Marker.CUBE
                     dot.action = Marker.ADD
                     dot.pose.position.x = entry["x"]
                     dot.pose.position.y = entry["y"]
-                    dot.pose.position.z = 0.10
-                    dot.scale.x = 0.15
-                    dot.scale.y = 0.15
-                    dot.scale.z = 0.15
-                    dot.color = ColorRGBA(r=0.5, g=0.5, b=0.5, a=0.35)
+                    dot.pose.position.z = base_z + (mem_h / 2.0)  # Base on semantic elevation
+                    dot.scale.x = mem_w
+                    dot.scale.y = mem_w
+                    dot.scale.z = mem_h
+                    dot.color = ColorRGBA(r=0.5, g=0.5, b=0.5, a=0.15)
                     dot.lifetime = mem_lifetime
                     current_markers.append(dot)
+                    
+                    if base_z > 0.1:
+                        desk = Marker()
+                        desk.header.frame_id = 'map'
+                        desk.header.stamp = now_msg
+                        desk.ns = "memory_phantom_desks"
+                        desk.id = mem_id + 2
+                        desk.type = Marker.CUBE
+                        desk.action = Marker.ADD
+                        desk.pose.position.x = entry["x"]
+                        desk.pose.position.y = entry["y"]
+                        desk.pose.position.z = base_z - 0.025
+                        desk.scale.x = mem_w * 1.5
+                        desk.scale.y = mem_w * 1.5
+                        desk.scale.z = 0.05
+                        desk.color = ColorRGBA(r=0.85, g=0.85, b=0.85, a=0.2)
+                        desk.lifetime = mem_lifetime
+                        current_markers.append(desk)
+
+
+        # Ground grid removed for cleaner RViz view
 
         self._marker_pub.publish(MarkerArray(markers=current_markers))
         
-    def _add_track_marker(self, current_markers, track, label_text, now_msg, marker_lifetime, is_dynamic, frame_id):
+        # Actually delete the expired memory keys safely
+        if self._mode == "indoor":
+            with self._memory_lock:
+                for key in keys_to_delete:
+                    if key in self._spatial_memory:
+                        del self._spatial_memory[key]
+        
+    def _add_track_marker(self, current_markers, track, label_text, now_msg, marker_lifetime, is_dynamic, frame_id, distance=0.0):
         from std_msgs.msg import ColorRGBA
         from visualization_msgs.msg import Marker
         px, py = track.x[0], track.x[1]
+        obj_width = max(0.05, float(track.width))
+        obj_height = max(0.05, float(track.height))
+        
+        # Safety-net: clamp marker sizes using known real-world maximum dimensions
+        base_label = label_text.rsplit('_', 1)[0].replace('_', ' ') if '_' in label_text else label_text
+        max_w, max_h = OBJECT_MAX_SIZES.get(base_label, OBJECT_MAX_SIZE_DEFAULT)
+        obj_width = min(obj_width, max_w)
+        obj_height = min(obj_height, max_h)
         
         # Distance-weighted color: closer objects are more vivid
         if is_dynamic:
-            marker_color = ColorRGBA(r=1.0, g=0.15, b=0.15, a=1.0)
+            marker_color = ColorRGBA(r=1.0, g=0.15, b=0.15, a=0.75)
         else:
-            marker_color = ColorRGBA(r=0.1, g=1.0, b=0.1, a=1.0)
+            marker_color = ColorRGBA(r=0.1, g=1.0, b=0.1, a=0.65)
         
-        anchor_scale = 0.35 if is_dynamic else 0.20
         marker_ns_prefix = "yolo_dynamic" if is_dynamic else "yolo_static"
         
         class_base = abs(hash(label_text.rsplit('_', 1)[0])) % 100000
         stable_id = int(class_base * 100 + (track.id % 100) * 2)
 
-        # Clean, minimal 3D RViz label (Object name only)
-        display_str = label_text
+        # ── 3D Text label floating above the object cube ──
+        display_str = f"{label_text} ({distance:.1f}m)"
 
         marker = Marker()
         marker.header.frame_id = frame_id
@@ -1098,30 +1392,79 @@ class VisionPerceptionNode(Node):
         marker.action = Marker.ADD
         marker.pose.position.x = px
         marker.pose.position.y = py
-        marker.pose.position.z = 0.40
-        marker.scale.z = 0.25
-        marker.color = marker_color
+        base_z = OBJECT_ELEVATIONS.get(base_label, 0.0)
+        marker.pose.position.z = base_z + obj_height + 0.15  # Float above the 3D cube
+        marker.scale.z = 0.22
+        marker.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
         marker.text = display_str
         marker.lifetime = marker_lifetime
         current_markers.append(marker)
 
-        # Clean 3D Object Sphere on the map
-        dot_marker = Marker()
-        dot_marker.header.frame_id = frame_id
-        dot_marker.header.stamp = now_msg
-        dot_marker.ns = f"{marker_ns_prefix}_anchors"
-        dot_marker.id = stable_id + 1
-        dot_marker.type = Marker.SPHERE
-        dot_marker.action = Marker.ADD
-        dot_marker.pose.position.x = px
-        dot_marker.pose.position.y = py
-        dot_marker.pose.position.z = 0.12
-        dot_marker.scale.x = anchor_scale
-        dot_marker.scale.y = anchor_scale
-        dot_marker.scale.z = anchor_scale
-        dot_marker.color = marker_color
-        dot_marker.lifetime = marker_lifetime
-        current_markers.append(dot_marker)
+        # ── 3D Semantic Shape on the map ──
+        cube_marker = Marker()
+        cube_marker.header.frame_id = frame_id
+        cube_marker.header.stamp = now_msg
+        cube_marker.ns = f"{marker_ns_prefix}_shapes"
+        cube_marker.id = stable_id + 1
+        
+        # Tesla-style semantic 3D rendering (Cylinders for people, spheres for balls, cubes for furniture)
+        if base_label in ["person", "bottle", "vase"]:
+            cube_marker.type = Marker.CYLINDER
+        elif base_label in ["sports ball", "apple", "orange", "bowl"]:
+            cube_marker.type = Marker.SPHERE
+        else:
+            cube_marker.type = Marker.CUBE
+            
+        cube_marker.action = Marker.ADD
+        cube_marker.pose.position.x = px
+        cube_marker.pose.position.y = py
+        cube_marker.pose.position.z = base_z + (obj_height / 2.0)  # Add semantic elevation so laptops sit on tables
+        cube_marker.scale.x = obj_width
+        cube_marker.scale.y = obj_width
+        cube_marker.scale.z = obj_height
+        cube_marker.color = marker_color
+        cube_marker.lifetime = marker_lifetime
+        current_markers.append(cube_marker)
+        
+        # ── RESTORED: PHANTOM TABLE ──
+        # If an object is floating (base_z > 0), draw a sleek table underneath it
+        if base_z > 0.1:
+            desk = Marker()
+            desk.header.frame_id = frame_id
+            desk.header.stamp = now_msg
+            desk.ns = f"{marker_ns_prefix}_phantom_desks"
+            desk.id = stable_id + 2
+            desk.type = Marker.CUBE
+            desk.action = Marker.ADD
+            desk.pose.position.x = px
+            desk.pose.position.y = py
+            # Draw a sleek 5cm thick table surface right below the object
+            desk.pose.position.z = base_z - 0.025
+            desk.scale.x = obj_width * 1.5
+            desk.scale.y = obj_width * 1.5
+            desk.scale.z = 0.05
+            # Elegant white/grey table surface
+            desk.color = ColorRGBA(r=0.85, g=0.85, b=0.85, a=0.7)
+            desk.lifetime = marker_lifetime
+            current_markers.append(desk)
+            
+            # Draw a pedestal leg down to the floor
+            leg = Marker()
+            leg.header.frame_id = frame_id
+            leg.header.stamp = now_msg
+            leg.ns = f"{marker_ns_prefix}_phantom_legs"
+            leg.id = stable_id + 3
+            leg.type = Marker.CYLINDER
+            leg.action = Marker.ADD
+            leg.pose.position.x = px
+            leg.pose.position.y = py
+            leg.pose.position.z = (base_z - 0.05) / 2.0
+            leg.scale.x = 0.1  # Thin leg
+            leg.scale.y = 0.1
+            leg.scale.z = base_z - 0.05
+            leg.color = ColorRGBA(r=0.6, g=0.6, b=0.6, a=0.5)
+            leg.lifetime = marker_lifetime
+            current_markers.append(leg)
 
     def _draw_cached_boxes(self, frame):
         """Tesla FSD-style detection HUD with proximity colors, corner brackets, and assistive telemetry."""
@@ -1164,8 +1507,9 @@ class VisionPerceptionNode(Node):
                      (corridor_x_center + corridor_half_px, h), (0, 255, 100), 1, cv2.LINE_AA)
         
         for track_data in hud_tracks:
-            hud_timeout = 1.2 if self._mode == "indoor" else 0.8
-            sta_timeout = 2.5 if self._mode == "indoor" else 1.5
+            # Increased timeouts to ensure boxes stay on screen even if YOLO takes >1 second to run
+            hud_timeout = 3.0 if self._mode == "indoor" else 2.0
+            sta_timeout = 5.0 if self._mode == "indoor" else 3.0
             if now - track_data['last_seen'] > (hud_timeout if track_data['is_dynamic'] else sta_timeout):
                 continue
                 
@@ -1204,9 +1548,6 @@ class VisionPerceptionNode(Node):
                     color_rect = np.full_like(roi, color)
                     cv2.addWeighted(color_rect, 0.15, roi, 0.85, 0, roi)
             
-            # ── 2. BOUNDING BOX ──
-            thickness = 3 if (is_dynamic or is_moving) else 2
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
             
             # ── 3. TESLA CORNER BRACKETS ──
             corner_len = min(20, max(6, (x2 - x1) // 4), max(6, (y2 - y1) // 4))
@@ -1223,13 +1564,18 @@ class VisionPerceptionNode(Node):
             type_tag = "DYN" if is_dynamic else "STA"
             motion_tag = f"MOVING {vel:.1f}m/s" if is_moving else "STATIC"
             if depth is not None:
-                info_text = f"{label} {depth:.1f}m {rel_pos} [{type_tag}]"
+                info_text = f"{label} (dist: {depth:.1f}m) {rel_pos} [{type_tag}]"
             else:
                 info_text = f"{label} {rel_pos} [{type_tag}]"
             
             (tw, th), bl = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
             label_y = max(y1, th + bl + 6)
-            cv2.rectangle(frame, (x1, label_y - th - bl - 6), (x1 + tw + 8, label_y), color, cv2.FILLED)
+            
+            # Overlay for transparency
+            overlay = frame[label_y - th - bl - 6:label_y, x1:x1 + tw + 8].copy()
+            cv2.rectangle(overlay, (0, 0), (tw + 8, th + bl + 6), color, cv2.FILLED)
+            frame[label_y - th - bl - 6:label_y, x1:x1 + tw + 8] = cv2.addWeighted(overlay, 0.6, frame[label_y - th - bl - 6:label_y, x1:x1 + tw + 8], 0.4, 0)
+            
             cv2.putText(frame, info_text, (x1 + 4, label_y - bl - 3),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
             
@@ -1238,9 +1584,10 @@ class VisionPerceptionNode(Node):
             (stw, sth), sbl = cv2.getTextSize(size_text, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
             sub_y = label_y + sth + sbl + 6
             if sub_y < y2:
-                cv2.rectangle(frame, (x1, label_y + 2), (x1 + stw + 6, sub_y), (30, 30, 30), cv2.FILLED)
+                # Text outline for readability without solid background block
+                cv2.putText(frame, size_text, (x1 + 3, sub_y - sbl - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0,0,0), 2, cv2.LINE_AA)
                 cv2.putText(frame, size_text, (x1 + 3, sub_y - sbl - 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 255) if is_moving else (220, 220, 220), 1, cv2.LINE_AA)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 255) if is_moving else (255, 255, 255), 1, cv2.LINE_AA)
             
             # ── 6. CONFIDENCE BAR ──
             bar_w = int((x2 - x1) * max(0.0, min(1.0, conf)))
@@ -1309,29 +1656,35 @@ def main(args=None) -> None:
     
     # ── MAIN THREAD: High-speed OpenCV GUI loop (maximum FPS, 0ms delay) ──
     try:
-        waiting_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        cv2.putText(waiting_frame, "Waiting for camera feed...", (80, 240),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
-        
-        while rclpy.ok():
-            frame = node._gui_frame
-            if frame is not None:
-                display_frame = frame.copy()
-                node._draw_cached_boxes(display_frame)
-                cv2.imshow(node._window_name, display_frame)
-            else:
-                cv2.imshow(node._window_name, waiting_frame)
+        if node._show_window:
+            waiting_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(waiting_frame, "Waiting for camera feed...", (80, 240),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
             
-            key = cv2.waitKey(30) & 0xFF
-            if key == 27 or key == ord('q'):
-                break
+            while rclpy.ok():
+                frame = node._gui_frame
+                if frame is not None:
+                    display_frame = frame.copy()
+                    node._draw_cached_boxes(display_frame)
+                    cv2.imshow(node._window_name, display_frame)
+                else:
+                    cv2.imshow(node._window_name, waiting_frame)
+                
+                key = cv2.waitKey(30) & 0xFF
+                if key == 27 or key == ord('q'):
+                    break
+        else:
+            # Headless mode: no GUI, just let ROS spin handle everything
+            node.get_logger().info("Running in HEADLESS mode (no display). Press Ctrl+C to stop.")
+            ros_thread.join()
     except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
     finally:
         # Save spatial memory on shutdown (indoor mode)
         if node._mode == "indoor":
             node._save_spatial_memory()
-        cv2.destroyAllWindows()
+        if node._show_window:
+            cv2.destroyAllWindows()
         if rclpy.ok():
             rclpy.shutdown()
 

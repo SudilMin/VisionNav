@@ -84,4 +84,14 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/scripts/yolov5m.onnx")
   )
 endif()
 
+# ── Piper TTS Voice Model ────────────────────────────────────────────────────
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/scripts/en_US-lessac-medium.onnx")
+  install(
+    FILES
+      scripts/en_US-lessac-medium.onnx
+      scripts/en_US-lessac-medium.onnx.json
+    DESTINATION lib/${PROJECT_NAME}
+  )
+endif()
+
 ament_package()

@@ -9,7 +9,7 @@ Current assistive technologies for the visually impaired suffer from severe limi
 
 ## 2. The VisionNav Solution & Distributed Architecture
 VisionNav acts as a context-aware robotic state machine. To solve battery, thermal, and weight constraints, it utilizes a **Distributed Split-Node Architecture** connected via high-speed Wi-Fi (`ROS 2 FastDDS`):
-* **Sensor Node (On-Body Chest Rig):** A lightweight, unencumbering rig containing a Raspberry Pi, 2D LiDAR, Smartphone Camera, and an ESP32. It performs zero heavy computing; it simply captures, compresses, and streams sensor data.
+* **Sensor Node (On-Body Chest Rig):** A lightweight, unencumbering rig containing a Raspberry Pi, RPLIDAR C1 (DTOF), USB Web Camera, and an ESP32. It performs zero heavy computing; it simply captures, compresses, and streams sensor data.
 * **Compute Node (Edge/Laptop):** A powerful host device (carried in a backpack or running nearby) that handles all heavy lifting: YOLOv5 object detection, Semantic SLAM mapping, A* Navigation, and Local LLM inference.
 * **Zero-Spam Philosophy:** VisionNav employs algorithmic filtering. It remains completely silent to preserve the user's peace of mind, only interrupting if a critical hazard breaches a proximity threshold, or if the user actively asks for help.
 
