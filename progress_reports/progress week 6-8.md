@@ -10,7 +10,7 @@ Over the past three weeks, we transformed the wearable perception pipeline into 
 * Significantly enhanced the AI's ability to reason about complex indoor environments, spatial relationships between objects, and perform accurate Optical Character Recognition (OCR) in the wild.
 * Optimized inference execution to balance Qwen-VL's massive parameter scale against the stringent < 1 second real-time response requirements for blind users.
 
-### 2. Tesla FSD-Style 3D Mapping Using 2D LiDAR (`vision_perception.py`)
+### 2.FSD-Style 3D Mapping Using 2D LiDAR (`vision_perception.py`)
 
 ![3D Semantic Map in RViz]
 
