@@ -12,8 +12,6 @@ Over the past three weeks, we transformed the wearable perception pipeline into 
 
 ### 2.FSD-Style 3D Mapping Using 2D LiDAR (`vision_perception.py`)
 
-![3D Semantic Map in RViz]
-
 * Successfully generated a rich, 3D immersive environment map in RViz using only a single-plane 2D LiDAR scanner.
 * Implemented **semantic 3D shapes**: rendering dynamic cylinders for humans and bottles, spheres for sports balls, and cubes for furniture.
 * Engineered **"Phantom Desks"**: When the AI detects a laptop or cup, it automatically renders a sleek, transparent desk and pedestal leg underneath the object. This anchors floating objects to the floor and provides spatial context even when the physical table is invisible to the camera.
