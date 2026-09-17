@@ -1,7 +1,7 @@
 # Week 6, 7, and 8 Progress Report
 
 ## Summary of Work
-Over the past three weeks, we transformed the wearable perception pipeline into a highly robust, Tesla FSD-style 3D mapping and navigation engine. We significantly upgraded the Vision-Language Model (VLM) pipeline by transitioning to Qwen-VL to enhance scene reasoning and intelligence. To bridge the gap between flat 2D LiDAR scans and a true 3D environment, we engineered semantic AI heuristics that intelligently "guess" physical heights and elevations for everyday objects. Furthermore, we entirely overhauled the voice-driven navigation logic to support dynamic real-time target tracking and natural language matching.
+Over the past three weeks, we transformed the wearable perception pipeline into a highly robust, FSD-style 3D mapping and navigation engine. We significantly upgraded the Vision-Language Model (VLM) pipeline by transitioning to Qwen-VL to enhance scene reasoning and intelligence. To bridge the gap between flat 2D LiDAR scans and a true 3D environment, I engineered semantic AI heuristics that intelligently "guess" physical heights and elevations for everyday objects. Furthermore, we entirely overhauled the voice-driven navigation logic to support dynamic real-time target tracking and natural language matching.
 
 ## Key Implementations
 
@@ -12,10 +12,10 @@ Over the past three weeks, we transformed the wearable perception pipeline into 
 
 ### 2. Tesla FSD-Style 3D Mapping Using 2D LiDAR (`vision_perception.py`)
 
-![Tesla-Style 3D Semantic Map in RViz](replace_with_3d_map_image.png)
+![3D Semantic Map in RViz]
 
 * Successfully generated a rich, 3D immersive environment map in RViz using only a single-plane 2D LiDAR scanner.
-* Implemented **Tesla-style semantic 3D shapes**: rendering dynamic cylinders for humans and bottles, spheres for sports balls, and cubes for furniture.
+* Implemented **semantic 3D shapes**: rendering dynamic cylinders for humans and bottles, spheres for sports balls, and cubes for furniture.
 * Engineered **"Phantom Desks"**: When the AI detects a laptop or cup, it automatically renders a sleek, transparent desk and pedestal leg underneath the object. This anchors floating objects to the floor and provides spatial context even when the physical table is invisible to the camera.
 
 ### 3. AI Semantic Elevation and Size Heuristics (AI Height Guessing)
