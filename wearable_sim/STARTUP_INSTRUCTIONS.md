@@ -52,8 +52,8 @@ ros2 launch wearable_sim laptop_brain.launch.py
 export ROS_DOMAIN_ID=42
 export ROS_LOCALHOST_ONLY=0
 export WEARABLE_CAMERA_MODE=ros
-cd ~/weale_ws
-source install/setup.barabsh
+cd ~/wearable_ws
+source install/setup.bash
 ros2 run wearable_sim vision_perception.py
 ```
 
