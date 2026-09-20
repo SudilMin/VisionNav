@@ -139,7 +139,16 @@ OBJECT_ELEVATIONS = {
     "spoon": 0.75, "scissors": 0.75, "book": 0.75, "remote": 0.75, 
     "cell phone": 0.75, "smartphone": 0.75, "vase": 0.75,
     "microwave": 0.90, "toaster": 0.90, "sink": 0.85,
-    "tv": 0.60, "television": 0.60, "clock": 1.50
+    "tv": 0.60, "television": 0.60, "clock": 1.50,
+    "table": 0.0, "dining table": 0.0,
+}
+
+# ── DESKTOP OBJECTS (objects that typically sit on tables) ──
+DESKTOP_OBJECTS = {
+    "laptop", "mouse", "keyboard", "cup", "bottle", "bowl", "tv", 
+    "monitor", "book", "vase", "scissors", "remote", "cell phone",
+    "smartphone", "apple", "orange", "banana", "fork", "knife", 
+    "spoon", "toaster", "microwave",
 }
 
 # ── MODE-SPECIFIC PERCEPTION PARAMETERS ──
@@ -150,6 +159,7 @@ MODE_PARAMS = {
         "conf_threshold":       0.50,  # Greatly increased to stop random hallucinations
         "static_timeout":       120.0,   # 2 min memory while indoors
         "dynamic_timeout":      5.0,
+        "dynamic_timeout":      0.5,     # SUPER FAST cleanup for moving objects (was 5.0)
         "static_assoc":         3.00,    # Increased heavily to merge jittery detections
         "dynamic_assoc":        3.50,
         "static_alpha":         0.25,
@@ -163,6 +173,7 @@ MODE_PARAMS = {
         "conf_threshold":       0.55,    # Higher threshold to reduce false positives
         "static_timeout":       3.0,     # Very short memory outdoors
         "dynamic_timeout":      2.0,
+        "dynamic_timeout":      0.5,
         "static_assoc":         3.00,
         "dynamic_assoc":        3.50,
         "static_alpha":         0.30,
@@ -182,14 +193,14 @@ MEMORY_SAVE_INTERVAL = 30.0  # seconds between auto-saves
 
 
 class KalmanTracker:
-    """Real-time 2D/3D spatial Kalman filter for dynamic & static obstacles.
-    Tracks state vector: [X, Y, Vx, Vy] in meters and m/s, plus physical width and height.
+    """Advanced Real-time 2D/3D spatial Kalman filter for dynamic & static obstacles.
+    Tracks state vector: [X, Y, Vx, Vy, Ax, Ay] (Constant Acceleration Kinematics).
     """
     def __init__(self, track_id: int, x: float, y: float, width: float, height: float, conf: float, now: float, is_dynamic: bool = True):
         self.id = track_id
-        # State: [X (forward meters), Y (lateral meters), Vx (m/s), Vy (m/s)]
-        self.x = np.array([x, y, 0.0, 0.0], dtype=np.float64)
-        self.P = np.eye(4, dtype=np.float64) * 2.0
+        # State: [X, Y, Vx, Vy, Ax, Ay]
+        self.x = np.array([x, y, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        self.P = np.eye(6, dtype=np.float64) * 2.0
         self.conf = conf
         self.last_seen = now
         self.is_dynamic = is_dynamic
@@ -200,35 +211,52 @@ class KalmanTracker:
         self.is_moving = False
         self.update_count = 0  # Track how many times this object has been observed
         
-        self.F = np.eye(4, dtype=np.float64)
-        self.H = np.zeros((2, 4), dtype=np.float64)
+        self.F = np.eye(6, dtype=np.float64)
+        self.H = np.zeros((2, 6), dtype=np.float64)
         self.H[0, 0] = 1.0
         self.H[1, 1] = 1.0
         
         if is_dynamic:
-            # Responsive process noise for moving people / vehicles
+            # Responsive process noise for moving people / vehicles (allow acceleration)
             self.R = np.eye(2, dtype=np.float64) * 0.15
-            self.Q = np.eye(4, dtype=np.float64) * 0.08
+            self.Q = np.eye(6, dtype=np.float64) * 0.08
+            self.Q[4, 4] = 0.2  # Higher uncertainty for acceleration
+            self.Q[5, 5] = 0.2
         else:
             # Moderate measurement noise for static obstacles — responsive but stable
             self.R = np.eye(2, dtype=np.float64) * 1.0
-            self.Q = np.eye(4, dtype=np.float64) * 0.005
+            self.Q = np.eye(6, dtype=np.float64) * 0.005
 
     def predict(self, now: float):
         dt = max(0.001, min(0.5, now - self.last_seen))
-        self.F[0, 2] = dt
-        self.F[1, 3] = dt
+        
+        # Position += Velocity * dt + 0.5 * Accel * dt^2
+        self.F[0, 2] = dt; self.F[1, 3] = dt
+        self.F[0, 4] = 0.5 * dt * dt; self.F[1, 5] = 0.5 * dt * dt
+        # Velocity += Accel * dt
+        self.F[2, 4] = dt; self.F[3, 5] = dt
+        
         self.x = self.F @ self.x
+        
+        # Apply friction to out-of-frame tracks so they don't drift forever
+        if now - self.last_seen > 0.1:
+            self.x[2:6] *= 0.80  # Dampen velocity and acceleration heavily if not observed
+        
+        if not self.is_dynamic:
+            self.x[2:6] = 0.0 # Force static objects to have absolute zero velocity/acceleration
+            
         self.P = self.F @ self.P @ self.F.T + self.Q
         self.velocity = float(math.hypot(self.x[2], self.x[3]))
 
     def update(self, px: float, py: float, width: float, height: float, conf: float, now: float):
         dt = max(0.001, min(0.5, now - self.last_seen))
-        self.F[0, 2] = dt
-        self.F[1, 3] = dt
+        self.F[0, 2] = dt; self.F[1, 3] = dt
+        self.F[0, 4] = 0.5 * dt * dt; self.F[1, 5] = 0.5 * dt * dt
+        self.F[2, 4] = dt; self.F[3, 5] = dt
+        
         self.x = self.F @ self.x
         self.P = self.F @ self.P @ self.F.T + self.Q
-
+        
         z = np.array([px, py], dtype=np.float64)
         y = z - (self.H @ self.x)
         
@@ -239,16 +267,11 @@ class KalmanTracker:
             
             if self.update_count >= 5:
                 # Well-established object: only accept large movements (> 1.5m)
-                # that indicate the object was truly moved (e.g., someone picked up a chair).
-                # Camera tilt and LiDAR jitter are always < 1.5m.
                 if dist_moved < 1.5:
                     y = y * 0.0  # Fully lock position — zero innovation
-                # else: let it update normally (object genuinely relocated)
             elif dist_moved < 1.0:
                 # New object still stabilizing: heavily dampen small movements
-                # Camera tilt typically causes < 1.0m apparent shifts
                 y = y * 0.01
-            # else: large movement on new object, let it update normally
         else:
             self.update_count += 1
         # ------------------------------------------------------
@@ -256,17 +279,15 @@ class KalmanTracker:
         S = self.H @ self.P @ self.H.T + self.R
         K = self.P @ self.H.T @ np.linalg.inv(S)
         self.x = self.x + (K @ y)
-        self.P = (np.eye(4) - K @ self.H) @ self.P
+        self.P = (np.eye(6) - K @ self.H) @ self.P
         
         # Update physical dimensions with smooth exponential filter
-        # Use very low alpha for static objects so sizes lock quickly
         dim_alpha = 0.40 if self.is_dynamic else 0.25
         self.width = (1.0 - dim_alpha) * self.width + dim_alpha * max(0.05, float(width))
         self.height = (1.0 - dim_alpha) * self.height + dim_alpha * max(0.05, float(height))
         
         self.velocity = float(math.hypot(self.x[2], self.x[3]))
         self.is_moving = self.is_dynamic and (self.velocity > 0.20)
-        self.conf = max(self.conf * 0.90, conf)
         self.last_seen = now
 
     @property
@@ -669,8 +690,8 @@ class VisionPerceptionNode(Node):
         return float(valid_ranges[p15_idx])
 
     def _stabilize_object(
-        self, label: str, px: float, py: float, width_m: float, height_m: float, conf: float, now: float, is_dynamic: bool, dist: float = 0.0
-    ) -> tuple[str, float, float, float, float, float, bool, float]:
+        self, label: str, px: float, py: float, width_m: float, height_m: float, conf: float, now: float, is_dynamic: bool, dist: float = 0.0, z_m: float = 0.0
+    ) -> tuple[str, float, float, float, float, float, bool, float, float]:
         """Continuous Kalman spatial tracking with position, velocity, and size estimation."""
         tracks_dict = self._dynamic_tracks if is_dynamic else self._static_tracks
         used_tracks_dict = self._dynamic_tracks_used if is_dynamic else self._static_tracks_used
@@ -686,25 +707,45 @@ class VisionPerceptionNode(Node):
 
         best_track = None
         best_dist = float("inf")
+        best_cost = float("inf")
         for track in tracks:
             if track.id in used_tracks_dict.get(label, set()):
                 continue
             assoc_d = math.hypot(px - track.x[0], py - track.x[1])
             if assoc_d < best_dist:
                 best_dist = assoc_d
+                
+            # Tesla-style advanced association (SORT logic)
+            # Predict the track's location using Constant Acceleration Kinematics
+            predicted_x = track.x[0]
+            predicted_y = track.x[1]
+            
+            dist = math.hypot(px - predicted_x, py - predicted_y)
+            
+            # 3D Bounding Box size penalty (Proxy for 3D IoU)
+            size_penalty = abs(width_m - track.width) + abs(height_m - track.height)
+            
+            # Combine distance and size into a single cost metric
+            # If size is vastly different, it's heavily penalized and won't match, stopping ID swaps
+            cost = dist + (size_penalty * 0.8)
+            
+            if dist < association_dist and cost < best_cost:
+                best_cost = cost
                 best_track = track
 
-        if best_track is None or best_dist > association_dist:
+        if best_track is None:
             existing_ids = {t.id for t in tracks}
             track_id = 1
             while track_id in existing_ids:
                 track_id += 1
             best_track = KalmanTracker(track_id, px, py, width_m, height_m, conf, now, is_dynamic=is_dynamic)
             best_track.dist = dist
+            best_track.z = z_m
             tracks.append(best_track)
         else:
             best_track.update(px, py, width_m, height_m, conf, now)
             best_track.dist = 0.7 * best_track.dist + 0.3 * dist  # Smooth distance updates
+            best_track.z = 0.7 * getattr(best_track, 'z', z_m) + 0.3 * z_m # Smooth Z elevation updates
 
         used_tracks_dict.setdefault(label, set()).add(best_track.id)
         final_label = f"{label.replace(' ', '_')}_{best_track.id}"
@@ -717,6 +758,7 @@ class VisionPerceptionNode(Node):
             float(best_track.dist),
             bool(best_track.is_moving),
             float(best_track.velocity),
+            float(best_track.z),
         )
 
     def _stabilize_static_box(
@@ -1066,8 +1108,7 @@ class VisionPerceptionNode(Node):
             
             # Table Heuristic: If it's a desktop object, it's not on the floor! 
             # Subtract table height (0.75m) from camera height to get true drop distance.
-            table_objects = ["laptop", "mouse", "keyboard", "cup", "bottle", "bowl", "tv", "monitor", "book", "vase", "scissors"]
-            if label in table_objects and camera_height > 1.0:
+            if label in DESKTOP_OBJECTS and camera_height > 1.0:
                 effective_h = max(0.1, camera_height - 0.75)
             else:
                 effective_h = camera_height
@@ -1118,14 +1159,37 @@ class VisionPerceptionNode(Node):
             depth = max(0.35, min(depth, 10.0))
 
             # ── 2. ACTUAL PHYSICAL SIZE ESTIMATION (Width & Height in meters) ──
+            # 3-Tier Dynamic Size System:
+            #   Tier 1: Known object in OBJECT_MAX_SIZES → use hardcoded clamps
+            #   Tier 2: Unknown object → estimate category from bbox coverage
+            #   Tier 3: Pure optical math (depth × pixels / focal) clamped by tier above
             width_meters = depth * (bw_ / focal_px)
             height_meters = depth * (bh_ / focal_py)
             width_meters = max(0.05, min(width_meters, 5.0))
             height_meters = max(0.05, min(height_meters, 4.0))
-            # Per-category size clamping using known real-world dimensions
-            max_w, max_h = OBJECT_MAX_SIZES.get(label, OBJECT_MAX_SIZES.get(raw_label, OBJECT_MAX_SIZE_DEFAULT))
-            width_meters = max(0.05, min(width_meters, max_w))
-            height_meters = max(0.05, min(height_meters, max_h))
+            
+            if label in OBJECT_MAX_SIZES or raw_label in OBJECT_MAX_SIZES:
+                # Tier 1: Known object — use hardcoded max dimensions
+                max_w_clamp, max_h_clamp = OBJECT_MAX_SIZES.get(label, OBJECT_MAX_SIZES.get(raw_label, OBJECT_MAX_SIZE_DEFAULT))
+            else:
+                # Tier 2: Unknown object — estimate from bounding box coverage
+                box_area_ratio = (bw_ * bh_) / float(max(w * h, 1))
+                if box_area_ratio < 0.10:
+                    max_w_clamp, max_h_clamp = (0.30, 0.30)   # Small object
+                elif box_area_ratio < 0.40:
+                    max_w_clamp, max_h_clamp = (0.80, 0.80)   # Medium object
+                else:
+                    max_w_clamp, max_h_clamp = (2.00, 2.00)    # Large object
+            
+            # Tier 3: Clamp the optically computed size
+            width_meters = max(0.05, min(width_meters, max_w_clamp))
+            height_meters = max(0.05, min(height_meters, max_h_clamp))
+
+            # ── 2.5 DYNAMIC ELEVATION ESTIMATION (Z-Axis) ──
+            # Calculate the physical drop from the camera lens to the bottom of the object
+            drop_distance = depth * math.tan(elevation_rad)
+            estimated_base_z = max(0.0, camera_height - drop_distance)
+            estimated_base_z = min(estimated_base_z, camera_height)  # Cap at camera height
 
             # ── 3. 3D POSITION ──
             mx = depth * math.cos(yaw)
@@ -1147,7 +1211,7 @@ class VisionPerceptionNode(Node):
                         pt_global = self._tf_buffer.transform(pt_local, target_frame, rclpy.duration.Duration(seconds=0.3))
                         break
                     except Exception:
-                    pass
+                        pass
                 
                 if pt_global is None:
                     continue
@@ -1161,11 +1225,11 @@ class VisionPerceptionNode(Node):
             # Semantic Size Enforcement (Fixes occlusion shrinking)
             # If a chair is occluded by a desk, its bounding box is small, making it look shorter than a laptop.
             # We force known objects to their typical real-world heights.
-            if label in ["chair", "person", "refrigerator", "door"]:
+            if label in ["chair", "refrigerator", "door"]:
                 height_meters = max_h  # Force to 90% of max height if occluded
                 
-            final_label, kx, ky, kw, kh, kdist, is_moving, vel = self._stabilize_object(
-                label, px, py, width_meters, height_meters, conf, now, is_dynamic, dist=depth
+            final_label, kx, ky, kw, kh, kdist, is_moving, vel, kz = self._stabilize_object(
+                label, px, py, width_meters, height_meters, conf, now, is_dynamic, dist=depth, z_m=estimated_base_z
             )
 
             # Directional relative position for blind assistance
@@ -1214,7 +1278,8 @@ class VisionPerceptionNode(Node):
                 self._hazard_pub.publish(String(data=hazard_msg))
 
             # ── 6. INDOOR: Register to persistent spatial memory ──
-            if self._mode == "indoor":
+            # ── 6. INDOOR: Register to persistent spatial memory (Static Only) ──
+            if self._mode == "indoor" and not is_dynamic:
                 self._register_to_memory(final_label, kx, ky, kw, kh, conf, time.time())
 
             if raw_label in self._hazard_classes:
@@ -1228,12 +1293,48 @@ class VisionPerceptionNode(Node):
             self._hazard_pub.publish(String(data=collision_msg))
 
         self._hazard_history = current_hazards
+
+        # ── SMART TABLE INFERENCE ──
+        # If desktop objects (laptop, cup, etc.) are detected but YOLO didn't see the table,
+        # synthetically inject a table object at the average position of all desktop objects.
+        if self._mode == "indoor":
+            desktop_positions = []
+            table_detected = False
+            for label_key, tracks in self._static_tracks.items():
+                base = label_key.replace('_', ' ')
+                if base in ["table", "dining table"]:
+                    table_detected = True
+                if base in DESKTOP_OBJECTS:
+                    for t in tracks:
+                        if now - t.last_seen < 5.0:
+                            desktop_positions.append((t.x[0], t.x[1], t.width, t.dist))
+            
+            if desktop_positions and not table_detected:
+                # Average position of all desktop objects
+                avg_x = sum(p[0] for p in desktop_positions) / len(desktop_positions)
+                avg_y = sum(p[1] for p in desktop_positions) / len(desktop_positions)
+                # Table width = span of objects + padding
+                max_w = max(p[2] for p in desktop_positions)
+                avg_dist = sum(p[3] for p in desktop_positions) / len(desktop_positions)
+                table_width = max(max_w * 2.0, 1.0)  # At least 1m wide
+                
+                # Inject synthetic table into static tracks
+                inferred_label = "table"
+                _, kx, ky, kw, kh, kdist, is_moving, vel, kz = self._stabilize_object(
+                    inferred_label, avg_x, avg_y, table_width, 0.75, 0.80, now, False, dist=avg_dist, z_m=0.0
+                )
+                
+                # Register to spatial memory
+                inferred_final = f"table_{hash('inferred_table') % 100}"
+                self._register_to_memory(inferred_final, kx, ky, kw, kh, 0.80, time.time())
         
     def _publish_markers(self, now):
         from visualization_msgs.msg import Marker, MarkerArray
         current_markers = []
         now_msg = self.get_clock().now().to_msg()
         marker_lifetime = rclpy.duration.Duration(seconds=2.5).to_msg()
+        static_marker_lifetime = rclpy.duration.Duration(seconds=2.5).to_msg()
+        dynamic_marker_lifetime = rclpy.duration.Duration(seconds=0.6).to_msg()
         
         marker_frame = 'map' if self._mode == 'indoor' else 'base_footprint'
         
@@ -1243,7 +1344,7 @@ class VisionPerceptionNode(Node):
                     continue
                 final_label = f"{label.replace(' ', '_')}_{track.id}"
                 self._add_track_marker(
-                    current_markers, track, final_label, now_msg, marker_lifetime, True, marker_frame, distance=track.dist
+                    current_markers, track, final_label, now_msg, dynamic_marker_lifetime, True, marker_frame, distance=track.dist
                 )
                 
         for label, tracks in self._static_tracks.items():
@@ -1252,7 +1353,7 @@ class VisionPerceptionNode(Node):
                     continue
                 final_label = f"{label.replace(' ', '_')}_{track.id}"
                 self._add_track_marker(
-                    current_markers, track, final_label, now_msg, marker_lifetime, False, marker_frame, distance=track.dist
+                    current_markers, track, final_label, now_msg, static_marker_lifetime, False, marker_frame, distance=track.dist
                 )
 
         # ── INDOOR: Also publish remembered objects from spatial memory ──
@@ -1365,7 +1466,16 @@ class VisionPerceptionNode(Node):
         
         # Safety-net: clamp marker sizes using known real-world maximum dimensions
         base_label = label_text.rsplit('_', 1)[0].replace('_', ' ') if '_' in label_text else label_text
-        max_w, max_h = OBJECT_MAX_SIZES.get(base_label, OBJECT_MAX_SIZE_DEFAULT)
+        if base_label in OBJECT_MAX_SIZES:
+            max_w, max_h = OBJECT_MAX_SIZES[base_label]
+        else:
+            # Dynamic size clamp for unknown objects based on measured height
+            if obj_height < 0.30:
+                max_w, max_h = (0.30, 0.30)   # Small unknown
+            elif obj_height < 0.80:
+                max_w, max_h = (0.80, 0.80)   # Medium unknown
+            else:
+                max_w, max_h = (2.00, 2.00)    # Large unknown
         obj_width = min(obj_width, max_w)
         obj_height = min(obj_height, max_h)
         
@@ -1392,7 +1502,25 @@ class VisionPerceptionNode(Node):
         marker.action = Marker.ADD
         marker.pose.position.x = px
         marker.pose.position.y = py
-        base_z = OBJECT_ELEVATIONS.get(base_label, 0.0)
+        
+        # ── DYNAMIC ELEVATION ESTIMATION ──
+        # Tier 1: Known objects use OBJECT_ELEVATIONS (accurate hardcoded values)
+        # Tier 2: Unknown objects get elevation estimated from their physical size
+        if base_label in OBJECT_ELEVATIONS:
+            base_z = OBJECT_ELEVATIONS[base_label]
+        else:
+            # Heuristic: Small objects are likely on desks, large objects are on the floor
+            if obj_height < 0.30:
+                base_z = 0.75   # Small → probably on a table
+            elif obj_height > 0.80:
+                base_z = 0.0    # Large → probably on the floor
+            else:
+                base_z = 0.40   # Medium → mid-height (could be shelf, counter, etc.)
+        # ── DYNAMIC ELEVATION ESTIMATION (From Pinhole Math) ──
+        # We now use the geometrically computed Z-elevation calculated from the 
+        # actual pixel position in the camera frame and the estimated depth!
+        base_z = getattr(track, 'z', 0.0)
+        
         marker.pose.position.z = base_z + obj_height + 0.15  # Float above the 3D cube
         marker.scale.z = 0.22
         marker.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
@@ -1408,23 +1536,61 @@ class VisionPerceptionNode(Node):
         cube_marker.id = stable_id + 1
         
         # Tesla-style semantic 3D rendering (Cylinders for people, spheres for balls, cubes for furniture)
-        if base_label in ["person", "bottle", "vase"]:
+        if base_label in ["table", "dining table"]:
+            # ── REAL TABLE: Render as a wide, flat surface at standard table height ──
+            # ── REAL TABLE: Render as a wide, flat surface dynamically calculated from optical geometry ──
+            cube_marker.type = Marker.CUBE
+            cube_marker.action = Marker.ADD
+            cube_marker.pose.position.x = px
+            cube_marker.pose.position.y = py
+            table_height = 0.75  # Standard table height
+            cube_marker.pose.position.z = table_height - 0.025  # Top surface at 0.75m
+            table_height = max(0.1, base_z + obj_height)  # dynamically derived table surface height
+            cube_marker.pose.position.z = table_height - 0.025  # Top surface
+            cube_marker.scale.x = max(obj_width, 1.0)  # Tables are at least 1m wide
+            cube_marker.scale.y = max(obj_width, 0.8)   # Tables have depth
+            cube_marker.scale.z = 0.05  # 5cm thick surface
+            cube_marker.color = ColorRGBA(r=0.55, g=0.35, b=0.15, a=0.7)  # Wood brown
+            cube_marker.lifetime = marker_lifetime
+            current_markers.append(cube_marker)
+            
+            # Draw table legs
+            for lx, ly in [(-0.4, -0.3), (0.4, -0.3), (-0.4, 0.3), (0.4, 0.3)]:
+                leg = Marker()
+                leg.header.frame_id = frame_id
+                leg.header.stamp = now_msg
+                leg.ns = f"{marker_ns_prefix}_table_legs"
+                leg.id = stable_id + 4 + int((lx + 0.5) * 10 + (ly + 0.5) * 100)
+                leg.type = Marker.CYLINDER
+                leg.action = Marker.ADD
+                leg.pose.position.x = px + lx
+                leg.pose.position.y = py + ly
+                leg.pose.position.z = (table_height - 0.05) / 2.0
+                leg.scale.x = 0.06
+                leg.scale.y = 0.06
+                leg.scale.z = table_height - 0.05
+                leg.color = ColorRGBA(r=0.45, g=0.28, b=0.10, a=0.6)
+                leg.lifetime = marker_lifetime
+                current_markers.append(leg)
+        elif base_label in ["person", "bottle", "vase"]:
             cube_marker.type = Marker.CYLINDER
         elif base_label in ["sports ball", "apple", "orange", "bowl"]:
             cube_marker.type = Marker.SPHERE
         else:
             cube_marker.type = Marker.CUBE
-            
-        cube_marker.action = Marker.ADD
-        cube_marker.pose.position.x = px
-        cube_marker.pose.position.y = py
-        cube_marker.pose.position.z = base_z + (obj_height / 2.0)  # Add semantic elevation so laptops sit on tables
-        cube_marker.scale.x = obj_width
-        cube_marker.scale.y = obj_width
-        cube_marker.scale.z = obj_height
-        cube_marker.color = marker_color
-        cube_marker.lifetime = marker_lifetime
-        current_markers.append(cube_marker)
+        
+        # Only render the standard shape if it's NOT a table (tables already rendered above)
+        if base_label not in ["table", "dining table"]:
+            cube_marker.action = Marker.ADD
+            cube_marker.pose.position.x = px
+            cube_marker.pose.position.y = py
+            cube_marker.pose.position.z = base_z + (obj_height / 2.0)  # Add semantic elevation so laptops sit on tables
+            cube_marker.scale.x = obj_width
+            cube_marker.scale.y = obj_width
+            cube_marker.scale.z = obj_height
+            cube_marker.color = marker_color
+            cube_marker.lifetime = marker_lifetime
+            current_markers.append(cube_marker)
         
         # ── RESTORED: PHANTOM TABLE ──
         # If an object is floating (base_z > 0), draw a sleek table underneath it
