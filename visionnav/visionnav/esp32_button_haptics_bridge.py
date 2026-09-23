@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-esp32_bridge.py
+esp32_button_haptics_bridge.py
 ---------------
 ROS 2 interface bridging physical ESP32 tactile buttons and vibration haptics to VisionNav.
 Listens over USB Serial (/dev/ttyUSB1, /dev/ttyACM0, etc.) or Wi-Fi UDP Port 9090.
@@ -25,7 +25,7 @@ except ImportError:
 
 class ESP32BridgeNode(Node):
     def __init__(self):
-        super().__init__("esp32_bridge")
+        super().__init__("esp32_button_haptics_bridge")
         self._pub_describe = self.create_publisher(String, "/describe_command", 10)
         
         self.get_logger().info("🔌 VisionNav ESP32 Tactical Bridge initializing...")

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-find_object.py
---------------
+voice_navigation_assistant.py
+-----------------------------
 Voice-guided semantic navigation node — like Google Maps for blind users.
 
 Flow:
@@ -36,7 +36,7 @@ from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 
-from visionnav.paths import model_path
+from visionnav.model_paths import model_path
 
 TMP_DIR = tempfile.gettempdir()  # scratch audio/images
 TTS_MODEL = model_path("en_US-lessac-medium.onnx")
@@ -62,7 +62,7 @@ def suppress_stderr():
 
 class FindObjectNode(Node):
     def __init__(self):
-        super().__init__('find_object_node')
+        super().__init__('voice_navigation_assistant')
         
         self._marker_names = {}  # (ns, id) -> object name, so Marker.DELETE can forget the object
         self._marker_sub = self.create_subscription(MarkerArray, '/semantic_markers', self._marker_callback, 10)

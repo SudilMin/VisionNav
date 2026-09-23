@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-gps_nav.py - Offline GPS Navigation for Outdoor Mode
+gps_voice_navigator.py - Offline GPS Navigation for Outdoor Mode
 Subscribes to /gps/fix (NavSatFix) and provides:
   1. Heading direction to a GPS waypoint
   2. Distance remaining
@@ -15,7 +15,7 @@ import math
 
 class GPSNavNode(Node):
     def __init__(self):
-        super().__init__('gps_nav')
+        super().__init__('gps_voice_navigator')
         self._gps_sub = self.create_subscription(NavSatFix, '/gps/fix', self._gps_callback, 10)
         self._cmd_sub = self.create_subscription(String, '/gps_destination', self._dest_callback, 10)
         self._guidance_pub = self.create_publisher(String, '/gps_guidance', 10)

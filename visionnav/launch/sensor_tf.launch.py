@@ -3,7 +3,7 @@ sensor_tf.launch.py
 ===================
 Single source of truth for the chest-rig sensor extrinsics.
 
-Both the SLAM backend and vision_perception.py read these transforms, so the LiDAR map
+Both the SLAM backend and object_perception.py read these transforms, so the LiDAR map
 and the camera-projected objects always agree. Measure your rig once and pass the values
 as launch arguments instead of editing numbers in several files.
 
@@ -20,12 +20,12 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 ARGS = {
-    # LiDAR yaw MEASURED on the rig with visionnav/check_lidar_orientation.py (camera depth vs LiDAR
+    # LiDAR yaw MEASURED on the rig with visionnav/lidar_orientation_calibrator.py (camera depth vs LiDAR
     # ranges): its forward axis points backward, ~8 deg off. With 0 here, walking backward showed as
     # walking forward in the map. Re-run the tool whenever the LiDAR is re-mounted.
     # roll 180 = LiDAR mounted upside down (the tool reports this as a "mirrored" scan).
     'lidar_height': ('1.2', 'LiDAR scan plane height above the floor (m)'),
-    'lidar_yaw_deg': ('188.0', 'LiDAR yaw on the rig (deg), measured by check_lidar_orientation.py'),
+    'lidar_yaw_deg': ('188.0', 'LiDAR yaw on the rig (deg), measured by lidar_orientation_calibrator.py'),
     'lidar_roll_deg': ('0.0', 'LiDAR roll on the rig, 180 = upside down (deg)'),
     'camera_height': ('1.3', 'Camera lens height above the floor (m)'),
     'camera_pitch_deg': ('0.0', 'Camera downward tilt, positive = looking down (deg)'),

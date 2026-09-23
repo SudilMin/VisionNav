@@ -31,5 +31,5 @@ VisionNav offers dual-modality feedback to ensure the user is safely guided to t
 
 ## 5. Hardware Interface: ESP32 Smart Buttons
 To completely eliminate the need for a screen or keyboard, the user controls the entire VisionNav system seamlessly via physical ESP32 push buttons mounted on the chest rig:
-* **Button 1 (AI Voice Navigation):** Triggers the `find_object` node. The user holds this button to speak spatial commands like *"Find the chair"* or *"Take me to the door"*.
+* **Button 1 (AI Voice Navigation):** Triggers the `voice_navigation_assistant` node. The user holds this button to speak spatial commands like *"Find the chair"* or *"Take me to the door"*.
 * **Button 2 (Moondream Scene Describer):** Triggers the `scene_describer` node. When pressed, the system instantly grabs the latest camera frame and feeds it into the Moondream2 Vision Language Model (running via Ollama). The VLM analyzes the image and speaks a highly detailed, natural language description of everything in front of the user, helping them understand complex environments (e.g., reading signs, recognizing room layouts).

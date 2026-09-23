@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-phone_camera.py
----------------
+phone_camera_publisher.py
+-------------------------
 Reads the live video feed from a USB-connected smartphone (Webcam mode) 
 and publishes it to the ROS 2 `/camera/image_raw` topic so the AI can process it.
 """
@@ -18,7 +18,7 @@ import time
 
 class PhoneCameraNode(Node):
     def __init__(self):
-        super().__init__('phone_camera')
+        super().__init__('phone_camera_publisher')
         
         # We use BEST_EFFORT so if the AI lags, it just drops old frames 
         # rather than building up a massive backlog.

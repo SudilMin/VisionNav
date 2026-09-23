@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-structure_mapper.py
-===================
+wall_structure_mapper.py
+========================
 Completes the 3D indoor map with the structure YOLO cannot see: walls and other fixed barriers.
 
 The LiDAR SLAM map (/map from Cartographer) already contains every wall, but only as 2D occupied
 cells. This node turns them into 3D geometry for RViz, next to the YOLO objects from
-vision_perception.py:
+object_perception.py:
   1. Take the occupied cells (Cartographer probability >= 65 %), drop single-cell scan noise, and
      drop cells belonging to YOLO objects (a chair back the LiDAR hits is already drawn as a chair).
   2. Fit straight wall segments with sequential RANSAC, split where a line has gaps (doorways).
@@ -16,7 +16,7 @@ vision_perception.py:
 
 Runs at map rate (every RECOMPUTE_PERIOD s), separately from the camera-rate vision node.
 
-Subscribes: /map (nav_msgs/OccupancyGrid), /semantic_objects (JSON from vision_perception.py)
+Subscribes: /map (nav_msgs/OccupancyGrid), /semantic_objects (JSON from object_perception.py)
 Publishes:  /structure_markers (visualization_msgs/MarkerArray, frame map)
 """
 
@@ -105,7 +105,7 @@ def extract_segments(points, rng):
 
 class StructureMapper(Node):
     def __init__(self):
-        super().__init__('structure_mapper')
+        super().__init__('wall_structure_mapper')
         latched = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                              durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self._map = None

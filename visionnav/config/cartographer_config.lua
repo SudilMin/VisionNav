@@ -35,7 +35,7 @@ MAP_BUILDER.use_trajectory_builder_2d = true
 
 TRAJECTORY_BUILDER_2D.use_imu_data = false
 TRAJECTORY_BUILDER_2D.num_accumulated_range_data = 1
--- Body returns are already removed by scan_body_filter.py; this is a second guard.
+-- Body returns are already removed by lidar_body_filter.py; this is a second guard.
 TRAJECTORY_BUILDER_2D.min_range = 0.45
 -- A chest-worn scan plane pitches with every step; beyond ~8 m it starts hitting floor/ceiling.
 TRAJECTORY_BUILDER_2D.max_range = 8.0

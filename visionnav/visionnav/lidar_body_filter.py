@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-scan_body_filter.py
-===================
+lidar_body_filter.py
+====================
 Removes the wearer's own body from the chest LiDAR scan before it reaches SLAM.
 
 A 360° LiDAR on the chest sees the user's torso behind it and their arms at the sides.
@@ -30,7 +30,7 @@ import tf2_ros
 
 class ScanBodyFilter(Node):
     def __init__(self):
-        super().__init__('scan_body_filter')
+        super().__init__('lidar_body_filter')
         self._min_range = self.declare_parameter('min_range', 0.45).value
         self._keep_fov = math.radians(self.declare_parameter('keep_fov_deg', 220.0).value)
         self._base_frame = self.declare_parameter('base_frame', 'base_footprint').value

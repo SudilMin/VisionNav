@@ -37,8 +37,8 @@ def generate_launch_description():
         # 2. Remove the wearer's own body from the scan before SLAM
         Node(
             package='visionnav',
-            executable='scan_body_filter',
-            name='scan_body_filter',
+            executable='lidar_body_filter',
+            name='lidar_body_filter',
             output='screen',
         ),
 
@@ -83,8 +83,8 @@ def generate_launch_description():
         # 3c. 3D walls and fixed structure from the SLAM map (YOLO cannot see walls)
         Node(
             package='visionnav',
-            executable='structure_mapper',
-            name='structure_mapper',
+            executable='wall_structure_mapper',
+            name='wall_structure_mapper',
             output='screen',
         ),
 

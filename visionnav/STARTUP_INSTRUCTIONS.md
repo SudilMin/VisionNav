@@ -19,8 +19,15 @@ colcon build --symlink-install --packages-select visionnav
 source install/setup.bash
 ```
 
+**Node names** (renamed so each says what it does; old name → new name):
+`vision_perception` → `object_perception`, `find_object` → `voice_navigation_assistant`,
+`phone_camera` → `phone_camera_publisher`, `esp32_bridge` → `esp32_button_haptics_bridge`,
+`scan_body_filter` → `lidar_body_filter`, `check_lidar_orientation` → `lidar_orientation_calibrator`,
+`gps_nav` → `gps_voice_navigator`, `structure_mapper` → `wall_structure_mapper`.
+Topics are unchanged.
+
 **Object detector (laptop):** the vision node uses **YOLOE-11s-seg** (open-vocabulary) with the indoor
-vocabulary in `VOCABULARY` at the top of `visionnav/vision_perception.py` (doors, light switches, wall sockets,
+vocabulary in `VOCABULARY` at the top of `visionnav/object_perception.py` (doors, light switches, wall sockets,
 stairs, holes in the floor, furniture, …). On the first start, or after the vocabulary is edited, it compiles a
 TensorRT FP16 engine for the RTX 2050 into `models/` automatically (≈2 min, one time) before the ROS loop starts.
 To detect something new, add its name to `VOCABULARY`; the engine rebuilds itself on the next start.
@@ -49,7 +56,7 @@ export ROS_DOMAIN_ID=42
 export ROS_LOCALHOST_ONLY=0
 cd ~/wearable_ws
 source install/setup.bash
-ros2 run visionnav phone_camera
+ros2 run visionnav phone_camera_publisher
 ```
 
 ---
@@ -73,11 +80,10 @@ ros2 launch visionnav laptop_brain.launch.py
 ```
 This starts the sensor TFs (`sensor_tf.launch.py`), the body filter (`/scan` → `/scan_filtered`,
 removes your own torso/arms from the LiDAR), Cartographer and RViz.
-It also starts the `structure_mapper` node, which turns the walls in the SLAM map into 3D blocks in RViz
+It also starts the `wall_structure_mapper` node, which turns the walls in the SLAM map into 3D blocks in RViz
 (**Walls & Structure** display, `/structure_markers`): segments 0.6 m or longer become 2.4 m walls, and
 shorter pieces become 1.3 m obstacle blocks. A detected **door** is cut out of the wall (and made passable
 for Nav2), so routes can go through it; stairs and holes in the floor are kept out of routes with a wide margin. Walls grow longer as you walk around and the LiDAR sees more.
-`cartographer.launch.py` still works and is identical.
 
 *Option B: SLAM Toolbox (legacy)* — `ros2 launch visionnav laptop_brain.launch.py slam:=slam_toolbox`.
 SLAM Toolbox only adds a scan after wheel odometry reports motion; the wearable has none, so the map
@@ -102,10 +108,10 @@ export WEARABLE_CAMERA_MODE=ros
 cd ~/wearable_ws
 source install/setup.bash
 # For standard indoor mode:
-ros2 run visionnav vision_perception
+ros2 run visionnav object_perception
 
 # For outdoor mode (longer tracking timeouts):
-WEARABLE_MODE=outdoor ros2 run visionnav vision_perception
+WEARABLE_MODE=outdoor ros2 run visionnav object_perception
 ```
 
 **Terminal 5 (Start the Navigation Assistant):**
@@ -115,7 +121,7 @@ export ROS_DOMAIN_ID=42
 export ROS_LOCALHOST_ONLY=0
 cd ~/wearable_ws
 source install/setup.bash
-ros2 run visionnav find_object
+ros2 run visionnav voice_navigation_assistant
 # Voice/keyboard assistant. "go to chair" is routed by Nav2 (Theta* + smoother, started by
 # laptop_brain.launch.py) with spoken turn-by-turn guidance; falls back to the built-in A* if
 # Nav2 is not running (force with WEARABLE_NAV_BACKEND=astar).
@@ -123,7 +129,7 @@ ros2 run visionnav find_object
 
 
 # (If Outdoors) Start the GPS Macro-Navigator in background
-# ros2 run visionnav gps_nav &
+# ros2 run visionnav gps_voice_navigator &
 ```
 
 **Terminal 6 (Start the Qwen3-VL Scene Describer):**
@@ -144,7 +150,7 @@ vision node read them from TF, so there is one place to fix them.
 
 0. **LiDAR direction (most important).** If the map moves the wrong way (walking backward shows as
    walking forward, or turning left shows as turning right), the LiDAR mounting is wrong. With the Pi
-   LiDAR running, wear the rig and run `ros2 run visionnav check_lidar_orientation`. Then follow
+   LiDAR running, wear the rig and run `ros2 run visionnav lidar_orientation_calibrator`. Then follow
    the prompts: stand still, walk ~1 m forward, turn left ~90°. It prints the `lidar_yaw_deg` /
    `lidar_roll_deg` to use. The current default (188°, upright) was measured from camera depth plus
    your report that backward showed as forward. Confirm it with this walk. RViz's **Your Tracked Path**
@@ -158,7 +164,7 @@ vision node read them from TF, so there is one place to fix them.
    * Dots on the **wrong side** of the image (mirrored): use `lidar_roll_deg:=180` (LiDAR upside down).
    * The camera picture itself is mirrored: the Pi stream is flipped back by default in ROS mode;
      set `WEARABLE_CAMERA_FLIP=0` (or `=1` in direct USB mode) for a camera that is not mirrored.
-   * Dots **rotated / shifted sideways**: re-run `check_lidar_orientation` (step 0).
+   * Dots **rotated / shifted sideways**: re-run `lidar_orientation_calibrator` (step 0).
    * Dots consistently **too high or low**: fix `camera_pitch_deg` / heights.
 3. Every label shows the distance from you, how it was measured (`LiDAR`, `depth` or `cam`), the
    object's real height, and the surface height for objects on a table. RViz labels show the same,

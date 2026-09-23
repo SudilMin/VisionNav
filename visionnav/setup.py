@@ -6,9 +6,9 @@ from setuptools import find_packages, setup
 package_name = 'visionnav'
 
 NODES = [
-    'vision_perception', 'find_object', 'scene_describer', 'phone_camera', 'esp32_bridge',
-    'scan_body_filter', 'semantic_costmap', 'semantic_navigator', 'structure_mapper',
-    'check_lidar_orientation', 'gps_nav', 'sensor_sender', 'sensor_receiver', 'download_model',
+    'object_perception', 'voice_navigation_assistant', 'scene_describer', 'phone_camera_publisher', 'esp32_button_haptics_bridge',
+    'lidar_body_filter', 'semantic_costmap', 'semantic_navigator', 'wall_structure_mapper',
+    'lidar_orientation_calibrator', 'gps_voice_navigator',
 ]
 
 setup(
@@ -21,7 +21,9 @@ setup(
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
         (os.path.join('share', package_name, 'config'), glob('config/*')),
         (os.path.join('share', package_name, 'rviz'), glob('rviz/*.rviz')),
-        (os.path.join('share', package_name, 'models'), glob('models/*')),
+        # TensorRT engines are generated at run time next to the weights, so they are not installed.
+        (os.path.join('share', package_name, 'models'),
+         [f for f in glob('models/*') if not f.endswith('.engine')]),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

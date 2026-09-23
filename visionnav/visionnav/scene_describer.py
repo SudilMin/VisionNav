@@ -25,7 +25,7 @@ import time
 import threading
 import numpy as np
 
-from visionnav.paths import model_path
+from visionnav.model_paths import model_path
 
 TMP_DIR = tempfile.gettempdir()  # scratch audio/images
 TTS_MODEL = model_path("en_US-lessac-medium.onnx")
@@ -155,7 +155,7 @@ class SceneDescriberNode(Node):
         # Publish the VLM's description
         self._desc_pub = self.create_publisher(String, "/scene_description", 10)
         
-        self.get_logger().info("Scene Describer ready! Waiting for commands from find_object...")
+        self.get_logger().info("Scene Describer ready! Waiting for commands from voice_navigation_assistant...")
     
     def _image_callback(self, msg):
         try:
@@ -164,7 +164,7 @@ class SceneDescriberNode(Node):
             pass
     
     def _cmd_callback(self, msg):
-        """Handle commands from other nodes (e.g., find_object.py)."""
+        """Handle commands from other nodes (e.g., voice_navigation_assistant.py)."""
         if self.latest_frame is not None:
             self._process_question(msg.data)
             

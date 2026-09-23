@@ -16,7 +16,7 @@ and re-plans every second. The chosen goal has hysteresis (moves only when the o
 spot gets blocked, or a straight line newly opens up), so the path does not flip between two valid
 sides of the object. People's predicted paths are in the semantic costmap, so a Theta* re-plan curves
 around where they are walking (what a TEB local planner would do for a robot).
-find_object.py turns the resulting path into spoken turn-by-turn guidance.
+voice_navigation_assistant.py turns the resulting path into spoken turn-by-turn guidance.
 
 Subscribes: /semantic_goal (String: "chair", "chair_2", "stop", or JSON {"name","x","y"} to pin the
             goal to a locked map coordinate instead of the live detection), /semantic_objects (JSON),

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-check_lidar_orientation.py
-==========================
+lidar_orientation_calibrator.py
+===============================
 Measures how the LiDAR is mounted on the rig, so the map moves the way you move.
 
 If the LiDAR mounting in sensor_tf.launch.py (lidar_yaw_deg / lidar_roll_deg) is wrong, SLAM moves
 you the wrong way: e.g. walking backward shows as walking forward in the map.
 
 Guided walk (default, unambiguous), with the Pi's LiDAR running, wearing the rig:
-    ros2 run visionnav check_lidar_orientation
+    ros2 run visionnav lidar_orientation_calibrator
   1. stand still,
   2. walk straight FORWARD about 1 m and stop: the direction the LiDAR moved in its own frame is
      your forward direction -> lidar_yaw_deg,
@@ -17,7 +17,7 @@ Guided walk (default, unambiguous), with the Pi's LiDAR running, wearing the rig
 The LiDAR's own motion comes from scan-to-scan ICP; returns closer than MIN_RANGE (your body) are
 ignored.
 
-    ros2 run visionnav check_lidar_orientation --static
+    ros2 run visionnav lidar_orientation_calibrator --static
 compares camera depth with LiDAR ranges for a still rig instead. In a small room several mountings
 can fit a still scene about equally well, so use it only as a sanity check.
 """
@@ -35,7 +35,7 @@ from rclpy.qos import qos_profile_sensor_data
 from scipy.spatial import cKDTree
 from sensor_msgs.msg import LaserScan
 
-from visionnav.paths import model_path
+from visionnav.model_paths import model_path
 
 MIN_RANGE = 0.5          # m: closer returns are the wearer's body (they move with the LiDAR)
 MAX_RANGE = 8.0
@@ -110,7 +110,7 @@ def mounting_from_motion(walk_translation, turn_angle):
 # ── ROS capture ──
 class ScanRecorder(Node):
     def __init__(self):
-        super().__init__('check_lidar_orientation')
+        super().__init__('lidar_orientation_calibrator')
         self.scans = []
         self.create_subscription(LaserScan, '/scan', self.scans.append, qos_profile_sensor_data)
 
@@ -178,7 +178,7 @@ def static_check():
     hfov = math.radians(float(os.environ.get("WEARABLE_CAMERA_HFOV_DEG", "70.0")))
     flip = os.environ.get("WEARABLE_CAMERA_FLIP", "1") == "1"
     rclpy.init()
-    node = Node('check_lidar_orientation')
+    node = Node('lidar_orientation_calibrator')
     bridge, scans, pairs = CvBridge(), [], []
     node.create_subscription(LaserScan, '/scan', scans.append, qos_profile_sensor_data)
 

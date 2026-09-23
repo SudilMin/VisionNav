@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-vision_perception.py
+object_perception.py
 ====================
 ROS 2 Jazzy – Wearable Blind-Assist Vision Node  (Ultralytics YOLOE open-vocabulary edition)
 
@@ -33,6 +33,7 @@ import time
 import numpy as np
 import threading
 import zlib
+import glob
 import hashlib
 import shutil
 from collections import deque
@@ -40,7 +41,7 @@ import rclpy
 from cv_bridge import CvBridge
 from rclpy.node import Node
 
-from visionnav.paths import model_path
+from visionnav.model_paths import model_path
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 from rclpy.duration import Duration
@@ -61,41 +62,74 @@ MODEL_PATH  = model_path("yoloe-11s-seg.pt")
 # YOLOE is prompted once with these names (text embeddings are baked into the TensorRT engine, so
 # there is no text encoder at run time). Add a word here and the engine is rebuilt automatically.
 VOCABULARY = [
-    # required
-    "door", "light switch", "wall socket", "staircase", "chair", "table", "obstacle", "person",
-    # structure / wall-mounted
-    "doorway", "window", "stairs", "step", "handrail", "elevator door", "pillar", "door handle",
-    "power outlet", "thermostat", "fire extinguisher", "fire alarm", "radiator", "air conditioner",
-    "mirror", "picture frame", "whiteboard", "clock", "shelf",
+    # doors, stairs and building structure
+    "door", "doorway", "sliding door", "glass door", "door handle", "door knob", "gate", "window",
+    "curtain", "window blinds", "staircase", "stairs", "step", "handrail", "railing", "elevator door",
+    "escalator", "pillar", "doormat",
+    # switches, sockets and other wall-mounted things
+    "light switch", "wall switch", "switch board", "electrical switch panel", "wall socket",
+    "power outlet", "plug socket", "power strip", "extension cord", "circuit breaker panel",
+    "thermostat", "fire extinguisher", "fire alarm", "smoke detector", "intercom", "doorbell",
+    "air conditioner", "radiator", "water heater", "ceiling fan", "ceiling light", "tube light", "lamp",
+    "exit sign", "sign", "mirror", "picture frame", "painting", "poster", "whiteboard", "notice board",
+    "calendar", "clock", "wall shelf", "hook", "coat hanger", "towel rack",
     # floor hazards
-    "hole in floor", "pothole", "floor step", "ramp", "wet floor sign", "cable on floor", "box",
-    "bag", "shoe", "trash can", "bucket", "rug",
-    # furniture and appliances
-    "office chair", "desk", "couch", "bed", "stool", "bench", "cabinet", "wardrobe", "bookshelf",
-    "refrigerator", "microwave", "oven", "stove", "sink", "washing machine", "toilet", "bathtub",
-    "tv", "monitor", "laptop", "keyboard", "mouse", "printer", "lamp", "fan",
-    # items
-    "cup", "bottle", "book", "cell phone", "remote", "backpack", "umbrella", "vase", "potted plant",
-    "bowl", "kettle", "keys",
+    "hole in floor", "pothole", "floor step", "ramp", "wet floor sign", "puddle", "cable on floor",
+    "wire", "box", "cardboard box", "bag", "shoe", "slippers", "trash can", "dustbin", "bucket", "mop",
+    "broom", "rug", "toy", "ball", "laundry basket", "clothes on floor", "obstacle",
+    # furniture
+    "chair", "office chair", "plastic chair", "table", "desk", "dining table", "coffee table",
+    "side table", "couch", "sofa", "bed", "stool", "bench", "cabinet", "cupboard", "wardrobe", "drawer",
+    "chest of drawers", "shelf", "bookshelf", "shoe rack", "tv stand", "kitchen counter",
+    "dressing table", "crib",
+    # kitchen
+    "refrigerator", "microwave", "oven", "stove", "gas cylinder", "rice cooker", "blender", "toaster",
+    "kettle", "sink", "faucet", "dish rack", "water dispenser", "plate", "bowl", "cup", "mug", "glass",
+    "bottle", "water bottle", "jug", "cooking pot", "frying pan", "knife", "spoon", "fork",
+    "cutting board", "food", "fruit",
+    # bathroom
+    "toilet", "bathtub", "shower", "wash basin", "towel", "toothbrush", "soap",
+    # electronics and appliances
+    "tv", "monitor", "laptop", "computer", "keyboard", "mouse", "printer", "speaker", "router",
+    "phone charger", "cell phone", "remote", "tablet", "camera", "headphones", "fan", "table fan",
+    "pedestal fan", "washing machine", "iron", "vacuum cleaner",
+    # personal items
+    "book", "notebook", "pen", "paper", "backpack", "handbag", "wallet", "keys", "glasses", "watch",
+    "medicine", "umbrella", "pillow", "blanket", "cushion", "clothes", "hanger", "basket", "vase",
+    "potted plant", "flower", "candle", "scissors", "teddy bear",
     # people / pets
-    "dog", "cat",
+    "person", "child", "dog", "cat",
     # outdoor
-    "car", "bicycle", "motorcycle", "bus", "truck", "traffic light", "stop sign", "fire hydrant", "curb",
+    "car", "bicycle", "motorcycle", "three-wheeler", "bus", "truck", "traffic light", "stop sign",
+    "fire hydrant", "curb",
 ]
+# Several prompts for one thing raise recall (switches are often on a switch board or panel); they
+# are reported, mapped and navigated to under one name.
+PROMPT_SYNONYMS = {
+    "wall switch": "light switch", "switch board": "light switch", "electrical switch panel": "light switch",
+    "power outlet": "wall socket", "plug socket": "wall socket",
+    "staircase": "stairs", "floor step": "step", "doorway": "door", "sliding door": "door",
+    "glass door": "door", "door knob": "door handle", "dustbin": "trash can",
+    "cardboard box": "box", "office chair": "chair", "plastic chair": "chair", "desk": "table",
+    "dining table": "table", "cupboard": "cabinet", "wall shelf": "shelf",
+    "water bottle": "bottle", "mug": "cup", "table fan": "fan", "pedestal fan": "fan",
+    "wire": "cable on floor", "wash basin": "sink",
+}
 _VOCAB_HASH = hashlib.sha1("|".join(VOCABULARY).encode()).hexdigest()[:8]
 ENGINE_PATH = model_path(f"yoloe-11s-seg-indoor-{_VOCAB_HASH}.engine")
 
 INDOOR_CLASSES = set(VOCABULARY) - {
     "bicycle", "motorcycle", "bus", "truck", "car", "traffic light", "stop sign", "fire hydrant",
-    "curb", "pothole",
+    "curb", "pothole", "three-wheeler",
 }
 OUTDOOR_CLASSES = {
     "person", "bicycle", "car", "motorcycle", "bus", "truck", "dog", "cat",
     "traffic light", "stop sign", "fire hydrant", "bench", "chair", "potted plant", "backpack",
-    "umbrella", "stairs", "step", "curb", "pothole", "hole in floor", "obstacle", "door", "trash can",
+    "umbrella", "stairs", "staircase", "step", "curb", "pothole", "hole in floor", "obstacle", "door",
+    "trash can", "three-wheeler", "dustbin",
 }
 # Drops: a blind user needs more warning before these than before a chair.
-DROP_HAZARDS = {"stairs", "step", "hole in floor", "pothole", "curb"}
+DROP_HAZARDS = {"stairs", "step", "hole in floor", "pothole", "curb", "escalator"}
 
 # Class-specific NMS is done by YOLO. Across classes, only suppress pairs the model
 # genuinely confuses — a person sitting on a chair must keep both detections.
@@ -112,13 +146,13 @@ YOLO_IOU = 0.50
 # Small objects are the ones YOLO misnames most (a door handle as a cup, a remote as a phone),
 # so they need more confidence than furniture before they are shown or mapped.
 SMALL_OBJECT_CONF = 0.55
-SMALL_OBJECTS = {"light switch", "wall socket", "door handle", "keys", "cup", "bottle", "cell phone", "mouse", "remote", "book", "vase", "clock",
+SMALL_OBJECTS = {"light switch", "wall switch", "wall socket", "power outlet", "plug socket", "door handle",
+                 "door knob", "keys", "pen", "wallet", "glasses", "watch", "phone charger", "cup", "bottle", "cell phone", "mouse", "remote", "book", "vase", "clock",
                  "scissors", "toothbrush", "spoon", "fork", "knife", "wine glass", "sports ball"}
 CROSS_CLASS_OVERLAP = 0.70   # intersection / smaller box area
 
 FRIENDLY_NAMES = {
-    "staircase": "stairs", "power outlet": "wall socket", "office chair": "chair", "desk": "table",
-    "floor step": "step", "doorway": "door",
+    **PROMPT_SYNONYMS,
     "dining table": "table", "couch": "sofa", "cell phone": "smartphone",
     "potted plant": "plant", "wine glass": "glass", "sports ball": "ball",
     "baseball bat": "bat", "baseball glove": "glove", "tennis racket": "racket",
@@ -566,9 +600,9 @@ class _InferredTable:
         self.dist = dist
 
 
-class VisionPerceptionNode(Node):
+class ObjectPerceptionNode(Node):
     def __init__(self, mode: str = "indoor") -> None:
-        super().__init__("vision_perception")
+        super().__init__("object_perception")
 
         self._bridge = CvBridge()
         self._frame_count = 0
@@ -666,7 +700,7 @@ class VisionPerceptionNode(Node):
             LaserScan, "/scan", self._scan_callback, qos_profile_sensor_data,
         )
         self._marker_pub = self.create_publisher(MarkerArray, "/semantic_markers", 10)
-        # Alias requested for other tooling; find_object.py and the RViz config use /semantic_markers
+        # Alias requested for other tooling; voice_navigation_assistant.py and the RViz config use /semantic_markers
         self._marker_pub_alias = self.create_publisher(MarkerArray, "/vision_markers", 10)
         # Machine-readable object map for navigation (semantic_costmap.py / semantic_navigator.py)
         self._objects_pub = self.create_publisher(String, "/semantic_objects", 10)
@@ -1309,6 +1343,9 @@ class VisionPerceptionNode(Node):
                     model.set_classes(VOCABULARY, model.get_text_pe(VOCABULARY))
                     built = model.export(format="engine", half=True, workspace=4, imgsz=640, device=0)
                     shutil.move(str(built), ENGINE_PATH)
+                    for old in glob.glob(model_path("yoloe-11s-seg-indoor-*.engine")):  # older vocabularies
+                        if old != ENGINE_PATH:
+                            os.remove(old)
                     stem = os.path.splitext(MODEL_PATH)[0]
                     for onnx in (stem + ".onnx", stem + ".fp16.onnx"):  # export intermediates
                         if os.path.isfile(onnx):
@@ -1459,7 +1496,8 @@ class VisionPerceptionNode(Node):
                 ax1, ay1, ax2, ay2 = d["box"]
                 duplicate = False
                 for k in kept:
-                    if k["raw_label"] == d["raw_label"] or not self._confusable(k["raw_label"], d["raw_label"]):
+                    if k["raw_label"] == d["raw_label"] or (
+                            k["label"] != d["label"] and not self._confusable(k["raw_label"], d["raw_label"])):
                         continue
                     bx1, by1, bx2, by2 = k["box"]
                     inter = max(0, min(ax2, bx2) - max(ax1, bx1)) * max(0, min(ay2, by2) - max(ay1, by1))
@@ -2033,7 +2071,7 @@ class VisionPerceptionNode(Node):
         marker.pose.position.z = top_z + 0.20
         marker.scale.z = LABEL_SCALE
         marker.color = ColorRGBA(r=r, g=g, b=b, a=0.55 if remembered else 1.0)
-        # "(" separates the name that find_object.py matches from the details
+        # "(" separates the name that voice_navigation_assistant.py matches from the details
         # RViz draws spaces in text markers as huge gaps, so the details use none
         details = f"dist:{distance:.1f}m|H:{obj_height:.2f}m"
         if base_z > 0.3:
@@ -2376,7 +2414,7 @@ def main(args=None) -> None:
     if mode not in MODE_PARAMS:
         mode = "indoor"
 
-    node = VisionPerceptionNode(mode=mode)
+    node = ObjectPerceptionNode(mode=mode)
 
     # ── ZERO-LAG ARCHITECTURE: Offload ROS 2 spin to background thread ──
     ros_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)

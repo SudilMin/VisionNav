@@ -4,7 +4,7 @@ semantic_costmap.py
 ===================
 Projects the 3D semantic object map down into a 2D cost grid for Nav2.
 
-Subscribes: /semantic_objects (JSON from vision_perception.py), /map (Cartographer)
+Subscribes: /semantic_objects (JSON from object_perception.py), /map (Cartographer)
 Publishes:  /semantic_map (nav_msgs/OccupancyGrid): the SLAM map with the semantic costs merged in
 
 Nav2's global costmap reads /semantic_map with its single StaticLayer (trinary_costmap: false), so the
@@ -46,7 +46,12 @@ CLASS_COSTS = {
     "door": (0.0, 0),
     # Drops: lethal footprint plus a wide, near-lethal halo
     "stairs": (0.60, 95), "step": (0.60, 95), "hole in floor": (0.60, 95), "pothole": (0.60, 95),
-    "curb": (0.40, 90),
+    "curb": (0.40, 90), "escalator": (0.60, 95),
+    # Trip hazards on the floor
+    "cable on floor": (0.35, 85), "puddle": (0.35, 80), "wet floor sign": (0.40, 85), "toy": (0.35, 85),
+    "ball": (0.35, 85), "shoe": (0.30, 80), "slippers": (0.30, 80), "clothes on floor": (0.30, 80),
+    "bucket": (0.35, 85), "box": (0.35, 80), "gas cylinder": (0.40, 85), "laundry basket": (0.35, 80),
+    "bag": (0.40, 85), "trash can": (0.30, 70), "mop": (0.35, 85), "broom": (0.35, 85),
 }
 DOOR_PASSABLE_COST = 30        # a closed door reads as wall to the LiDAR; make it passable but not preferred
 DOOR_MIN_HALF_WIDTH = 0.45     # m
