@@ -1,0 +1,74 @@
+# Nav2 for a walking, visually impaired user (not a robot base).
+#
+# Only planner_server and smoother_server run: there is no controller_server / bt_navigator,
+# because those command a robot's motors (cmd_vel) and a person follows voice guidance instead.
+# semantic_navigator.py calls ComputePathToPose + SmoothPath and re-plans every second, so people's
+# predicted paths (in the semantic layer) bend the route around them. That replaces the TEB local
+# planner, which has no ROS 2 Jazzy release.
+
+planner_server:
+  ros__parameters:
+    expected_planner_frequency: 1.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      # Theta*: any-angle A*. Long straight legs with few corners instead of robotic 90/45-degree
+      # grid staircases, and fewer spoken instructions for the user.
+      plugin: "nav2_theta_star_planner::ThetaStarPlanner"
+      how_many_corners: 8
+      w_euc_cost: 1.0
+      w_traversal_cost: 1.0              # shortest walkable route; inflation alone keeps the clearance
+      use_final_approach_orientation: false
+      allow_unknown: false               # never route a blind user through space the LiDAR has not seen
+
+smoother_server:
+  ros__parameters:
+    smoother_plugins: ["human"]
+    human:
+      # A walking person turns in place, so no kinematic model: SimpleSmoother only rounds Theta*'s
+      # corners and leaves straight legs straight. (ConstrainedSmoother imposed a car-like minimum
+      # turning radius, which bent short approaches into wide arcs.)
+      plugin: "nav2_smoother::SimpleSmoother"
+      tolerance: 1.0e-10
+      max_its: 1000
+      w_data: 0.2                        # stay close to the planned (collision-free) path
+      w_smooth: 0.3                      # corner rounding strength
+      do_refinement: true
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      update_frequency: 2.0
+      publish_frequency: 1.0
+      global_frame: map
+      robot_base_frame: base_footprint
+      robot_radius: 0.25                 # half shoulder width of a walking adult
+      resolution: 0.05
+      track_unknown_space: true
+      always_send_full_costmap: true
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      static_layer:
+        # SLAM walls + YOLO objects with class-based costs, merged by semantic_costmap.py.
+        # (Nav2 cannot stack a second StaticLayer in a fixed-size costmap: it wipes the first.)
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_topic: /semantic_map
+        map_subscribe_transient_local: true
+        trinary_costmap: false           # keep graded costs (0-100 -> 0-254), not just free/lethal
+        lethal_cost_threshold: 100
+      obstacle_layer:                    # things the LiDAR sees now but are not in the map yet
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        observation_sources: scan
+        scan:
+          topic: /scan_filtered
+          data_type: "LaserScan"
+          marking: true
+          clearing: true
+          obstacle_max_range: 4.0
+          raytrace_max_range: 6.0
+          min_obstacle_height: 0.0
+          max_obstacle_height: 2.0
+      inflation_layer:                   # walls and furniture: high-cost zone that keeps paths centred
+        plugin: "nav2_costmap_2d::InflationLayer"
+        # Indoors a wide inflation fills whole rooms and pushes the last metre of the approach sideways.
+        # 0.45 m with a steep fall-off: cost is high only right next to obstacles.
+        inflation_radius: 0.45
+        cost_scaling_factor: 5.0

@@ -29,6 +29,17 @@ Visualization Manager:
       Name: Semantic Markers
       Topic:
         Value: /semantic_markers
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Your Tracked Path
+      Topic:
+        Value: /trajectory_node_list
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Walls & Structure
+      Topic:
+        Durability Policy: Transient Local
+        Value: /structure_markers
     - Class: rviz_default_plugins/TF
       Enabled: true
       Name: TF

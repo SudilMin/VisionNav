@@ -71,6 +71,11 @@ install(PROGRAMS
   scripts/esp32_bridge.py
   scripts/sensor_sender.py
   scripts/sensor_receiver.py
+  scripts/scan_body_filter.py
+  scripts/semantic_costmap.py
+  scripts/semantic_navigator.py
+  scripts/structure_mapper.py
+  scripts/check_lidar_orientation.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
