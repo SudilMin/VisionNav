@@ -1,0 +1,3 @@
+Vendored from https://github.com/DepthAnything/Depth-Anything-V2 (metric_depth/depth_anything_v2)
+commit a561b849ebae10a6f5ef49e26c83cbbcd36c71bf, Apache-2.0 (see LICENSE).
+Weights: depth-anything/Depth-Anything-V2-Metric-Hypersim-Small (Apache-2.0).

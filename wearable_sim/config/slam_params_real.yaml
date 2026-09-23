@@ -12,7 +12,7 @@
     odom_frame: odom
     map_frame: map
     base_frame: base_footprint
-    scan_topic: /scan
+    scan_topic: /scan_filtered   # body-filtered by scan_body_filter.py
     use_map_saver: true
     mode: mapping
 

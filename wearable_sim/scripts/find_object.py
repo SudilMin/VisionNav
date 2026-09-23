@@ -24,6 +24,7 @@ import subprocess
 import os
 import time
 import queue
+import json
 import sys
 import contextlib
 import speech_recognition as sr
@@ -35,6 +36,11 @@ from std_msgs.msg import String
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Memory-anchored terminal navigation: the target's map position is locked when navigation starts,
+# because a low object (chair) drops below the chest-mounted camera/LiDAR in the last metre.
+# Arrival is decided purely by the SLAM (TF) distance to that locked point.
+ARRIVAL_RADIUS = 0.6  # m from the locked object centre
+HAPTIC_TOPIC = '/haptic_command'
 
 @contextlib.contextmanager
 def suppress_stderr():
@@ -54,6 +60,7 @@ class FindObjectNode(Node):
     def __init__(self):
         super().__init__('find_object_node')
         
+        self._marker_names = {}  # (ns, id) -> object name, so Marker.DELETE can forget the object
         self._marker_sub = self.create_subscription(MarkerArray, '/semantic_markers', self._marker_callback, 10)
         
         map_qos = QoSProfile(
@@ -64,7 +71,8 @@ class FindObjectNode(Node):
         self._map_sub = self.create_subscription(OccupancyGrid, '/map', self._map_callback, map_qos)
         self._path_pub = self.create_publisher(Path, '/object_path', 10)
         self._describe_cmd_pub = self.create_publisher(String, '/describe_command', 10)
-        
+        self._haptic_pub = self.create_publisher(String, HAPTIC_TOPIC, 10)  # "last inch" wristband cue
+
         empty_path = Path()
         empty_path.header.frame_id = 'map'
         self._path_pub.publish(empty_path)
@@ -76,8 +84,16 @@ class FindObjectNode(Node):
         self.map_data = None
         self.last_found_object = None
         self.navigating = False  # True when actively guiding user
+        self._using_nav2 = False
         self.last_hazard_time = 0.0
         
+        # Nav2 semantic navigation (semantic_navigator.py): send the target, receive path + status
+        self._semantic_goal_pub = self.create_publisher(String, '/semantic_goal', 10)
+        self._nav2_status = None
+        self._nav2_path = []  # [(x, y)] in map frame
+        self.create_subscription(String, '/semantic_nav_status', self._nav2_status_callback, 10)
+        self.create_subscription(Path, '/object_path', self._nav2_path_callback, 10)
+
         # Listen for Emergency Hazards from vision node
         self._hazard_sub = self.create_subscription(String, '/hazard_warning', self._hazard_callback, 10)
         
@@ -106,11 +122,36 @@ class FindObjectNode(Node):
         for marker in msg.markers:
             if marker.action == 3:
                 self.saved_objects.clear()
+                self._marker_names.clear()
+                continue
+            key = (marker.ns, marker.id)
+            if marker.action == 2:  # DELETE: the perception node removed this object from the map
+                name = self._marker_names.pop(key, None)
+                if name is not None:
+                    self.saved_objects.pop(name, None)
                 continue
             if marker.text:
-                # Strip out the height tags like "(0.2m)" and "[MEM]" tags so we just get "chair_1"
+                # Strip out the details like "(dist:1.2m|H:0.9m)" and "[MEM]" tags so we just get "chair_1"
                 obj_name = marker.text.split('(')[0].replace("[MEM]", "").strip().lower()
                 self.saved_objects[obj_name] = marker.pose.position
+                self._marker_names[key] = obj_name
+
+    def _nav2_status_callback(self, msg: String):
+        try:
+            self._nav2_status = json.loads(msg.data)
+        except ValueError:
+            pass
+
+    def _nav2_path_callback(self, msg: Path):
+        if self._using_nav2:
+            self._nav2_path = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
+
+    def _nav2_available(self):
+        """semantic_navigator.py is running (it subscribes to /semantic_goal)."""
+        backend = os.environ.get("WEARABLE_NAV_BACKEND", "auto").lower()
+        if backend == "astar":
+            return False
+        return self.count_subscribers('/semantic_goal') > 0
 
     def _map_callback(self, msg: OccupancyGrid):
         self.map_data = msg
@@ -209,6 +250,8 @@ class FindObjectNode(Node):
             if target == 'exit' or target == 'stop navigation' or target == 'stop':
                 if self.navigating:
                     self.navigating = False
+                    if self._using_nav2:
+                        self._semantic_goal_pub.publish(String(data="stop"))
                     self.speak("Navigation stopped.")
                     cancel_path = Path()
                     cancel_path.header.frame_id = "map"
@@ -264,6 +307,9 @@ class FindObjectNode(Node):
     # =============================================
     def navigate_to(self, target_name):
         """Continuously guide the user to the target with voice instructions."""
+        if self._nav2_available():
+            self._navigate_nav2(target_name)
+            return
         self.navigating = True
         friendly_name = ''.join(c for c in target_name if not c.isdigit()).replace("_", "").strip()
         
@@ -277,13 +323,13 @@ class FindObjectNode(Node):
             self.speak(f"Lost track of {friendly_name}.")
             self.navigating = False
             return
-            
+
+        # Locked once: the route must not follow (or lose) the live detection near the object
         tx, ty = target_pos.x, target_pos.y
-        
+
         last_instruction = ""
         last_speech_time = 0
         recalc_counter = 0
-        arrival_threshold = 0.60  # meters — safe arm's reach distance for visually impaired users
         current_grid_path = None
         
         print("\n" + "=" * 50)
@@ -292,11 +338,6 @@ class FindObjectNode(Node):
         print("=" * 50)
         
         while rclpy.ok() and self.navigating:
-            # Dynamically update target position if the vision system refines it!
-            target_pos = self.saved_objects.get(target_name)
-            if target_pos:
-                tx, ty = target_pos.x, target_pos.y
-                
             pose = self.get_robot_pose()
             if pose is None:
                 time.sleep(0.1)
@@ -306,12 +347,9 @@ class FindObjectNode(Node):
             dist_to_target = math.hypot(tx - rx, ty - ry)
             dist_ft = dist_to_target * 3.28084
             
-            # ---- ARRIVAL CHECK ----
-            if dist_to_target < arrival_threshold:
-                self.speak(f"You have arrived at {friendly_name}. It should be within reach.")
-                empty_path = Path()
-                empty_path.header.frame_id = 'map'
-                self._path_pub.publish(empty_path)
+            # ---- ARRIVAL CHECK (SLAM distance only: the object is in the blind spot by now) ----
+            if dist_to_target < ARRIVAL_RADIUS:
+                self._arrive(friendly_name)
                 break
                 
             # ---- RECALCULATE A* PATH every 1.0 second (10 cycles) ----
@@ -338,40 +376,32 @@ class FindObjectNode(Node):
                 # Publish perfectly anchored to the robot's real-time position
                 self._publish_path(current_grid_path, rx, ry, tx, ty)
             
-            # ---- FIND NEXT WAYPOINT (~2m ahead on path) ----
+            # ---- PURE PURSUIT LOOKAHEAD STEERING ----
+            lookahead_dist = max(1.5, min(3.0, dist_to_target * 0.3))
             waypoint_x, waypoint_y = tx, ty
-            if current_grid_path:
-                for (gx, gy) in current_grid_path:
-                    wx, wy = self.grid_to_world(gx, gy, self.map_data.info)
-                    if math.hypot(wx - rx, wy - ry) >= 2.0:
-                        waypoint_x, waypoint_y = wx, wy
+            if current_grid_path and len(current_grid_path) > 1:
+                accumulated_dist = 0.0
+                prev_wx, prev_wy = self.grid_to_world(current_grid_path[0][0], current_grid_path[0][1], self.map_data.info)
+                for i in range(1, len(current_grid_path)):
+                    curr_wx, curr_wy = self.grid_to_world(current_grid_path[i][0], current_grid_path[i][1], self.map_data.info)
+                    segment_dist = math.hypot(curr_wx - prev_wx, curr_wy - prev_wy)
+                    
+                    if accumulated_dist + segment_dist >= lookahead_dist:
+                        ratio = (lookahead_dist - accumulated_dist) / segment_dist if segment_dist > 0 else 0
+                        waypoint_x = prev_wx + ratio * (curr_wx - prev_wx)
+                        waypoint_y = prev_wy + ratio * (curr_wy - prev_wy)
                         break
+                        
+                    accumulated_dist += segment_dist
+                    prev_wx, prev_wy = curr_wx, curr_wy
             
             # ---- CALCULATE DIRECTION ----
             rel_angle, clock_hr = self.get_relative_direction(robot_yaw, waypoint_x, waypoint_y, rx, ry)
             abs_angle_deg = abs(math.degrees(rel_angle))
             
             # ---- GENERATE INSTRUCTION ----
-            if abs_angle_deg > 45:
-                direction = "left" if rel_angle > 0 else "right"
-                if dist_ft > 15:
-                    instruction = f"Turn {direction} to your {clock_hr} o clock. {int(dist_ft)} feet remaining."
-                else:
-                    instruction = f"Turn {direction} now. Almost there."
-            elif abs_angle_deg > 15:
-                direction = "slightly left" if rel_angle > 0 else "slightly right"
-                if dist_ft > 15:
-                    instruction = f"Bear {direction}. {int(dist_ft)} feet to go."
-                else:
-                    instruction = f"Bear {direction}. Almost there."
-            else:
-                if dist_ft > 30:
-                    instruction = f"Keep going straight. {int(dist_ft)} feet remaining."
-                elif dist_ft > 10:
-                    instruction = f"Continue straight. {int(dist_ft)} feet to go."
-                else:
-                    instruction = f"Almost there. {int(dist_ft)} feet."
-            
+            instruction = self._instruction(rel_angle, clock_hr, dist_ft)
+
             # ---- SPEAK INSTRUCTION ----
             instruction_type = instruction.split(".")[0]
             now = time.time()
@@ -384,6 +414,96 @@ class FindObjectNode(Node):
             time.sleep(0.1)
         
         self.navigating = False
+        print("\n✅ Navigation ended.\n")
+
+    def _arrive(self, friendly_name):
+        """Arrival cue: haptic 'last inch' event, voice, and clear the drawn path."""
+        self._haptic_pub.publish(String(data="arrived"))
+        self.speak(f"You have arrived at the {friendly_name}. It is just below you, within reach.")
+        empty_path = Path()
+        empty_path.header.frame_id = 'map'
+        self._path_pub.publish(empty_path)
+
+    @staticmethod
+    def _instruction(rel_angle, clock_hr, dist_ft):
+        """Spoken turn-by-turn instruction toward the lookahead point."""
+        abs_angle_deg = abs(math.degrees(rel_angle))
+        if abs_angle_deg > 45:
+            direction = "left" if rel_angle > 0 else "right"
+            if dist_ft > 15:
+                return f"Turn {direction} to your {clock_hr} o clock. {int(dist_ft)} feet remaining."
+            return f"Turn {direction} now. Almost there."
+        if abs_angle_deg > 15:
+            direction = "slightly left" if rel_angle > 0 else "slightly right"
+            if dist_ft > 15:
+                return f"Bear {direction}. {int(dist_ft)} feet to go."
+            return f"Bear {direction}. Almost there."
+        if dist_ft > 30:
+            return f"Keep going straight. {int(dist_ft)} feet remaining."
+        if dist_ft > 10:
+            return f"Continue straight. {int(dist_ft)} feet to go."
+        return f"Almost there. {int(dist_ft)} feet."
+
+    def _navigate_nav2(self, target_name):
+        """Guide the user along the smooth Nav2 path from semantic_navigator.py (re-planned every second)."""
+        friendly_name = ''.join(c for c in target_name if not c.isdigit()).replace("_", " ").strip()
+        target_pos = self.saved_objects.get(target_name)
+        if not target_pos:
+            self.speak(f"Lost track of {friendly_name}.")
+            return
+        # Lock the goal in the map frame: Nav2 routes to this fixed point, not the live detection
+        tx, ty = target_pos.x, target_pos.y
+        self.navigating, self._using_nav2 = True, True
+        self._nav2_status, self._nav2_path = None, []
+        self._semantic_goal_pub.publish(String(data=json.dumps({"name": target_name, "x": tx, "y": ty})))
+        print(f"\n🧭 NAVIGATING (Nav2) TO: {friendly_name}   — type 'stop' to cancel")
+        last_instruction, last_speech_time, last_problem = "", 0.0, None
+        while rclpy.ok() and self.navigating:
+            status = self._nav2_status or {}
+            state = status.get("state")
+            if state == "arrived":
+                self._arrive(friendly_name)
+                break
+            if state in ("no_path", "blocked", "not_found", "no_planner") and state != last_problem:
+                last_problem = state
+                self.speak({"no_path": "The way is blocked right now. Please wait.",
+                            "blocked": f"There is no free space next to the {friendly_name}.",
+                            "not_found": f"I can't see the {friendly_name} on the map any more.",
+                            "no_planner": "The path planner is not running."}[state])
+            pose = self.get_robot_pose()
+            if pose is not None and math.hypot(tx - pose[0], ty - pose[1]) < ARRIVAL_RADIUS:
+                self._arrive(friendly_name)
+                break
+            path = self._nav2_path
+            if pose is None or len(path) < 2:
+                time.sleep(0.1)
+                continue
+            rx, ry, robot_yaw = pose
+            # Drop the part of the path already walked, then look ahead along the rest
+            nearest = min(range(len(path)), key=lambda i: math.hypot(path[i][0] - rx, path[i][1] - ry))
+            ahead = path[nearest:]
+            remaining = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(ahead, ahead[1:]))
+            lookahead = max(1.0, min(2.5, remaining * 0.3))
+            wx, wy = ahead[-1]
+            travelled = 0.0
+            for a, b in zip(ahead, ahead[1:]):
+                seg = math.hypot(b[0] - a[0], b[1] - a[1])
+                if travelled + seg >= lookahead:
+                    k = (lookahead - travelled) / seg if seg > 0 else 0.0
+                    wx, wy = a[0] + k * (b[0] - a[0]), a[1] + k * (b[1] - a[1])
+                    break
+                travelled += seg
+            rel_angle, clock_hr = self.get_relative_direction(robot_yaw, wx, wy, rx, ry)
+            instruction = self._instruction(rel_angle, clock_hr, remaining * 3.28084)
+            kind = instruction.split(".")[0]
+            now = time.time()
+            if kind != last_instruction or now - last_speech_time > 8.0:
+                self.speak(instruction)
+                print(f"  📍 {instruction}")
+                last_instruction, last_speech_time = kind, now
+            time.sleep(0.1)
+        self._semantic_goal_pub.publish(String(data="stop"))
+        self.navigating, self._using_nav2 = False, False
         print("\n✅ Navigation ended.\n")
 
     def smooth_path_chaikin(self, path, iterations=3):
@@ -470,6 +590,39 @@ class FindObjectNode(Node):
                         return False
             return True
             
+        def get_cost(gx, gy):
+            if not is_free(gx, gy, radius=2):
+                return float('inf')
+            
+            if not is_free(gx, gy, radius=3):
+                base_cost = 5.0
+            elif not is_free(gx, gy, radius=4):
+                base_cost = 3.0
+            elif not is_free(gx, gy, radius=5):
+                base_cost = 2.0
+            elif not is_free(gx, gy, radius=6):
+                base_cost = 1.5
+            else:
+                base_cost = 1.0
+
+            near_landmark = False
+            for obj_name, pos in self.saved_objects.items():
+                ox, oy = self.world_to_grid(pos.x, pos.y, map_msg.info)
+                dist_cells = math.hypot(gx - ox, gy - oy)
+                
+                is_dynamic = any(k in obj_name for k in ["dynamic", "person", "human"])
+                if is_dynamic:
+                    if dist_cells < 40:
+                        base_cost += 20.0 / (dist_cells + 1.0)
+                else:
+                    if dist_cells <= 30:
+                        near_landmark = True
+                        
+            if near_landmark:
+                base_cost *= 0.70
+                
+            return base_cost
+            
         def line_of_sight(p1, p2):
             x0, y0 = p1
             x1, y1 = p2
@@ -537,10 +690,20 @@ class FindObjectNode(Node):
                 nx, ny = cx + dx, cy + dy
                 if not is_free(nx, ny, radius=4):
                     continue
-                cost = 1.414 if dx != 0 and dy != 0 else 1.0
-                tentative_g = g_score[(cx, cy)] + cost
+                cost = (1.414 if dx != 0 and dy != 0 else 1.0) * get_cost(nx, ny)
+                if cost == float('inf'):
+                    continue
+                
+                parent = came_from.get((cx, cy))
+                if parent and line_of_sight(parent, (nx, ny)):
+                    tentative_g = g_score[parent] + math.hypot(parent[0] - nx, parent[1] - ny)
+                    came_from_node = parent
+                else:
+                    tentative_g = g_score[(cx, cy)] + cost
+                    came_from_node = (cx, cy)
+                    
                 if (nx, ny) not in g_score or tentative_g < g_score[(nx, ny)]:
-                    came_from[(nx, ny)] = (cx, cy)
+                    came_from[(nx, ny)] = came_from_node
                     g_score[(nx, ny)] = tentative_g
                     f_score = tentative_g + math.hypot(gx - nx, gy - ny)
                     heapq.heappush(open_set, (f_score, nx, ny))
