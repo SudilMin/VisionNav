@@ -26,6 +26,14 @@ source install/setup.bash
 `gps_nav` → `gps_voice_navigator`, `structure_mapper` → `wall_structure_mapper`.
 Topics are unchanged.
 
+**Hand tracking for grasp mode (laptop, one time).** Install MediaPipe *without* its dependencies: a normal
+install pulls NumPy 2 and a second OpenCV, which breaks ROS (cv_bridge, matplotlib). Then fetch the hand model:
+```bash
+python3 -m pip install --user --break-system-packages --no-deps mediapipe==1.0.1 absl-py
+curl -sSfL -o ~/wearable_ws/src/visionnav/models/hand_landmarker.task \
+  https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
+```
+
 **Object detector (laptop):** the vision node uses **YOLOE-11s-seg** (open-vocabulary) with the indoor
 vocabulary in `VOCABULARY` at the top of `visionnav/object_perception.py` (doors, light switches, wall sockets,
 stairs, holes in the floor, furniture, …). On the first start, or after the vocabulary is edited, it compiles a
@@ -48,8 +56,9 @@ ros2 launch visionnav pi_sensors.launch.py
 ```
 
 **Terminal 2 (Start the Camera):**
-*(Pull the repo and build the workspace on the Pi first (step 0). It logs the real camera and publish rate
-every 5 s. If "camera" is low (e.g. 8 fps), the webcam is slow, often from auto-exposure in dim light.
+*(Pull the repo and build the workspace on the Pi first (step 0). It stays quiet while the camera is healthy
+and warns only if the camera drops below 10 fps (`CAMERA_SLOW_FPS`); add `--ros-args --log-level debug` to
+see the rate every 5 s. A low "camera" rate means the webcam is slow, often from auto-exposure in dim light.
 If "published" is high but the laptop gets fewer frames, it's Wi-Fi loss; try `CAMERA_JPEG_QUALITY=70`.)*
 ```bash
 export ROS_DOMAIN_ID=42
@@ -84,6 +93,16 @@ It also starts the `wall_structure_mapper` node, which turns the walls in the SL
 (**Walls & Structure** display, `/structure_markers`): segments 0.6 m or longer become 2.4 m walls, and
 shorter pieces become 1.3 m obstacle blocks. A detected **door** is cut out of the wall (and made passable
 for Nav2), so routes can go through it; stairs and holes in the floor are kept out of routes with a wide margin. Walls grow longer as you walk around and the LiDAR sees more.
+
+**Remembering the home (saved maps).** The first time, the brain *maps*: walk through every room and
+finish somewhere you have already been, then say or type **`save map`** in the navigation assistant
+(Terminal 5). That saves the map, the objects seen reliably, and your named places in `~/.visionnav/maps/`
+(`home.pbstream`, `home_objects.json`, `home_places.json`). From then on the same command starts in
+**localization** mode: Cartographer loads the saved map and finds you in it (walk a few metres after
+starting), the remembered objects are on the map at once ("go to light switch" works before the camera has
+seen it again), and the map no longer grows or drifts. Options: `map:=office` for another building,
+`localize:=false` to map again from scratch. (The last minute of a mapping walk is not yet usable for
+finding you, which is why the walk should end somewhere already covered.)
 
 *Option B: SLAM Toolbox (legacy)* — `ros2 launch visionnav laptop_brain.launch.py slam:=slam_toolbox`.
 SLAM Toolbox only adds a scan after wheel odometry reports motion; the wearable has none, so the map
@@ -126,6 +145,11 @@ ros2 run visionnav voice_navigation_assistant
 # laptop_brain.launch.py) with spoken turn-by-turn guidance; falls back to the built-in A* if
 # Nav2 is not running (force with WEARABLE_NAV_BACKEND=astar).
 # Any class the vision node detects can be a goal, e.g. "go to light switch", "go to door".
+# Saved maps and places: "save map", "save this place as kitchen" (or "mark kitchen"),
+# "go to kitchen", "where am i", "forget place kitchen".
+# Grasp mode: "grasp cup" (also "grab", "pick up", "reach for"), and automatically on arrival at an
+# object: the camera locks onto the object, tracks your hand, and speaks "Right 10 centimetres",
+# "Lower 5 centimetres", "Forward 15 centimetres" ... until "Stop. The cup is at your hand."
 
 
 # (If Outdoors) Start the GPS Macro-Navigator in background
@@ -133,7 +157,10 @@ ros2 run visionnav voice_navigation_assistant
 ```
 
 **Terminal 6 (Start the Qwen3-VL Scene Describer):**
-*(Type a question and press Enter to get an audio description of what the camera sees)*
+*(Type any question — "what colour is the door?", "is there a light switch?", "can I walk straight
+ahead?" — or just press Enter for a description. Answers take ~0.3–2.5 s and are spoken aloud.)*
+Qwen3-VL 2B instruct is the system's only VLM. One-time: `ollama pull qwen3-vl:2b-instruct`
+(the plain `qwen3-vl:2b` tag is the *thinking* variant that gave empty answers; it and moondream were removed).
 ```bash
 export ROS_DOMAIN_ID=42
 export ROS_LOCALHOST_ONLY=0
@@ -206,7 +233,7 @@ Optional: for a calibrated camera, set `WEARABLE_CAMERA_FX/FY/CX/CY` (pixels) in
 | `error code: 80008004` | LiDAR serial port unavailable | Check USB cable and run `sudo chmod 666 /dev/ttyUSB0` on the Pi |
 | `numpy.core.multiarray failed` | A pip install pulled NumPy 2 into `~/.local` (ROS Jazzy, cv_bridge and matplotlib need the system NumPy 1.26) | `python3 -m pip uninstall --break-system-packages numpy scipy` (removes only the `~/.local` copies) |
 | `Package 'wearable_sim' not found` | Old package name | The package is now `visionnav`: rebuild as in step 0 and use `ros2 run visionnav <node>` (no `.py`) |
-| Qwen-VL returns empty answers | Thinking mode consuming all tokens | Already fixed — `think: False` is now set |
+| Scene describer gives empty or cut-off answers | A *thinking* model (`qwen3-vl:2b`) spends its tokens on hidden reasoning | The describer uses only `qwen3-vl:2b-instruct` (`ollama pull qwen3-vl:2b-instruct`) |
 | Bounding boxes too large on map | Depth estimation overshoot | Already fixed — per-category size clamping applied |
 | Markers in the wrong place / on the wrong side | Sensor mount TF does not match the rig | Follow **Calibrating the Chest Rig** above (press `l` for the LiDAR overlay) |
 | Map smears or stops updating while walking | SLAM Toolbox without odometry, or body hits in the scan | Use the default Cartographer backend (body filter is included) |

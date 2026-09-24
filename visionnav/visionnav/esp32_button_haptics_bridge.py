@@ -4,7 +4,7 @@ esp32_button_haptics_bridge.py
 ---------------
 ROS 2 interface bridging physical ESP32 tactile buttons and vibration haptics to VisionNav.
 Listens over USB Serial (/dev/ttyUSB1, /dev/ttyACM0, etc.) or Wi-Fi UDP Port 9090.
-When the pushbutton on GPIO 15 is pressed, it publishes to /describe_command to instantly trigger Ollama Moondream VLM scene descriptions.
+When the pushbutton on GPIO 15 is pressed, it publishes to /describe_command to instantly trigger a VLM scene description (scene_describer, Qwen3-VL via Ollama).
 """
 
 import os
@@ -47,7 +47,7 @@ class ESP32BridgeNode(Node):
         self.get_logger().info("✅ ESP32 Bridge Ready! Waiting for tactile pushbutton triggers from D12 (GPIO 12)...")
 
     def _trigger_scene_describer(self, source_name):
-        self.get_logger().info(f"⚡ Tactical Pushbutton Pressed via {source_name}! Triggering Ollama Moondream VLM...")
+        self.get_logger().info(f"⚡ Tactical Pushbutton Pressed via {source_name}! Triggering the scene describer...")
         msg = String()
         msg.data = "Describe what you see in this image in one detailed, natural sentence."
         self._pub_describe.publish(msg)

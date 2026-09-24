@@ -16,6 +16,9 @@ import threading
 import os
 import time
 
+CAMERA_SLOW_FPS = float(os.environ.get("CAMERA_SLOW_FPS", "10"))  # below this the rate report becomes a warning
+
+
 class PhoneCameraNode(Node):
     def __init__(self):
         super().__init__('phone_camera_publisher')
@@ -100,10 +103,14 @@ class PhoneCameraNode(Node):
             if now - last_report >= 5.0:
                 # If "camera" is low, the webcam itself is slow (often auto-exposure in dim light);
                 # if "published" is fine but the laptop receives less, it is Wi-Fi loss.
+                # Quiet by default (see it with --ros-args --log-level debug); warns only when slow.
                 dt = now - last_report
-                self.get_logger().info(
-                    f"camera {grabbed_count / dt:.1f} fps, published {published_count / dt:.1f} fps, "
-                    f"{bytes_sent / max(published_count, 1) / 1024:.0f} KB/frame")
+                report = (f"camera {grabbed_count / dt:.1f} fps, published {published_count / dt:.1f} fps, "
+                          f"{bytes_sent / max(published_count, 1) / 1024:.0f} KB/frame")
+                if grabbed_count / dt < CAMERA_SLOW_FPS:
+                    self.get_logger().warn(f"Camera is slow: {report}")
+                else:
+                    self.get_logger().debug(report)
                 grabbed_count, published_count, bytes_sent, last_report = 0, 0, 0, now
             if (now - self._last_publish_time) < self.publish_interval:
                 continue

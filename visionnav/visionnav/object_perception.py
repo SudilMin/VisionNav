@@ -41,6 +41,7 @@ import rclpy
 from cv_bridge import CvBridge
 from rclpy.node import Node
 
+from visionnav.grasp_tracker import GraspTracker
 from visionnav.model_paths import model_path
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
@@ -67,7 +68,8 @@ VOCABULARY = [
     "curtain", "window blinds", "staircase", "stairs", "step", "handrail", "railing", "elevator door",
     "escalator", "pillar", "doormat",
     # switches, sockets and other wall-mounted things
-    "light switch", "wall switch", "switch board", "electrical switch panel", "wall socket",
+    "light switch", "wall switch", "black switch", "white switch", "electric switch", "switch",
+    "switch board", "electrical switch panel", "wall socket",
     "power outlet", "plug socket", "power strip", "extension cord", "circuit breaker panel",
     "thermostat", "fire extinguisher", "fire alarm", "smoke detector", "intercom", "doorbell",
     "air conditioner", "radiator", "water heater", "ceiling fan", "ceiling light", "tube light", "lamp",
@@ -103,17 +105,20 @@ VOCABULARY = [
     "car", "bicycle", "motorcycle", "three-wheeler", "bus", "truck", "traffic light", "stop sign",
     "fire hydrant", "curb",
 ]
-# Several prompts for one thing raise recall (switches are often on a switch board or panel); they
-# are reported, mapped and navigated to under one name.
+# Several prompts for one thing raise recall; they are reported, mapped and navigated to under one
+# name. Measured on the rig: a switch scores 0.60 as "black switch", 0.44 "electric switch", 0.38
+# "switch", but only 0.01 as "light switch", and without them it was mostly called a "doorbell".
 PROMPT_SYNONYMS = {
-    "wall switch": "light switch", "switch board": "light switch", "electrical switch panel": "light switch",
+    "wall switch": "light switch", "black switch": "light switch", "white switch": "light switch",
+    "electric switch": "light switch", "switch": "light switch", "switch board": "light switch",
+    "electrical switch panel": "light switch",
     "power outlet": "wall socket", "plug socket": "wall socket",
     "staircase": "stairs", "floor step": "step", "doorway": "door", "sliding door": "door",
     "glass door": "door", "door knob": "door handle", "dustbin": "trash can",
     "cardboard box": "box", "office chair": "chair", "plastic chair": "chair", "desk": "table",
     "dining table": "table", "cupboard": "cabinet", "wall shelf": "shelf",
     "water bottle": "bottle", "mug": "cup", "table fan": "fan", "pedestal fan": "fan",
-    "wire": "cable on floor", "wash basin": "sink",
+    "wire": "cable on floor", "wash basin": "sink", "elevator door": "door",
 }
 _VOCAB_HASH = hashlib.sha1("|".join(VOCABULARY).encode()).hexdigest()[:8]
 ENGINE_PATH = model_path(f"yoloe-11s-seg-indoor-{_VOCAB_HASH}.engine")
@@ -133,23 +138,37 @@ DROP_HAZARDS = {"stairs", "step", "hole in floor", "pothole", "curb", "escalator
 
 # Class-specific NMS is done by YOLO. Across classes, only suppress pairs the model
 # genuinely confuses — a person sitting on a chair must keep both detections.
+# Groups hold both raw and reported names (FRIENDLY_NAMES), since either may be compared.
 CONFUSABLE_GROUPS = [
     {"tv", "monitor", "laptop"},
-    {"door", "elevator door", "wardrobe"},
-    {"couch", "bed", "chair"},
+    # a door and the furniture doors that look just like it
+    {"door", "wardrobe", "cabinet", "refrigerator"},
+    # small plates on a wall
+    {"light switch", "wall socket", "doorbell", "thermostat", "intercom", "fire alarm", "smoke detector"},
+    {"couch", "sofa", "bed", "chair"},
     {"cup", "bottle", "vase"},
-    {"cell phone", "remote"},
-    {"car", "truck", "bus"},
+    {"cell phone", "smartphone", "remote"},
+    {"car", "truck", "bus", "three-wheeler"},
     {"bicycle", "motorcycle"},
 ]
+# In a close call between look-alikes, the class that matters for walking wins (a door, not a wardrobe).
+PRIORITY_LABELS = {"door", "stairs", "step", "hole in floor", "light switch", "wall socket", "person"}
+PRIORITY_BOOST = 1.25
+# A track is renamed once another look-alike label has clearly more evidence than its own.
+RELABEL_MIN_VOTES = 3.0
+RELABEL_RATIO = 1.5
+# Small things fixed to a wall
+WALL_MOUNTED = {"light switch", "wall socket", "doorbell", "thermostat", "intercom", "fire alarm",
+                "smoke detector", "door handle", "door knob", "exit sign", "power strip"}
+WALL_MOUNTED_FOOTPRINT = 0.35  # m
 YOLO_IOU = 0.50
 # Small objects are the ones YOLO misnames most (a door handle as a cup, a remote as a phone),
 # so they need more confidence than furniture before they are shown or mapped.
 SMALL_OBJECT_CONF = 0.55
-SMALL_OBJECTS = {"light switch", "wall switch", "wall socket", "power outlet", "plug socket", "door handle",
-                 "door knob", "keys", "pen", "wallet", "glasses", "watch", "phone charger", "cup", "bottle", "cell phone", "mouse", "remote", "book", "vase", "clock",
+SMALL_OBJECTS = {"door handle", "door knob", "keys", "pen", "wallet", "glasses", "watch", "phone charger", "cup", "bottle", "cell phone", "mouse", "remote", "book", "vase", "clock",
                  "scissors", "toothbrush", "spoon", "fork", "knife", "wine glass", "sports ball"}
 CROSS_CLASS_OVERLAP = 0.70   # intersection / smaller box area
+CROSS_CLASS_SAME_BOX_IOU = 0.80  # any two static labels on (almost) the same box are one detection
 
 FRIENDLY_NAMES = {
     **PROMPT_SYNONYMS,
@@ -163,6 +182,11 @@ FRIENDLY_NAMES = {
 # ── KNOWN REAL-WORLD MAXIMUM PHYSICAL SIZES (width_m, height_m) ──
 # Used to clamp estimated sizes to prevent wildly oversized RViz markers.
 OBJECT_MAX_SIZES = {
+    "doorbell": (0.15, 0.20), "thermostat": (0.20, 0.20), "intercom": (0.25, 0.35),
+    "fire alarm": (0.25, 0.25), "smoke detector": (0.20, 0.10), "door handle": (0.30, 0.12),
+    "exit sign": (0.60, 0.30), "sign": (1.50, 1.00), "picture frame": (1.50, 1.50),
+    "painting": (1.50, 1.50), "poster": (1.00, 1.50), "calendar": (0.50, 0.70),
+    "window": (3.00, 2.20), "curtain": (4.00, 3.00), "wardrobe": (2.50, 2.40), "cabinet": (2.00, 2.20),
     "door": (1.10, 2.10), "light switch": (0.12, 0.14), "wall socket": (0.12, 0.12),
     "stairs": (1.60, 3.00), "step": (1.60, 0.30), "hole in floor": (1.50, 0.20),
     "pothole": (1.00, 0.20), "obstacle": (1.50, 1.50), "curb": (3.00, 0.25),
@@ -232,6 +256,12 @@ OBJECT_MAX_SIZE_DEFAULT = (1.50, 1.50)
 # ── TYPICAL SIZES (width_m, height_m) for the known-size depth prior ──
 # Falls back to 60 % of the max size for classes not listed.
 OBJECT_TYPICAL_SIZES = {
+    "doorbell": (0.08, 0.12), "thermostat": (0.10, 0.10), "intercom": (0.12, 0.20),
+    "fire alarm": (0.12, 0.12), "smoke detector": (0.12, 0.05), "door handle": (0.15, 0.05),
+    "door knob": (0.07, 0.07), "exit sign": (0.35, 0.15), "sign": (0.40, 0.30),
+    "picture frame": (0.40, 0.50), "painting": (0.60, 0.50), "poster": (0.45, 0.65),
+    "calendar": (0.30, 0.45), "window": (1.00, 1.20), "curtain": (1.20, 2.00),
+    "wardrobe": (1.20, 1.90), "cabinet": (0.80, 0.90),
     "door": (0.90, 2.00), "light switch": (0.08, 0.12), "wall socket": (0.08, 0.08),
     "stairs": (1.20, 2.50), "step": (1.20, 0.20), "hole in floor": (1.00, 0.10),
     "obstacle": (1.00, 1.00),
@@ -294,6 +324,9 @@ LIDAR_ROW_TOL_PX = int(os.environ.get("WEARABLE_LIDAR_ROW_TOL_PX", "25"))
 LIDAR_CLUSTER_GAP = 0.25     # m, range gap separating an object from what is behind it
 LIDAR_BODY_RANGE = 0.30      # m, returns closer than this are the wearer's body
 LIDAR_SNAP_RANGE = (0.45, 1.15)  # LiDAR range / camera depth accepted when snapping (near objects: depth net reads long)
+LIDAR_SNAP_PLANE_MARGIN = 0.15   # m: only objects whose top reaches this close to the scan plane may snap to it
+# Snap regardless of height (the old behaviour), for a rig whose mounting heights in TF are wrong
+LIDAR_SNAP_ANY_HEIGHT = os.environ.get("WEARABLE_LIDAR_SNAP_ANY_HEIGHT", "0") == "1"
 SCAN_MATCH_MAX_DT = 0.25     # s, max image/scan time offset before falling back to latest scan
 BOX_EDGE_PX = 4              # a box this close to the border is truncated by the frame
 CENTER_BEARING_DEG = 7.0     # objects within this angle of straight ahead are announced as CENTER
@@ -320,6 +353,9 @@ MONO_MAX_POINTS = 2000       # object pixels back-projected per detection
 MIN_HITS_STATIC = 4          # sightings before a static object is mapped / remembered
 MIN_HITS_DYNAMIC = 2
 UNCONFIRMED_TIMEOUT = 1.5    # s, tentative tracks die fast (kills one-frame hallucinations)
+TRACK_DEBUG = os.environ.get("WEARABLE_TRACK_DEBUG", "0") == "1"  # log why each new static object is created
+CONFIRMED_TIMEOUT = 30.0    # s a confirmed (MIN_HITS_STATIC) but not yet reliable object survives out of view,
+                             # so the next glance at it matches it instead of mapping it again under a new ID
 UNSEEN_DROP_S = 1.0          # s, an object the camera is looking at but no longer detects is removed
 VISIBILITY_MAX_RANGE = 6.0   # m, only apply the rule above to objects this close
 # Real-time map: an object is drawn only while it is being detected right now
@@ -344,6 +380,7 @@ BLIND_SPOT_RADIUS = 0.8      # m: a remembered object this close to the wearer i
 OCCLUSION_DEPTH_MARGIN = 0.3  # m: something this much closer in the same pixel hides the object
 FREE_SPACE_MARGIN = 1.0      # m: live depth this far beyond a remembered object means its spot is empty
 FREE_SPACE_CLEAR_S = 0.4     # s of consistent free-space evidence before it is pruned (rejects depth glitches)
+SEE_THROUGH = {"door", "window"}  # open doorways / windows: depth reading past them is expected, not a ghost
 MAX_REMEMBERED_OBJECTS = 200  # oldest-seen remembered objects are evicted first past this count
 REMEMBERED_ALPHA = 0.30      # remembered (not currently seen) objects are drawn translucent
 OBJECTS_PUBLISH_PERIOD = 0.2 # s, /semantic_objects rate (5 Hz)
@@ -354,6 +391,12 @@ REVISIT_GAP_S = 2.0          # s unseen after which the next sighting is treated
 REVISIT_VAR = 0.30 ** 2      # m^2: prior widened to this on a revisit (absorbs SLAM drift / a new viewing angle)
 CHI2_GATE_2D = 9.21          # 99 % gate for a 2-D innovation
 SAME_OBJECT_IOU = 0.3        # footprints overlapping this much (and statistically consistent) are one object
+# Two *different* labels on one spot (a cabinet also read as a door and a notice board) are one object when
+# the footprints overlap this much, the widths are within this ratio and the height bands overlap this much
+# of the shorter one. A bottle on a table (tiny vs large, different heights) stays two objects.
+SAME_PLACE_IOU = 0.40
+SAME_PLACE_SIZE_RATIO = 1.6
+SAME_PLACE_Z_OVERLAP = 0.5
 BIG_COST = 1e6
 HUD_TIMEOUT = 0.7            # s, camera-view boxes vanish this fast once the object is not detected
 HUD_MIN_HITS = 2             # sightings before a box is labelled in the camera view
@@ -377,7 +420,7 @@ def _object_color(name: str):
 # Outdoor: short memory, responsive tracking, collision focus
 MODE_PARAMS = {
     "indoor": {
-        "conf_threshold":       0.25,    # open-vocabulary scores run low; track confirmation (MIN_HITS) filters hallucinations
+        "conf_threshold":       0.30,    # open-vocabulary scores run low; track confirmation (MIN_HITS) filters hallucinations
         "static_timeout":       120.0,   # 2 min memory while indoors
         "dynamic_timeout":      0.5,     # SUPER FAST cleanup for moving objects
         "static_assoc":         1.50,    # hard association limit (m); main gate is statistical
@@ -427,6 +470,11 @@ def _typical_size(label: str, raw_label: str):
     return typ
 
 
+def _ranking_score(det) -> float:
+    """Confidence, slightly favouring the classes that matter for walking among look-alikes."""
+    return det["conf"] * (PRIORITY_BOOST if det["label"] in PRIORITY_LABELS else 1.0)
+
+
 def _min_separation(label: str) -> float:
     """Two objects of the same class cannot physically stand closer than this (centre to centre)."""
     typ_w, _ = _typical_size(label, label)
@@ -441,12 +489,32 @@ def _footprint_iou(ax, ay, aw, bx, by, bw) -> float:
     return inter / (aw * aw + bw * bw - inter + 1e-9)
 
 
-def _same_object(a_xy, a_w, a_var, b_xy, b_w, b_var) -> bool:
-    """Same physical object only if the footprints overlap AND the gap is within the joint position
-    uncertainty. Plain centre distance merged two neighbouring chairs into one."""
+def _dedup_width(label: str, width: float) -> float:
+    """Footprint used to decide whether two sightings are one object. A switch's measured position
+    wobbles by more than its own 8 cm, and two wall plates are never this close together."""
+    return max(width, WALL_MOUNTED_FOOTPRINT) if label in WALL_MOUNTED else width
+
+
+def _same_object(a_xy, a_w, a_var, b_xy, b_w, b_var, min_sep: float = 0.0) -> bool:
+    """Same physical object only if the footprints overlap (or the centres are closer than two objects of
+    this class can stand, `min_sep`) AND the gap is within the joint position uncertainty. Plain centre
+    distance merged two neighbouring chairs into one."""
     d2 = (a_xy[0] - b_xy[0]) ** 2 + (a_xy[1] - b_xy[1]) ** 2
-    return (_footprint_iou(a_xy[0], a_xy[1], a_w, b_xy[0], b_xy[1], b_w) >= SAME_OBJECT_IOU
-            and d2 / max(a_var + b_var, 1e-4) <= CHI2_GATE_2D)
+    # A big object's estimated centre shifts with the side it is seen from (its visible face)
+    size_var = (0.25 * max(a_w, b_w)) ** 2
+    overlap = (_footprint_iou(a_xy[0], a_xy[1], a_w, b_xy[0], b_xy[1], b_w) >= SAME_OBJECT_IOU
+               or d2 <= min_sep ** 2)
+    return overlap and d2 / max(a_var + b_var + size_var, 1e-4) <= CHI2_GATE_2D
+
+
+def _same_place(a_xy, a_w, a_z, a_h, b_xy, b_w, b_z, b_h) -> bool:
+    """Two different labels for one physical thing: same footprint, similar width, same height band."""
+    if max(a_w, b_w) > SAME_PLACE_SIZE_RATIO * max(min(a_w, b_w), 0.05):
+        return False
+    if _footprint_iou(a_xy[0], a_xy[1], a_w, b_xy[0], b_xy[1], b_w) < SAME_PLACE_IOU:
+        return False
+    z_overlap = min(a_z + a_h, b_z + b_h) - max(a_z, b_z)
+    return z_overlap >= SAME_PLACE_Z_OVERLAP * min(a_h, b_h)
 
 
 def _track_var(t) -> float:
@@ -492,6 +560,8 @@ class KalmanTracker:
         self.free_in_view = 0.0
         self.seen_times = deque([now], maxlen=10)
         self.uid = 0  # globally unique object id (assigned by the node), used for RViz marker ids
+        self.votes = {}  # label -> accumulated (priority-weighted) confidence, for look-alike classes
+        self.from_memory = False  # reloaded from a saved map, not yet seen in this session
 
         self.H = np.zeros((2, 6), dtype=np.float64)
         self.H[0, 0] = 1.0
@@ -643,7 +713,7 @@ class ObjectPerceptionNode(Node):
         self._load_model()
         self.get_logger().info("Model loaded. Ready for detections.")
 
-        from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+        from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
         realtime_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -756,6 +826,23 @@ class ObjectPerceptionNode(Node):
         self._mode_sub = self.create_subscription(
             String, "/perception_mode", self._mode_callback, 10
         )
+
+        # ── SAVED MAPS (map_manager): reload the objects of a saved home, save them on request ──
+        self._objects_file = None
+        self._objects_loaded = False
+        # Reloaded objects are protected from removal until one of them is seen again: before that
+        # the wearer may not be localized in the saved map yet, so "not seen where expected" means nothing.
+        self._memory_confirmed = True
+        latched = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                             durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(String, "/active_map", self._active_map_callback, latched)
+        self.create_subscription(String, "/map_command", self._map_command_callback, 10)
+
+        # ── GRASP MODE: guide the hand to an object ("start cup" / "stop" on /grasp_command) ──
+        self._grasp = GraspTracker(self.get_logger())
+        self._grasp_status = None
+        self._grasp_pub = self.create_publisher(String, "/grasp_offset", 10)
+        self.create_subscription(String, "/grasp_command", self._grasp_command_callback, 10)
 
         self.get_logger().info(
             f"═══ VisionNav AI Perception Engine ═══\n"
@@ -1099,6 +1186,24 @@ class ObjectPerceptionNode(Node):
             debug['reason'] = 'row_no_cluster'
         return None
 
+    def _door_frame_range(self, proj, box):
+        """Horizontal range (m) of the nearest LiDAR cluster on a door's jambs (the box's side bands)."""
+        if proj is None:
+            return None
+        u, v, _, horiz, _ = proj
+        x1, y1, x2, y2 = box
+        band = 0.15 * (x2 - x1)
+        sides = ((u >= x1 - band) & (u <= x1 + band)) | ((u >= x2 - band) & (u <= x2 + band))
+        sel = np.nonzero(sides & (v >= y1 - LIDAR_ROW_TOL_PX) & (v <= y2 + LIDAR_ROW_TOL_PX)
+                         & (horiz > LIDAR_BODY_RANGE))[0]
+        r = np.sort(horiz[sel])
+        start = 0
+        for end in list(np.nonzero(np.diff(r) > LIDAR_CLUSTER_GAP)[0]) + [len(r) - 1]:
+            if end - start + 1 >= 3:
+                return float(np.median(r[start:end + 1]))
+            start = end + 1
+        return None
+
     def _log_lidar_snap_debug(self, label: str, depth_hint: float, lidar, info: dict):
         """Rate-limited (WEARABLE_LIDAR_SNAP_DEBUG=1) diagnostic for why an object did or did not get
         a LiDAR-anchored position — check this before touching LIDAR_SNAP_RANGE or the mask/row filters."""
@@ -1195,6 +1300,10 @@ class ObjectPerceptionNode(Node):
         cut_t, cut_b = y1 <= BOX_EDGE_PX, y2 >= h - BOX_EDGE_PX
         max_w, max_h = _max_size(label, raw)
         typ_w, typ_h = _typical_size(label, raw)
+        # Without a known real size the size prior is a guess: it may not veto LiDAR or metric depth
+        known_size = _lookup(OBJECT_TYPICAL_SIZES, label, raw) is not None or \
+            _lookup(OBJECT_MAX_SIZES, label, raw) is not None
+        size_gate = 3.0 if known_size else 1e6
         cam_z = float(self._cam_t[2])
         on_floor = raw in FLOOR_OBJECTS or label in FLOOR_OBJECTS or is_dynamic
         on_desk = not on_floor and (raw in DESKTOP_OBJECTS or label in DESKTOP_OBJECTS)
@@ -1213,10 +1322,10 @@ class ObjectPerceptionNode(Node):
             size_d = d_w
         else:
             size_d = min(d_w, d_h)
-        estimates = [(size_d, 0.35 * size_d + 0.05)]
+        estimates = [(size_d, (0.35 if known_size else 1.5) * size_d + 0.05)]
 
         def plausible(d):
-            return d is not None and 0.3 < d < 15.0 and size_d / 3.0 < d < size_d * 3.0
+            return d is not None and 0.3 < d < 15.0 and size_d / size_gate < d < size_d * size_gate
 
         # Support-plane contact: the box's bottom edge touches the floor / desk
         support_z = 0.0 if on_floor else (_lookup(SUPPORT_HEIGHTS, label, raw, DESK_HEIGHT) if on_desk else None)
@@ -1237,7 +1346,8 @@ class ObjectPerceptionNode(Node):
 
         # Metric depth of the object's own pixels — the main range source below the LiDAR plane
         mono = self._mono_object(det, K, dmap)
-        if mono is not None and not (0.3 < mono["dist"] < 15.0 and size_d / 4.0 < mono["dist"] < size_d * 4.0):
+        mono_gate = 4.0 if known_size else 1e6
+        if mono is not None and not (0.3 < mono["dist"] < 15.0 and size_d / mono_gate < mono["dist"] < size_d * mono_gate):
             mono = None
         if mono is not None:
             fresh = time.monotonic() - self._depth_scale_t <= DEPTH_SCALE_FRESH_S
@@ -1252,13 +1362,31 @@ class ObjectPerceptionNode(Node):
         # ── 2. LIDAR RANGING (overrides optical when the scan plane actually hits the object) ──
         front_xy = None
         lidar_debug = {} if self._lidar_snap_debug else None
-        lidar = self._lidar_hits_in_box(proj, det["box"], det.get("mask"), depth_hint=depth, debug=lidar_debug)
+        # The LiDAR scans one plane at chest height. An object whose top is clearly below it (a chair,
+        # a bottle on a desk) cannot be hit, so it may not borrow the range of whatever is in the same
+        # image columns (a table edge, the wall): that gave confident but wrong positions and duplicates.
+        snap_hint = depth
+        if not LIDAR_SNAP_ANY_HEIGHT and self._lidar_t is not None and not cut_t:
+            top_est = self._height_along_ray(self._pixel_ray(u_mid, y1, K), depth)
+            if top_est < self._lidar_t[2] - LIDAR_SNAP_PLANE_MARGIN:
+                snap_hint = None
+        lidar = self._lidar_hits_in_box(proj, det["box"], det.get("mask"), depth_hint=snap_hint, debug=lidar_debug)
         if lidar_debug is not None:
             self._log_lidar_snap_debug(label, depth, lidar, lidar_debug)
-        if lidar is not None and depth / 4.0 < lidar[0] < depth * 4.0:
+        lidar_gate = 4.0 if (known_size or mono is not None) else 1e6
+        if lidar is not None and depth / lidar_gate < lidar[0] < depth * lidar_gate:
             depth, front_xy, _ = lidar
             sigma_d = 0.04 + 0.01 * depth
             source = "lidar"
+        # A door sits in its wall: range it by the frame (jambs at the box's sides). Through an open
+        # doorway the middle of the box sees the next room, which put the door metres too far away.
+        is_door = label == "door"
+        if is_door:
+            jambs = self._door_frame_range(proj, det["box"])
+            if jambs is not None and (source != "lidar" or jambs < depth - 0.5):
+                depth, sigma_d, source = jambs, 0.04 + 0.01 * jambs, "lidar"
+                ray = self._pixel_ray(u_mid, 0.5 * (y1 + y2), K)
+                front_xy = self._cam_t[:2] + depth * ray[:2] / max(np.linalg.norm(ray[:2]), 1e-6)
         depth = max(0.3, min(depth, 15.0))
 
         # ── 3. POSITION (base_footprint) ──
@@ -1279,7 +1407,7 @@ class ObjectPerceptionNode(Node):
         width_m = max(0.05, min(width_px_m, max_w))
         # LiDAR and ground contact measure the nearest face; the marker goes at the centre.
         # Metric-depth points already sit on the visible surface's centre.
-        push = source == "lidar" or (mono is None and len(estimates) > 1)
+        push = not is_door and (source == "lidar" or (mono is None and len(estimates) > 1))
         center_xy = front_xy + direction * (0.5 * min(width_m, 0.6) if push else 0.0)
 
         # ── 4. ELEVATION AND HEIGHT: from the object's 3D points, else from the box-edge rays ──
@@ -1483,26 +1611,35 @@ class ObjectPerceptionNode(Node):
                     })
 
             dmap = None
-            if self._depth_model is not None and dets:
+            if self._depth_model is not None and (dets or self._grasp.active):
                 try:
                     dmap = self._infer_depth(frame)
                 except Exception as e:
                     self._warn_once("depth_fail", f"Metric depth inference failed: {e}")
 
-            # ── CROSS-CLASS SUPPRESSION: same object reported as two confusable classes ──
-            dets.sort(key=lambda d: d["conf"], reverse=True)
+            # ── CROSS-CLASS SUPPRESSION: same object reported as two classes ──
+            # Look-alikes are suppressed on a large overlap; any two static labels only on (almost)
+            # the same box (a bed also read as a crib, a pillow and a laundry basket).
+            dets.sort(key=_ranking_score, reverse=True)
             kept = []
             for d in dets:
                 ax1, ay1, ax2, ay2 = d["box"]
                 duplicate = False
                 for k in kept:
-                    if k["raw_label"] == d["raw_label"] or (
-                            k["label"] != d["label"] and not self._confusable(k["raw_label"], d["raw_label"])):
+                    if k["raw_label"] == d["raw_label"]:
                         continue
                     bx1, by1, bx2, by2 = k["box"]
                     inter = max(0, min(ax2, bx2) - max(ax1, bx1)) * max(0, min(ay2, by2) - max(ay1, by1))
-                    smaller = min((ax2 - ax1) * (ay2 - ay1), (bx2 - bx1) * (by2 - by1))
-                    if inter / max(smaller, 1) > CROSS_CLASS_OVERLAP:
+                    area_a, area_b = (ax2 - ax1) * (ay2 - ay1), (bx2 - bx1) * (by2 - by1)
+                    both_static = (k["raw_label"] not in self._dynamic_classes
+                                   and d["raw_label"] not in self._dynamic_classes)
+                    if both_static and inter / max(area_a + area_b - inter, 1) >= CROSS_CLASS_SAME_BOX_IOU:
+                        duplicate = True
+                        break
+                    if not (k["label"] == d["label"] or self._confusable(k["label"], d["label"])
+                            or self._confusable(k["raw_label"], d["raw_label"])):
+                        continue
+                    if inter / max(min(area_a, area_b), 1) > CROSS_CLASS_OVERLAP:
                         duplicate = True
                         break
                 if not duplicate:
@@ -1575,8 +1712,9 @@ class ObjectPerceptionNode(Node):
             t = assigned[i]
             if t is None:
                 # A second detection on top of an existing object is a duplicate, never a new object
-                near = [tr for tr in tracks if _same_object((m["px"], m["py"]), m["width_m"], m["sigma"] ** 2,
-                                                            tr.x[:2], tr.width, _track_var(tr))]
+                near = [tr for tr in tracks if _same_object((m["px"], m["py"]), _dedup_width(label, m["width_m"]),
+                                                            m["sigma"] ** 2, tr.x[:2], _dedup_width(label, tr.width),
+                                                            _track_var(tr), min_sep)]
                 if near:
                     m["track"] = max(near, key=lambda tr: tr.hits)
                     continue
@@ -1584,6 +1722,16 @@ class ObjectPerceptionNode(Node):
                 track_id = 1
                 while track_id in existing:
                     track_id += 1
+                if TRACK_DEBUG and not is_dynamic:
+                    near_txt = ", ".join(
+                        f"{label}_{tr.id} d={math.hypot(m['px'] - tr.x[0], m['py'] - tr.x[1]):.2f} "
+                        f"m2={tr.mahalanobis_sq(m['px'], m['py'], m['sigma']):.1f} "
+                        f"sd={math.sqrt(_track_var(tr)):.2f} hits={tr.hits}"
+                        for tr in tracks if math.hypot(m['px'] - tr.x[0], m['py'] - tr.x[1]) < 1.5)
+                    self.get_logger().info(
+                        f"[track-debug] NEW {label}_{track_id} at ({m['px']:.2f},{m['py']:.2f}) "
+                        f"src={m['source']} sigma={m['sigma']:.2f} depth={m['depth']:.2f} "
+                        f"w={m['width_m']:.2f} | nearby: {near_txt or 'none'}")
                 t = KalmanTracker(track_id, m["px"], m["py"], m["z"], m["width_m"], m["height_m"],
                                   m["conf"], now, is_dynamic, m["sigma"], m["depth"])
                 t.uid = self._next_uid
@@ -1592,12 +1740,174 @@ class ObjectPerceptionNode(Node):
             else:
                 t.update(m["px"], m["py"], m["z"], m["width_m"], m["height_m"], m["conf"],
                          now, m["sigma"], m["depth"])
+                if t.from_memory:
+                    t.from_memory = False
+                    if not self._memory_confirmed:
+                        self._memory_confirmed = True
+                        self.get_logger().info(f"🏠 Localized: remembered {label}_{t.id} seen again where "
+                                               f"it was saved; the saved object map is live")
             m["track"] = t
 
-        merged_into = self._merge_duplicate_tracks(tracks, min_sep)
+        merged_into = self._merge_duplicate_tracks(tracks, label)
         self._deleted_uids.extend(t.uid for t in merged_into.pop("_removed", []))
         for m in meas:
             m["track"] = merged_into.get(id(m["track"]), m["track"])
+
+    def _lookalike_track(self, m):
+        """Label of a static track of another class on this measurement's spot (same physical object):
+        a look-alike on an overlapping footprint, or any label on the same footprint, size and height."""
+        def same(t, lbl, min_sep=0.0):
+            return _same_object((m["px"], m["py"]), _dedup_width(m["label"], m["width_m"]), m["sigma"] ** 2,
+                                t.x[:2], _dedup_width(lbl, t.width), _track_var(t), min_sep)
+
+        min_sep = _min_separation(m["label"])
+        if any(same(t, m["label"], min_sep) for t in self._static_tracks.get(m["label"], [])):
+            return None
+        best = None
+        for lbl, tracks in self._static_tracks.items():
+            if lbl == m["label"]:
+                continue
+            confusable = self._confusable(lbl, m["label"])
+            for t in tracks:
+                match = same(t, lbl) if confusable else _same_place(
+                    (m["px"], m["py"]), _dedup_width(m["label"], m["width_m"]), m["z"], m["height_m"],
+                    t.x[:2], _dedup_width(lbl, t.width), t.z, t.height)
+                if match and (best is None or t.hits > best[1].hits):
+                    best = (lbl, t)
+        return best[0] if best else None
+
+    def _relabel_tracks(self):
+        """Rename a track whose evidence clearly favours a look-alike label (wardrobe_1 -> door_1).
+
+        The object keeps its uid (RViz marker) and position; only its class and name change.
+        Returns {id(track): new label}.
+        """
+        moves, renamed = [], {}
+        for lbl, tracks in self._static_tracks.items():
+            for t in tracks:
+                if not t.votes:
+                    continue
+                best = max(t.votes, key=t.votes.get)
+                if (best != lbl and t.votes[best] >= RELABEL_MIN_VOTES
+                        and t.votes[best] >= RELABEL_RATIO * t.votes.get(lbl, 0.0)):
+                    moves.append((lbl, t, best))
+        for old, t, new in moves:
+            self._static_tracks[old].remove(t)
+            dest = self._static_tracks.setdefault(new, [])
+            taken = {tr.id for tr in dest}
+            t.id = 1
+            while t.id in taken:
+                t.id += 1
+            dest.append(t)
+            renamed[id(t)] = new
+            self.get_logger().info(f"Relabelled {old} -> {new}_{t.id} (look-alike evidence {t.votes[new]:.1f})")
+        return renamed
+
+    # ── GRASP MODE ──
+    def _grasp_command_callback(self, msg: String):
+        words = msg.data.strip().lower().split(maxsplit=1)
+        if words and words[0] == "start" and len(words) > 1:
+            ok = self._grasp.start(words[1])
+            if not ok:
+                self._grasp_pub.publish(String(data=json.dumps({"target": words[1], "state": "unavailable"})))
+        elif words and words[0] == "stop":
+            self._grasp.stop()
+            self._grasp_status = None
+
+    def _grasp_step(self, frame, dets, dmap, K):
+        """Hand-to-target offset for this frame, published on /grasp_offset."""
+        if dmap is None:
+            status = {"target": self._grasp.target, "state": "no_depth"}
+        else:
+            fx, fy, cx, cy, _ = K
+            dh, dw = dmap.shape
+
+            def depth_at(us, vs):
+                us = np.clip(np.asarray(us, dtype=int), 0, dw - 1)
+                vs = np.clip(np.asarray(vs, dtype=int), 0, dh - 1)
+                return dmap[vs, us] * self._depth_scale
+
+            def to_base(u, v, z):
+                return self._cam_R @ np.array([(u - cx) / fx * z, (v - cy) / fy * z, z]) + self._cam_t
+
+            status = self._grasp.update(frame, dets, depth_at, to_base)
+        self._grasp_status = status
+        self._grasp_pub.publish(String(data=json.dumps(status)))
+
+    def _draw_grasp(self, frame):
+        """Target box, hand point and the remaining offset while grasp mode is on."""
+        overlay = self._grasp.overlay() if self._grasp.active else None
+        if overlay is None:
+            return
+        (x1, y1, x2, y2), hand = overlay
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
+        st = self._grasp_status or {}
+        if hand is not None:
+            cv2.circle(frame, hand, 7, (0, 255, 255), -1)
+            cv2.line(frame, hand, ((x1 + x2) // 2, (y1 + y2) // 2), (0, 255, 255), 2)
+        if "right" in st:
+            text = (f"GRASP {st['target']}: right {100 * st['right']:+.0f}  up {100 * st['up']:+.0f}  "
+                    f"fwd {100 * st['forward']:+.0f} cm  [{st['state']}]")
+        else:
+            text = f"GRASP {st.get('target', '')}: {st.get('state', '')}"
+        cv2.putText(frame, text, (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+
+    # ── SAVED MAPS ──
+    def _active_map_callback(self, msg: String):
+        try:
+            info = json.loads(msg.data)
+            self._objects_file = os.path.join(info["dir"], f"{info['name']}_objects.json")
+        except (ValueError, KeyError, TypeError):
+            return
+        if info.get("mode") == "localization" and self._mode == "indoor" and not self._objects_loaded:
+            self._load_objects()
+
+    def _map_command_callback(self, msg: String):
+        if msg.data.strip().lower() == "save" and self._objects_file and self._mode == "indoor":
+            self._save_objects()
+
+    def _save_objects(self):
+        objects = [{"class": label, "x": round(float(t.x[0]), 3), "y": round(float(t.x[1]), 3),
+                    "z": round(float(t.z), 3), "w": round(t.width, 3), "h": round(t.height, 3), "hits": t.hits}
+                   for label, tracks in self._static_tracks.items() for t in tracks if t.reliable]
+        try:
+            with open(self._objects_file, "w") as f:
+                json.dump(objects, f, indent=1)
+            self.get_logger().info(f"💾 Saved {len(objects)} objects to {self._objects_file}")
+        except OSError as e:
+            self.get_logger().error(f"Could not save objects: {e}")
+
+    def _load_objects(self):
+        self._objects_loaded = True
+        try:
+            with open(self._objects_file) as f:
+                objects = json.load(f)
+        except (OSError, ValueError):
+            return
+        now = time.monotonic()
+        for o in objects:
+            tracks = self._static_tracks.setdefault(o["class"], [])
+            taken = {t.id for t in tracks}
+            track_id = 1
+            while track_id in taken:
+                track_id += 1
+            t = KalmanTracker(track_id, o["x"], o["y"], o["z"], o["w"], o["h"], 0.5, now,
+                              False, math.sqrt(REVISIT_VAR), 0.0)
+            # Reliable and remembered, but not live: drawn faded until the camera sees it again
+            t.hits = max(int(o.get("hits", 0)), MEMORY_MIN_HITS)
+            t.first_seen = now - MEMORY_MIN_SPAN - REVISIT_GAP_S - 1.0
+            t.last_seen = now - REVISIT_GAP_S - 1.0
+            t.seen_times.clear()
+            t.from_memory = True
+            t.uid = self._next_uid
+            self._next_uid += 1
+            tracks.append(t)
+        self._memory_confirmed = not objects
+        self.get_logger().info(f"🏠 Reloaded {len(objects)} remembered objects from {self._objects_file}")
+
+    def _protected(self, t) -> bool:
+        """A reloaded object that must not be removed yet (the wearer may not be localized)."""
+        return t.from_memory and not self._memory_confirmed
 
     def _track_ttl(self, t, is_dynamic: bool) -> float:
         """How long a track may go unseen before it is removed."""
@@ -1605,6 +1915,8 @@ class ObjectPerceptionNode(Node):
             return self._dynamic_track_timeout
         if self._mode == "indoor" and t.reliable:
             return MEMORY_TTL
+        if t.confirmed:
+            return min(self._static_track_timeout, CONFIRMED_TIMEOUT)
         return min(self._static_track_timeout, UNCONFIRMED_TIMEOUT)
 
     def _purge_tracks(self, tracks: list, is_dynamic: bool, now: float):
@@ -1621,28 +1933,65 @@ class ObjectPerceptionNode(Node):
         return t.live(now) or (self._mode == "indoor" and not is_dynamic and t.remembered(now))
 
     @staticmethod
-    def _merge_duplicate_tracks(tracks: list, min_sep: float):
+    def _fold_track(twin, t):
+        """Merge track `t` into `twin` (same physical object): inverse-variance position, pooled evidence."""
+        wa, wb = 1.0 / max(twin.P[0, 0], 1e-4), 1.0 / max(t.P[0, 0], 1e-4)
+        twin.x[:2] = (wa * twin.x[:2] + wb * t.x[:2]) / (wa + wb)
+        twin.P[:2, :2] = np.eye(2) / (wa + wb)
+        twin.hits += t.hits
+        twin.first_seen = min(twin.first_seen, t.first_seen)
+        twin.last_seen = max(twin.last_seen, t.last_seen)
+        twin.seen_times.extend(t.seen_times)
+        twin.seen_times = deque(sorted(twin.seen_times), maxlen=twin.seen_times.maxlen)
+        for lbl, v in t.votes.items():
+            twin.votes[lbl] = twin.votes.get(lbl, 0.0) + v
+
+    def _merge_duplicate_tracks(self, tracks: list, label: str):
         """Fold together same-class tracks that drifted onto the same spot (keeps the older ID)."""
         tracks.sort(key=lambda t: (-t.hits, t.id))
+        min_sep = _min_separation(label)
         kept, merged_into = [], {}
         for t in tracks:
-            twin = next((k for k in kept if _same_object(t.x[:2], t.width, _track_var(t),
-                                                         k.x[:2], k.width, _track_var(k))), None)
+            twin = next((k for k in kept if _same_object(t.x[:2], _dedup_width(label, t.width), _track_var(t),
+                                                         k.x[:2], _dedup_width(label, k.width), _track_var(k),
+                                                         min_sep)), None)
             if twin is None:
                 kept.append(t)
                 continue
-            # Inverse-variance average of the two position estimates
-            wa, wb = 1.0 / max(twin.P[0, 0], 1e-4), 1.0 / max(t.P[0, 0], 1e-4)
-            twin.x[:2] = (wa * twin.x[:2] + wb * t.x[:2]) / (wa + wb)
-            twin.P[:2, :2] = np.eye(2) / (wa + wb)
-            twin.hits += t.hits
-            twin.last_seen = max(twin.last_seen, t.last_seen)
-            twin.seen_times.extend(t.seen_times)
-            twin.seen_times = deque(sorted(twin.seen_times), maxlen=twin.seen_times.maxlen)
+            self._fold_track(twin, t)
             merged_into[id(t)] = twin
             merged_into.setdefault("_removed", []).append(t)
         tracks[:] = sorted(kept, key=lambda t: t.id)
         return merged_into
+
+    def _merge_same_place_tracks(self):
+        """Fold static tracks of different labels that sit on one spot (one object mapped under several
+        names from different views) into the best-supported one. Returns {id(folded track): (kept, label)}."""
+        entries = sorted(((lbl, t) for lbl, tracks in self._static_tracks.items() for t in tracks),
+                         key=lambda e: -e[1].hits)
+        kept, folded = [], {}
+        for lbl, t in entries:
+            host = None
+            for klbl, k in kept:
+                if klbl == lbl:
+                    continue
+                if self._confusable(klbl, lbl):
+                    same = _same_object(t.x[:2], _dedup_width(lbl, t.width), _track_var(t),
+                                        k.x[:2], _dedup_width(klbl, k.width), _track_var(k))
+                else:
+                    same = _same_place(t.x[:2], _dedup_width(lbl, t.width), t.z, t.height,
+                                       k.x[:2], _dedup_width(klbl, k.width), k.z, k.height)
+                if same:
+                    host = (klbl, k)
+                    break
+            if host is None:
+                kept.append((lbl, t))
+                continue
+            self._fold_track(host[1], t)
+            self._static_tracks[lbl].remove(t)
+            self._deleted_uids.append(t.uid)
+            folded[id(t)] = host
+        return folded
 
     def _in_view_batch(self, xyz: np.ndarray, pose, K, h: int):
         """Which mapped objects (rows of xyz: x, y, z_mid in the map) should the camera be seeing now?
@@ -1717,6 +2066,8 @@ class ObjectPerceptionNode(Node):
         with self._hud_lock:
             self._lidar_overlay = None if proj is None else (proj[0], proj[1], proj[3])
         self._update_depth_scale(proj, dmap)
+        if self._grasp.active:
+            self._grasp_step(frame, dets, dmap, K)
         if dmap is not None and now - self._last_depth_log > 10.0:
             self._last_depth_log = now
             if self._depth_scale_valid:
@@ -1743,11 +2094,31 @@ class ObjectPerceptionNode(Node):
             m["py"] = py0 + syaw * m["bx"] + cyaw * m["by"]
             measurements.append(m)
 
+        # The same physical object seen under a look-alike label (a door read as a wardrobe) updates
+        # its existing track instead of starting a second object on the same spot
+        for m in measurements:
+            m["seen_label"] = m["label"]
+            if not m["is_dynamic"]:
+                lookalike = self._lookalike_track(m)
+                if lookalike is not None:
+                    m["label"] = lookalike
+
         groups = {}
         for m in measurements:
             groups.setdefault((m["label"], m["is_dynamic"]), []).append(m)
         for (label, is_dynamic), group in groups.items():
             self._associate(label, group, is_dynamic, now)
+        for m in measurements:
+            votes = m["track"].votes
+            boost = PRIORITY_BOOST if m["seen_label"] in PRIORITY_LABELS else 1.0
+            votes[m["seen_label"]] = votes.get(m["seen_label"], 0.0) + m["conf"] * boost
+        renamed = self._relabel_tracks()
+        for m in measurements:
+            m["label"] = renamed.get(id(m["track"]), m["label"])
+        folded = self._merge_same_place_tracks()
+        for m in measurements:
+            if id(m["track"]) in folded:
+                m["label"], m["track"] = folded[id(m["track"])]
 
         # Track collision corridor threats (outdoor mode)
         corridor_threats = []
@@ -1835,8 +2206,9 @@ class ObjectPerceptionNode(Node):
             # A remembered object next to a live one of the same class is a stale duplicate of it,
             # e.g. created while its distance estimate jumped, or out of view below the camera.
             live = [t for t in tracks if t.live(now)]
-            stale = [t for t in tracks if not t.live(now) and not near_user(t)
-                     and any(_same_object(t.x[:2], t.width, _track_var(t), l.x[:2], l.width, _track_var(l))
+            stale = [t for t in tracks if not t.live(now) and not near_user(t) and not self._protected(t)
+                     and any(_same_object(t.x[:2], t.width, _track_var(t), l.x[:2], l.width, _track_var(l),
+                                          _min_separation(label))
                              for l in live)]
             for t in stale:
                 self._deleted_uids.append(t.uid)
@@ -1858,13 +2230,14 @@ class ObjectPerceptionNode(Node):
         for label, tracks in self._static_tracks.items():
             survivors = []
             for t in tracks:
-                if id(t) not in matched and not near_user(t):
+                if id(t) not in matched and not near_user(t) and not self._protected(t):
                     in_view, u, v, cam_depth = view[id(t)]
                     half_px = 0.5 * fx_px * t.width / max(cam_depth, 0.1)
                     if in_view and not self._occluded(u, v, cam_depth, dmap, w, h, proj, half_px):
                         t.unseen_in_view += frame_dt
                         t.free_in_view = (t.free_in_view + frame_dt
-                                          if self._free_space(u, v, cam_depth, t, K, dmap, proj) else 0.0)
+                                          if label not in SEE_THROUGH
+                                          and self._free_space(u, v, cam_depth, t, K, dmap, proj) else 0.0)
                         drop_after = UNSEEN_DROP_RELIABLE_S if t.reliable else UNSEEN_DROP_S
                         if t.unseen_in_view > drop_after or t.free_in_view > FREE_SPACE_CLEAR_S:
                             if t.free_in_view > FREE_SPACE_CLEAR_S:
@@ -2207,6 +2580,7 @@ class ObjectPerceptionNode(Node):
         h, w = frame.shape[:2]
         if self._show_lidar_overlay:
             self._draw_lidar_overlay(frame)
+        self._draw_grasp(frame)
         with self._hud_lock:
             hud_tracks = list(self._hud_tracks.values())
         now = time.monotonic()
@@ -2305,7 +2679,8 @@ class ObjectPerceptionNode(Node):
             src_tag = {"lidar": "LiDAR", "depth": "depth"}.get(track_data.get('source'), "cam")
             detail = f"{depth:.1f}m away ({src_tag}) | {kh:.2f}m tall"
             if kz > 0.3:
-                detail += f" | on {kz:.2f}m surface"
+                cls = track_data['label'].rsplit('_', 1)[0].replace('_', ' ')
+                detail += f" | mounted at {kz:.2f}m" if cls in WALL_MOUNTED else f" | on {kz:.2f}m surface"
             detail += f" | {rel_pos}"
             if is_moving:
                 detail += f" | MOVING {vel:.1f}m/s"

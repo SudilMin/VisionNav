@@ -4,3 +4,4 @@ __pycache__/
 *.pt
 *.pth
 visionnav/models/mobileclip_blt.ts
+visionnav/models/hand_landmarker.task

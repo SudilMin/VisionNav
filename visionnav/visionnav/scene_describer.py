@@ -2,22 +2,23 @@
 """
 scene_describer.py
 ------------------
-Offline Vision-Language Model (VLM) for identifying ANY object.
+Offline Vision-Language Model (VLM): answers any question about what the chest camera sees.
 
-Uses Qwen3-VL 2B (2 Billion params) running 100% locally on GPU via Ollama.
-When the user says "what is this?", the system:
-  1. Grabs the latest camera frame
-  2. Feeds it to the VLM
-  3. Speaks the description aloud via Piper TTS
+Uses Qwen3-VL 2B *instruct* running 100% locally on the GPU via Ollama. When the user asks a
+question ("what colour is the door?", "is there a light switch?"), the node:
+  1. Grabs the latest camera frame (un-mirrored, so left/right match the wearer)
+  2. Asks the VLM, with instructions to answer briefly and only from what is visible
+  3. Speaks the answer aloud via Piper TTS
 
-This handles ALL 160+ objects that YOLO/COCO cannot detect:
-  doors, stairs, keys, plates, pillows, white cane, etc.
+This is the system's only VLM. The instruct variant answers directly; the plain `qwen3-vl:2b` tag is
+the *thinking* variant, which spent its token budget on hidden reasoning and gave empty answers.
 
 First-time setup:
-  ollama pull qwen3-vl:2b
+  ollama pull qwen3-vl:2b-instruct
 """
 
 import os
+import re
 import sys
 import subprocess
 import tempfile
@@ -27,7 +28,7 @@ import numpy as np
 
 from visionnav.model_paths import model_path
 
-TMP_DIR = tempfile.gettempdir()  # scratch audio/images
+TMP_DIR = tempfile.gettempdir()  # scratch audio
 TTS_MODEL = model_path("en_US-lessac-medium.onnx")
 
 
@@ -59,73 +60,65 @@ def speak(text):
 
 
 # ── VLM Model Configuration ──
-VLM_MODEL = os.environ.get("WEARABLE_VLM_MODEL", "moondream")
+VLM_MODEL = "qwen3-vl:2b-instruct"
+SYSTEM_PROMPT = (
+    "You are the eyes of a blind person, looking through a camera on their chest. Answer their "
+    "question about this image in one to three short, complete spoken sentences. Only mention what "
+    "is clearly visible; if you cannot tell, say so. Give left and right from the wearer's point of "
+    "view, and mention anything in their way when it matters for walking."
+)
+ANSWER_TOKENS = 256
+KEEP_ALIVE = "30m"   # keep the model in VRAM between questions
+# The Pi's ROS camera stream arrives mirrored (as in object_perception): flip it back so that
+# "left" in the answer is the wearer's left. Override with WEARABLE_CAMERA_FLIP=0/1.
+FLIP_INPUT = os.environ.get("WEARABLE_CAMERA_FLIP", "1") == "1"
+DEFAULT_QUESTION = "Describe what is in front of me."
 
 
 class OfflineVLM:
-    """Qwen3-VL 2B — using Ollama for lightning-fast 4-bit GPU inference."""
+    """A vision-language model served by Ollama (4-bit, on the GPU)."""
     
     def __init__(self):
         print(f"🧠 Connecting to Ollama VLM engine (model: {VLM_MODEL})...")
         try:
             # Check if ollama is running
-            ollama.list()
+            installed = [m.model for m in ollama.list().models]
         except Exception:
             print("❌ Ollama is not running. Please run: curl -fsSL https://ollama.com/install.sh | sh")
+            sys.exit(1)
+        if VLM_MODEL not in installed:
+            print(f"❌ {VLM_MODEL} is not installed. Please run: ollama pull {VLM_MODEL}")
             sys.exit(1)
             
         print("⏳ Warming up the GPU (loading model into VRAM)... this takes ~30s once.")
         try:
-            # Create a tiny 10x10 black image for warmup
-            warmup_img = np.zeros((10, 10, 3), dtype=np.uint8)
-            temp_warmup = os.path.join(TMP_DIR, "_temp_warmup.jpg")
-            cv2.imwrite(temp_warmup, warmup_img)
-            
-            ollama.chat(
-                model=VLM_MODEL,
-                messages=[{'role': 'user', 'content': 'test', 'images': [temp_warmup]}],
-                options={'num_predict': 1, 'think': False}
-            )
-        except Exception as e:
+            self._chat([{'role': 'user', 'content': 'test',
+                         'images': [self._jpeg(np.zeros((10, 10, 3), dtype=np.uint8))]}], num_predict=1)
+        except Exception:
             pass
             
         print(f"✅ GPU Warmed up! Model is now in memory. Ready to describe anything in ~2 seconds.")
     
-    def describe(self, image_np, question="Describe what you see in this image in one sentence."):
-        """
-        Takes a numpy BGR image and a question, returns the VLM's answer via Ollama.
-        """
-        # Save temp image for Ollama to read
-        temp_img_path = os.path.join(TMP_DIR, "_temp_vlm_input.jpg")
-        cv2.imwrite(temp_img_path, image_np)
-        
-        # Prepend /no_think to disable Qwen3's internal reasoning mode,
-        # which otherwise consumes all tokens on hidden <think> tags.
-        prompt_with_directive = question
-        
+    @staticmethod
+    def _jpeg(image_np) -> bytes:
+        return cv2.imencode('.jpg', image_np, [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tobytes()
+
+    def _chat(self, messages, num_predict=ANSWER_TOKENS):
+        """One Ollama chat call with reasoning off (`think` is a top-level argument, not an option)."""
+        return ollama.chat(model=VLM_MODEL, messages=messages, keep_alive=KEEP_ALIVE, think=False,
+                           options={'num_predict': num_predict, 'temperature': 0.2})
+
+    def describe(self, image_np, question=DEFAULT_QUESTION):
+        """Answer a question about a BGR image."""
         try:
-            response = ollama.chat(
-                model=VLM_MODEL,
-                messages=[{
-                    'role': 'user',
-                    'content': prompt_with_directive,
-                    'images': [temp_img_path]
-                }],
-                options={
-                    'num_predict': 150,
-                    'temperature': 0.3,
-                    'think': False,
-                }
-            )
-            return response['message']['content'].strip()
-            answer = response['message']['content'].strip()
-            # Fallback: strip any leaked <think>...</think> tags if they appear
-            if '<think>' in answer:
-                import re
-                answer = re.sub(r'<think>.*?</think>', '', answer, flags=re.DOTALL).strip()
-            return answer if answer else "I can see the scene but couldn't generate a description. Please try again."
+            response = self._chat([
+                {'role': 'system', 'content': SYSTEM_PROMPT},
+                {'role': 'user', 'content': question, 'images': [self._jpeg(image_np)]},
+            ])
         except Exception as e:
             return f"Error connecting to Ollama: {e}"
+        answer = re.sub(r'<think>.*?</think>', '', response['message']['content'], flags=re.DOTALL).strip()
+        return answer or "I can see the scene but could not answer that. Please ask again."
 
 
 class SceneDescriberNode(Node):
@@ -159,7 +152,8 @@ class SceneDescriberNode(Node):
     
     def _image_callback(self, msg):
         try:
-            self.latest_frame = self.bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
+            frame = self.bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
+            self.latest_frame = cv2.flip(frame, 1) if FLIP_INPUT else frame
         except Exception:
             pass
     
@@ -198,7 +192,7 @@ def main_ros():
     def keyboard_trigger_loop():
         time.sleep(1)
         print("\n" + "="*65)
-        print(f"🤖 QWEN-VL AI READY (model: {VLM_MODEL})")
+        print(f"🤖 SCENE DESCRIBER READY (model: {VLM_MODEL})")
         print("   Type a question about what the camera sees and press Enter.")
         print("   (Or just press Enter without typing to get a general description)")
         print("="*65 + "\n")
@@ -206,7 +200,7 @@ def main_ros():
             try:
                 user_q = input("\n👉 Ask a question: ")
                 if not user_q.strip():
-                    user_q = "Describe what you see in this image in a clear, natural sentence."
+                    user_q = DEFAULT_QUESTION
                 
                 if node.latest_frame is not None:
                     node._process_question(user_q)

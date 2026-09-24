@@ -45,6 +45,14 @@ TTS_MODEL = model_path("en_US-lessac-medium.onnx")
 # Arrival is decided purely by the SLAM (TF) distance to that locked point.
 ARRIVAL_RADIUS = 0.6  # m from the locked object centre
 HAPTIC_TOPIC = '/haptic_command'
+# Grasp mode: guide the hand to an object ("grasp cup"), also started on arrival at an object
+GRASP_COMMANDS = ("grasp ", "grab ", "pick up ", "reach for ")
+GRASP_TOL = 0.05          # m left/right or up/down still worth a cue
+GRASP_FORWARD_TOL = 0.07  # m forward/back
+GRASP_TIMEOUT_S = 90.0
+GRASP_CUE_GAP_S = 1.2     # s between spoken cues
+# "save this place as kitchen" and its variants: remember the current position under a name
+PLACE_COMMANDS = ("save this place as ", "remember this place as ", "save place ", "mark ")
 
 @contextlib.contextmanager
 def suppress_stderr():
@@ -98,6 +106,18 @@ class FindObjectNode(Node):
         self.create_subscription(String, '/semantic_nav_status', self._nav2_status_callback, 10)
         self.create_subscription(Path, '/object_path', self._nav2_path_callback, 10)
 
+        # Saved maps and named places (map_manager.py)
+        self.named_places = {}  # {"kitchen": {"x": .., "y": ..}}
+        self._map_cmd_pub = self.create_publisher(String, '/map_command', 10)
+        self.create_subscription(String, '/named_places', self._places_callback, map_qos)
+        self.create_subscription(String, '/map_command_result', lambda m: self.speak(m.data), 10)
+
+        # Grasp mode (object_perception tracks the hand and the object, this node speaks the cues)
+        self.grasping = False
+        self._grasp_status = None
+        self._grasp_cmd_pub = self.create_publisher(String, '/grasp_command', 10)
+        self.create_subscription(String, '/grasp_offset', self._grasp_callback, 10)
+
         # Listen for Emergency Hazards from vision node
         self._hazard_sub = self.create_subscription(String, '/hazard_warning', self._hazard_callback, 10)
         
@@ -139,6 +159,84 @@ class FindObjectNode(Node):
                 obj_name = marker.text.split('(')[0].replace("[MEM]", "").strip().lower()
                 self.saved_objects[obj_name] = marker.pose.position
                 self._marker_names[key] = obj_name
+
+    def _grasp_callback(self, msg: String):
+        try:
+            self._grasp_status = json.loads(msg.data)
+        except ValueError:
+            pass
+
+    def start_grasp(self, obj_class):
+        """Guide the hand to the object in a background thread (stops any grasp already running)."""
+        self.grasping = False
+        time.sleep(0.2)
+        threading.Thread(target=self._grasp_loop, args=(obj_class,), daemon=True).start()
+
+    @staticmethod
+    def _grasp_cue(status, obj):
+        """One short spoken cue: left/right first, then height, then forward."""
+        state = status.get("state")
+        if state == "no_target":
+            return f"I can't see the {obj}. Step back a little, or turn toward it."
+        if state == "no_hand":
+            return f"Reach out your hand toward the {obj}."
+        if state != "tracking":
+            return None
+
+        def cm(v):
+            return max(5, int(round(abs(v) * 100 / 5.0)) * 5)
+        right, up, forward = status["right"], status["up"], status["forward"]
+        if abs(right) > GRASP_TOL:
+            return f"{'Right' if right > 0 else 'Left'} {cm(right)} centimetres."
+        if abs(up) > GRASP_TOL:
+            return f"{'Higher' if up > 0 else 'Lower'} {cm(up)} centimetres."
+        if abs(forward) > GRASP_FORWARD_TOL:
+            return f"{'Forward' if forward > 0 else 'Back'} {cm(forward)} centimetres."
+        return None
+
+    def _grasp_loop(self, obj):
+        self.grasping, self._grasp_status = True, None
+        self._grasp_cmd_pub.publish(String(data=f"start {obj}"))
+        print(f"\n✋ GRASP MODE: {obj}   — type 'stop' to cancel")
+        self.speak(f"Reach out your hand toward the {obj}.")
+        start, last_cue, last_time = time.time(), None, 0.0
+        while rclpy.ok() and self.grasping:
+            status = self._grasp_status or {}
+            state = status.get("state")
+            if state == "unavailable":
+                self.speak("Hand tracking is not available.")
+                break
+            if state == "reached":
+                self._haptic_pub.publish(String(data="arrived"))
+                self.speak(f"Stop. The {obj} is at your hand.")
+                break
+            if time.time() - start > GRASP_TIMEOUT_S:
+                self.speak("Grasp mode stopped.")
+                break
+            cue = self._grasp_cue(status, obj)
+            now = time.time()
+            if cue and now - last_time > GRASP_CUE_GAP_S and (cue != last_cue or now - last_time > 4.0):
+                print(f"  ✋ {cue}")
+                self.speak(cue)
+                last_cue, last_time = cue, time.time()
+            time.sleep(0.1)
+        self._grasp_cmd_pub.publish(String(data="stop"))
+        self.grasping = False
+
+    def _places_callback(self, msg: String):
+        try:
+            self.named_places = json.loads(msg.data)
+        except ValueError:
+            pass
+
+    def _where_am_i(self):
+        pose = self.get_robot_pose()
+        if pose is None or not self.named_places:
+            self.speak("I don't know yet. Save places with: save this place as kitchen.")
+            return
+        name, p = min(self.named_places.items(), key=lambda kv: math.hypot(kv[1]['x'] - pose[0], kv[1]['y'] - pose[1]))
+        dist = math.hypot(p['x'] - pose[0], p['y'] - pose[1])
+        self.speak(f"You are at the {name}." if dist < 1.5 else f"You are {int(dist * 3.28084)} feet from the {name}.")
 
     def _nav2_status_callback(self, msg: String):
         try:
@@ -237,7 +335,9 @@ class FindObjectNode(Node):
         print("\n" + "=" * 50)
         print("⌨️  READY FOR COMMANDS")
         print("  - Type in this terminal (voice temporarily disabled).")
-        print("  - Commands: 'find [object]', 'go to [object]', 'describe...'")
+        print("  - Commands: 'find [object]', 'go to [object or place]', 'describe...'")
+        print("              'save map', 'save this place as [name]', 'where am i', 'forget place [name]'")
+        print("              'grasp [object]' (hand guidance; also starts on arrival at an object)")
         print("=" * 50 + "\n")
         
         # Start input threads
@@ -252,7 +352,10 @@ class FindObjectNode(Node):
                 continue
             
             if target == 'exit' or target == 'stop navigation' or target == 'stop':
-                if self.navigating:
+                if self.grasping:
+                    self.grasping = False
+                    self.speak("Grasp mode off.")
+                elif self.navigating:
                     self.navigating = False
                     if self._using_nav2:
                         self._semantic_goal_pub.publish(String(data="stop"))
@@ -275,6 +378,28 @@ class FindObjectNode(Node):
                     msg.data = target
                 self._describe_cmd_pub.publish(msg)
                 
+            elif target.startswith(GRASP_COMMANDS):
+                prefix = next(p for p in GRASP_COMMANDS if target.startswith(p))
+                obj = target[len(prefix):].strip()
+                obj = obj[4:] if obj.startswith("the ") else obj
+                if obj:
+                    self.start_grasp(obj)
+
+            elif target in ("save map", "save the map"):
+                self._map_cmd_pub.publish(String(data="save"))
+
+            elif target.startswith(PLACE_COMMANDS):
+                prefix = next(p for p in PLACE_COMMANDS if target.startswith(p))
+                name = target[len(prefix):].strip()
+                if name:
+                    self._map_cmd_pub.publish(String(data=f"place {name}"))
+
+            elif target.startswith("forget place "):
+                self._map_cmd_pub.publish(String(data=f"forget {target[len('forget place '):].strip()}"))
+
+            elif target in ("where am i", "where am i?"):
+                self._where_am_i()
+
             elif target.startswith("find "):
                 search_term = target.replace("find ", "").strip()
                 matched = self.find_match(search_term)
@@ -293,7 +418,12 @@ class FindObjectNode(Node):
                 else:
                     matched = self.find_match(dest_term)
                 
-                if matched:
+                place = self.named_places.get(dest_term)
+                if place is not None and not matched:
+                    self.speak(f"Starting navigation to the {dest_term}.")
+                    threading.Thread(target=self.navigate_to, args=(dest_term, (place['x'], place['y'])),
+                                     daemon=True).start()
+                elif matched:
                     friendly_name = matched.replace("_", " ")
                     self.speak(f"Starting navigation to {friendly_name}.")
                     # Launch navigation in a separate thread so input loop stays free
@@ -304,32 +434,36 @@ class FindObjectNode(Node):
                 else:
                     self.speak(f"I don't know where {dest_term} is.")
             else:
-                print("❓ Use: find <object> or go to <object>")
+                print("❓ Use: find <object>, go to <object or place>, save map, "
+                      "save this place as <name>, where am i")
 
     # =============================================
     # CONTINUOUS TURN-BY-TURN NAVIGATION (like Google Maps)
     # =============================================
-    def navigate_to(self, target_name):
-        """Continuously guide the user to the target with voice instructions."""
+    def navigate_to(self, target_name, place=None):
+        """Continuously guide the user to an object, or to a named place (place = (x, y)), by voice."""
         if self._nav2_available():
-            self._navigate_nav2(target_name)
+            self._navigate_nav2(target_name, place)
             return
         self.navigating = True
-        friendly_name = ''.join(c for c in target_name if not c.isdigit()).replace("_", "").strip()
+        friendly_name = target_name if place else \
+            ''.join(c for c in target_name if not c.isdigit()).replace("_", "").strip()
         
         if self.map_data is None:
             self.speak("No map available yet.")
             self.navigating = False
             return
         
-        target_pos = self.saved_objects.get(target_name)
-        if not target_pos:
-            self.speak(f"Lost track of {friendly_name}.")
-            self.navigating = False
-            return
-
-        # Locked once: the route must not follow (or lose) the live detection near the object
-        tx, ty = target_pos.x, target_pos.y
+        if place:
+            tx, ty = place
+        else:
+            target_pos = self.saved_objects.get(target_name)
+            if not target_pos:
+                self.speak(f"Lost track of {friendly_name}.")
+                self.navigating = False
+                return
+            # Locked once: the route must not follow (or lose) the live detection near the object
+            tx, ty = target_pos.x, target_pos.y
 
         last_instruction = ""
         last_speech_time = 0
@@ -353,7 +487,7 @@ class FindObjectNode(Node):
             
             # ---- ARRIVAL CHECK (SLAM distance only: the object is in the blind spot by now) ----
             if dist_to_target < ARRIVAL_RADIUS:
-                self._arrive(friendly_name)
+                self._arrive(friendly_name, place is not None, target_name.rsplit('_', 1)[0].replace('_', ' '))
                 break
                 
             # ---- RECALCULATE A* PATH every 1.0 second (10 cycles) ----
@@ -420,13 +554,17 @@ class FindObjectNode(Node):
         self.navigating = False
         print("\n✅ Navigation ended.\n")
 
-    def _arrive(self, friendly_name):
-        """Arrival cue: haptic 'last inch' event, voice, and clear the drawn path."""
+    def _arrive(self, friendly_name, is_place=False, obj_class=None):
+        """Arrival cue: haptic 'last inch' event, voice, and clear the drawn path. At an object,
+        grasp mode then guides the hand to it."""
         self._haptic_pub.publish(String(data="arrived"))
-        self.speak(f"You have arrived at the {friendly_name}. It is just below you, within reach.")
+        self.speak(f"You have arrived at the {friendly_name}." if is_place else
+                   f"You have arrived at the {friendly_name}. It is within reach.")
         empty_path = Path()
         empty_path.header.frame_id = 'map'
         self._path_pub.publish(empty_path)
+        if not is_place and obj_class:
+            self.start_grasp(obj_class)
 
     @staticmethod
     def _instruction(rel_angle, clock_hr, dist_ft):
@@ -448,25 +586,31 @@ class FindObjectNode(Node):
             return f"Continue straight. {int(dist_ft)} feet to go."
         return f"Almost there. {int(dist_ft)} feet."
 
-    def _navigate_nav2(self, target_name):
+    def _navigate_nav2(self, target_name, place=None):
         """Guide the user along the smooth Nav2 path from semantic_navigator.py (re-planned every second)."""
-        friendly_name = ''.join(c for c in target_name if not c.isdigit()).replace("_", " ").strip()
-        target_pos = self.saved_objects.get(target_name)
-        if not target_pos:
-            self.speak(f"Lost track of {friendly_name}.")
-            return
-        # Lock the goal in the map frame: Nav2 routes to this fixed point, not the live detection
-        tx, ty = target_pos.x, target_pos.y
+        if place:
+            friendly_name, (tx, ty) = target_name, place
+        else:
+            friendly_name = ''.join(c for c in target_name if not c.isdigit()).replace("_", " ").strip()
+            target_pos = self.saved_objects.get(target_name)
+            if not target_pos:
+                self.speak(f"Lost track of {friendly_name}.")
+                return
+            # Lock the goal in the map frame: Nav2 routes to this fixed point, not the live detection
+            tx, ty = target_pos.x, target_pos.y
         self.navigating, self._using_nav2 = True, True
         self._nav2_status, self._nav2_path = None, []
-        self._semantic_goal_pub.publish(String(data=json.dumps({"name": target_name, "x": tx, "y": ty})))
+        goal = {"name": target_name.replace(" ", "_"), "x": tx, "y": ty}
+        if place:
+            goal["place"] = True  # walk to the point itself (no object to stop in front of)
+        self._semantic_goal_pub.publish(String(data=json.dumps(goal)))
         print(f"\n🧭 NAVIGATING (Nav2) TO: {friendly_name}   — type 'stop' to cancel")
         last_instruction, last_speech_time, last_problem = "", 0.0, None
         while rclpy.ok() and self.navigating:
             status = self._nav2_status or {}
             state = status.get("state")
             if state == "arrived":
-                self._arrive(friendly_name)
+                self._arrive(friendly_name, place is not None, target_name.rsplit('_', 1)[0].replace('_', ' '))
                 break
             if state in ("no_path", "blocked", "not_found", "no_planner") and state != last_problem:
                 last_problem = state
@@ -476,7 +620,7 @@ class FindObjectNode(Node):
                             "no_planner": "The path planner is not running."}[state])
             pose = self.get_robot_pose()
             if pose is not None and math.hypot(tx - pose[0], ty - pose[1]) < ARRIVAL_RADIUS:
-                self._arrive(friendly_name)
+                self._arrive(friendly_name, place is not None, target_name.rsplit('_', 1)[0].replace('_', ' '))
                 break
             path = self._nav2_path
             if pose is None or len(path) < 2:

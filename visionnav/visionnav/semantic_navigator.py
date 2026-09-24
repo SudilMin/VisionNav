@@ -19,7 +19,8 @@ around where they are walking (what a TEB local planner would do for a robot).
 voice_navigation_assistant.py turns the resulting path into spoken turn-by-turn guidance.
 
 Subscribes: /semantic_goal (String: "chair", "chair_2", "stop", or JSON {"name","x","y"} to pin the
-            goal to a locked map coordinate instead of the live detection), /semantic_objects (JSON),
+            goal to a locked map coordinate instead of the live detection; add "place": true for a
+            named place, which is walked to directly), /semantic_objects (JSON),
             /global_costmap/costmap (to pick a reachable approach point)
 Publishes:  /object_path (nav_msgs/Path), /semantic_nav_status (String, JSON)
 """
@@ -112,8 +113,10 @@ class SemanticNavigator(Node):
             except (ValueError, KeyError, TypeError):
                 self._status('requested', 'Bad pinned goal')
                 return
-            width = self._objects.get(name, {}).get('w', 0.4)
-            pinned = {'name': name, 'class': name.rsplit('_', 1)[0], 'x': x, 'y': y, 'w': width}
+            is_place = bool(data.get('place'))  # a named place: walk to the point itself
+            width = 0.0 if is_place else self._objects.get(name, {}).get('w', 0.4)
+            pinned = {'name': name, 'class': name.rsplit('_', 1)[0], 'x': x, 'y': y, 'w': width,
+                      'place': is_place}
             request = name
         else:
             request = raw.lower().replace(' ', '_')
@@ -182,10 +185,10 @@ class SemanticNavigator(Node):
         line - outside the object's _target_zone - as a real obstacle,
         which falls back to the scored ring search around the object.
         """
-        radius = max(APPROACH_DIST, 0.5 * obj.get('w', 0.4) + MIN_EDGE_CLEARANCE)
+        radius = 0.0 if obj.get('place') else max(APPROACH_DIST, 0.5 * obj.get('w', 0.4) + MIN_EDGE_CLEARANCE)
         base = math.atan2(uy - obj['y'], ux - obj['x'])  # object -> user
         dist_to_obj = math.hypot(ux - obj['x'], uy - obj['y'])
-        if dist_to_obj <= radius:
+        if dist_to_obj <= max(radius, 0.05):
             # Already closer than the stopping distance: stop where the user is, facing the object
             return self._make_pose(ux, uy, base + math.pi)
 

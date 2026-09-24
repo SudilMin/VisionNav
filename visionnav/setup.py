@@ -8,7 +8,7 @@ package_name = 'visionnav'
 NODES = [
     'object_perception', 'voice_navigation_assistant', 'scene_describer', 'phone_camera_publisher', 'esp32_button_haptics_bridge',
     'lidar_body_filter', 'semantic_costmap', 'semantic_navigator', 'wall_structure_mapper',
-    'lidar_orientation_calibrator', 'gps_voice_navigator',
+    'lidar_orientation_calibrator', 'gps_voice_navigator', 'map_manager',
 ]
 
 setup(
