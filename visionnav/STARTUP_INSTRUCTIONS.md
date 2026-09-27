@@ -1,332 +1,358 @@
-# VisionNav Startup Instructions (Mega Upgrade Edition)
+# VisionNav Startup Guide
 
-This file contains the complete, up-to-date sequence of commands needed to launch the entire VisionNav system across both the Raspberry Pi and the Laptop.
+VisionNav runs on two computers:
 
-> **⚠️ IMPORTANT:** The Pi commands (Terminals 1-2) must be run on the **Raspberry Pi over SSH**.
-> The Laptop commands (Terminals 3-6) must be run **locally on your laptop**.
-> Do NOT run `pi_sensors.launch.py` on the laptop — there is no LiDAR connected to it!
+* **Raspberry Pi 5** (on the chest rig): the five push buttons, the LiDAR and the camera. The button program
+  starts by itself when the Pi boots; the **SENSORS** button turns the LiDAR and camera on.
+* **Laptop** (MSI Sword 15, RTX 2050): the AI, the map and the voice. The navigation assistant starts at login
+  (or with one command) and starts everything else — the map, the camera AI, the vision AI, GPS — as soon as the
+  camera and LiDAR are on, and whenever the buttons ask for it.
+
+**No SSH is needed to use it.** The Pi and the laptop find each other by themselves over Wi-Fi through ROS 2
+(both use `ROS_DOMAIN_ID=42` on the same network): the laptop hears the Pi's buttons and sensors directly.
+`ssh pi@raspberrypi.local` (or the Pi's user/IP) is only for the one-time setup and for updates (section 2).
 
 ---
 
-## 🔨 0. One-Time Setup (build the workspace)
-Run on **both** the laptop and the Pi after pulling changes. The ROS 2 package is `visionnav`
-(`src/visionnav`); its nodes live in `src/visionnav/visionnav/` and model weights in `src/visionnav/models/`.
+## 🚀 Everyday Use
+
+1. **Switch on the Pi and the laptop.** The Pi's buttons are ready about 30 s after it boots; the assistant
+   opens when you log in to the laptop (one-time setup: sections 1 and 2) and says
+   **"VisionNav is on. Press the sensor button to start."** — or "Waiting for the Pi…" until the Pi is on the
+   network ("Connected to the Pi." when it is).
+   Without the login start, run it yourself:
+   ```bash
+   export ROS_DOMAIN_ID=42
+   export ROS_LOCALHOST_ONLY=0
+   cd ~/wearable_ws
+   source install/setup.bash
+   ros2 run visionnav voice_navigation_assistant
+   ```
+2. **Press SENSORS.** "Turning on the camera and LiDAR." → "Camera and LiDAR on." → the laptop starts indoor
+   mode by itself: "Starting indoor mode." → **"Indoor mode activated."**
+3. Use the buttons (below), or type commands in the assistant's terminal. Every tap clicks, so you know it was
+   heard. Hold TALK and say **"help"** to hear what the buttons do.
+4. **Press SENSORS again** when you are done: "Camera and LiDAR off." → "Indoor mode paused." (the map is saved
+   first while mapping). The next SENSORS press continues where you left off.
+
+### What each button does, and what you hear
+
+| Button | Press | What happens and what you hear |
+|---|---|---|
+| **SENSORS** | tap | Turns the LiDAR and camera on — "Turning on the camera and LiDAR." → "Camera and LiDAR on." → the current mode starts ("Indoor mode activated.") — or off: "Camera and LiDAR off." → "Indoor mode paused." If they fail: "The camera and LiDAR could not start. Check their cables." |
+| | hold | Restarts them (for a camera that stopped sending) |
+| **LOOK** | tap | If the vision AI is off: "Turning on the vision AI. This takes about half a minute." → starts Qwen3-VL → "Vision AI enabled." → describes the scene. If it is already on: "Looking." → the description |
+| | hold | Beep → ask a question while holding ("what colour is the door?") → release → the camera answers |
+| | double tap | Stops the vision AI and frees its ~2 GB of GPU memory: "Vision AI off." |
+| **MODE** | tap | While paused (sensors off): "Outdoor mode selected. It starts when the camera and LiDAR are on." Otherwise: "Switching to outdoor mode." → stops the indoor map programs, starts the GPS ones → "Outdoor mode activated." (and back: "Indoor mode activated."). Without a GPS receiver: "…No GPS receiver is plugged in, so I will only warn you about obstacles." |
+| | hold | Status: mode, vision AI on/off, missing sensors, map, how many objects, what is around you |
+| **HAND** | tap | Starts the camera AI if it is off → "Hand guidance enabled." → guides your hand to the object found last (or the nearest one ahead), walking you there first if it is more than 1 m away. Tap again: "Hand guidance disabled." |
+| **TALK** | tap | **STOP** everything (speech, walking guidance, hand guidance): "Stopped." |
+| | hold | Beep → speak a command while holding (see the list below) → release |
+| | double tap | What is around you |
+
+A hold is 0.6 s; a double tap is two taps within 0.4 s. Every tap clicks. If the camera or LiDAR stream stops
+you hear "The camera signal is lost." ("The camera is on." when it returns), and if the Pi drops off the
+network, "The Pi is not answering. Check that it is switched on and on the same Wi-Fi."
+
+### Which programs each mode runs
+
+The assistant starts and stops these itself (`system_manager.py`); the Pi's button program starts the sensors.
+
+| Mode / button | Programs |
+|---|---|
+| **SENSORS** (Pi) | `pi_sensors.launch.py`: RPLiDAR C1 (`sllidar_node`) + chest camera (`phone_camera_publisher`) |
+| **Indoor** (default, laptop) | `laptop_brain.launch.py` (sensor TFs, Cartographer SLAM, Nav2, walls, RViz) + `object_perception` (camera AI, camera window) |
+| **Outdoor** (laptop) | `nmea_navsat_driver` (only if a GPS receiver is on `/dev/ttyACM0`) + `gps_localization.launch.py` + `gps_voice_navigator` + `object_perception` (collision warnings) |
+| **LOOK** (laptop) | `scene_describer` (Qwen3-VL), started on the first press, stopped by a double tap |
+
+* A program already started by hand in a terminal is used as it is — never started twice, and never stopped by
+  the buttons.
+* Everything the assistant started stops when it exits (Ctrl+C, closing its terminal, or saying "exit").
+* Each program's output: `~/.visionnav/logs/<part>.log` (`brain`, `perception`, `vision_ai`, `gps`,
+  `pi_sensors` on the Pi).
+* Settings (set before starting the assistant): `WEARABLE_AUTOSTART` — `sensors` (default: start the mode when
+  the camera and LiDAR come on, pause it when they go off), `now` (start at once), `off` (never, section 6);
+  `WEARABLE_MODE=outdoor` starts in outdoor mode;
+  `WEARABLE_BRAIN_ARGS="camera_height:=1.32 camera_pitch_deg:=12 lidar_height:=1.18"` passes the rig's measured
+  geometry to the map (section 5).
+* Switching from indoor to outdoor while *mapping* saves the map first.
+
+### Voice commands (hold TALK, or type them in the assistant's terminal)
+
+Objects are described the way you know them: IDs such as `table_2` and colours are never needed or spoken, and
+distances are in feet ("The table, with the cup on it, 7 feet away, at 1 o'clock").
+
+| Say | What it does |
+|---|---|
+| "find the table where the cup is", "where is the cup on the table" | Says where it is |
+| "go to the chair next to the door", "take me to the nearest chair", "go there" | Walking guidance (Nav2 route, turn-by-turn) |
+| "another one", "list them", "the second one", "the one in the kitchen" | When several objects match: "go to the chair" goes to the nearest ("There are 3 chairs. Taking you to the nearest one…") |
+| "what is on the table", "what is around me" | Answered from the map |
+| "call this my chair" → later "go to my chair"; "forget name my chair" | Your own names for objects (saved per map) |
+| "save this place as kitchen" (or "mark kitchen"), "go to kitchen", "where am i", "forget place kitchen" | Named places |
+| "save map" | Saves the map, the objects and the places (section 4) |
+| "grasp the cup" ("grab", "pick up", "reach for") | Hand guidance: "Right 4 inches", "Lower 2 inches", "Forward 6 inches"… "Stop. The cup is at your hand." (also starts on arrival at an object) |
+| "what colour is the door?", "describe …", "read …" | Sent to the vision AI |
+| "help" | What the buttons do and what you can say |
+| "stop" / "exit" | Stop everything / shut the assistant down |
+
+Speech is recognised offline (Whisper `tiny.en`, cached in `~/.cache/huggingface`) in about 0.3–0.6 s: wait for
+the beep, then speak. For more accuracy in noise: `WEARABLE_WHISPER_MODEL=base.en` (downloaded once).
+Colours are understood when someone says one ("the red cup") but only spoken with `WEARABLE_SPEAK_COLORS=1`
+(for a partially sighted user).
+
+---
+
+## 🔨 1. One-Time Setup: Laptop
 
 ```bash
+cd ~/wearable_ws/src && git pull
+source /opt/ros/jazzy/setup.bash
 cd ~/wearable_ws
-rm -rf build/wearable_sim install/wearable_sim   # only once, after the rename from wearable_sim
 colcon build --symlink-install --packages-select visionnav
-source install/setup.bash
 ```
 
-**Node names** (renamed so each says what it does; old name → new name):
-`vision_perception` → `object_perception`, `find_object` → `voice_navigation_assistant`,
-`phone_camera` → `phone_camera_publisher`, `esp32_bridge` → `esp32_button_haptics_bridge`,
-`scan_body_filter` → `lidar_body_filter`, `check_lidar_orientation` → `lidar_orientation_calibrator`,
-`gps_nav` → `gps_voice_navigator`, `structure_mapper` → `wall_structure_mapper`.
-Topics are unchanged.
+* **GPU driver.** The perception log must say `YOLO device: CUDA fp16 (TensorRT)`. `CPU` means the NVIDIA driver
+  is not loaded (often after a kernel update): `sudo apt install linux-modules-nvidia-595-open-$(uname -r)` and
+  reboot.
+* **Object detector.** YOLOE-11s-seg with the vocabulary in `VOCABULARY` (top of `visionnav/object_perception.py`).
+  The first start after the vocabulary changes builds a TensorRT engine (~2 min, one time); the camera window
+  opens when it is done. To detect something new, add its name to `VOCABULARY`.
+* **Vision AI.** `ollama pull qwen3-vl:2b-instruct` (the plain `qwen3-vl:2b` tag is a *thinking* model that
+  gives empty answers).
+* **Hand tracking** (grasp mode). Install MediaPipe *without* its dependencies (a normal install pulls NumPy 2
+  and breaks ROS), then fetch the hand model:
+  ```bash
+  python3 -m pip install --user --break-system-packages --no-deps mediapipe==1.0.1 absl-py
+  curl -sSfL -o ~/wearable_ws/src/visionnav/models/hand_landmarker.task \
+    https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
+  ```
 
-**Hand tracking for grasp mode (laptop, one time).** Install MediaPipe *without* its dependencies: a normal
-install pulls NumPy 2 and a second OpenCV, which breaks ROS (cv_bridge, matplotlib). Then fetch the hand model:
+**Start the assistant at login** (optional, so no command is needed at all): it opens in its own terminal window
+when you log in.
 ```bash
-python3 -m pip install --user --break-system-packages --no-deps mediapipe==1.0.1 absl-py
-curl -sSfL -o ~/wearable_ws/src/visionnav/models/hand_landmarker.task \
-  https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
+mkdir -p ~/.config/autostart
+cat > ~/.config/autostart/visionnav.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=VisionNav
+Exec=terminator -e "bash -ic 'export ROS_DOMAIN_ID=42 ROS_LOCALHOST_ONLY=0; source ~/wearable_ws/install/setup.bash; ros2 run visionnav voice_navigation_assistant'"
+X-GNOME-Autostart-enabled=true
+EOF
 ```
+To turn it off again: `rm ~/.config/autostart/visionnav.desktop`.
 
-**Object detector (laptop):** the vision node uses **YOLOE-11s-seg** (open-vocabulary) with the indoor
-vocabulary in `VOCABULARY` at the top of `visionnav/object_perception.py` (doors, light switches, wall sockets,
-stairs, holes in the floor, furniture, …). On the first start, or after the vocabulary is edited, it compiles a
-TensorRT FP16 engine for the RTX 2050 into `models/` automatically (≈2 min, one time) before the ROS loop starts.
-To detect something new, add its name to `VOCABULARY`; the engine rebuilds itself on the next start.
+**For a wearable laptop in a backpack** (recommended):
+* **Log in automatically:** Settings → Users → *Automatic Login*, so the assistant starts when the laptop is
+  switched on.
+* **Keep running with the lid closed:** in `/etc/systemd/logind.conf` set `HandleLidSwitch=ignore` and
+  `HandleLidSwitchExternalPower=ignore`, then `sudo systemctl restart systemd-logind`.
+* **Never sleep:** Settings → Power → *Automatic Suspend* off, and *Screen Blank* never.
+* **One network everywhere:** let the laptop share a hotspot (Settings → Wi-Fi → *Turn On Wi-Fi Hotspot*) or
+  use a phone hotspot, and join the Pi to it once (`sudo nmcli dev wifi connect <name> password <password>`
+  over SSH). Then the Pi and laptop find each other indoors and outdoors, with no home router needed.
 
 ---
 
-## 📡 1. Raspberry Pi (Hardware Interface)
-Run these on the **Raspberry Pi over SSH** — NOT on the laptop.
+## 🔧 2. One-Time Setup: Raspberry Pi 5
 
-**Terminal 1 (Start the LiDAR):**
+Over SSH on the Pi:
+
 ```bash
-export ROS_DOMAIN_ID=42
-export ROS_LOCALHOST_ONLY=0
+# Code
+cd ~/wearable_ws/src && git pull
+source /opt/ros/jazzy/setup.bash
 cd ~/wearable_ws
-source install/setup.bash
-sudo chmod 666 /dev/ttyUSB0
-ros2 launch visionnav pi_sensors.launch.py        # also starts the push buttons (see below); buttons:=false to skip
-```
+colcon build --symlink-install --packages-select visionnav
 
-**Terminal 2 (Start the Camera):**
-*(Pull the repo and build the workspace on the Pi first (step 0). It stays quiet while the camera is healthy
-and warns only if the camera drops below 10 fps (`CAMERA_SLOW_FPS`); add `--ros-args --log-level debug` to
-see the rate every 5 s. A low "camera" rate means the webcam is slow, often from auto-exposure in dim light.
-If "published" is high but the laptop gets fewer frames, it's Wi-Fi loss; try `CAMERA_JPEG_QUALITY=70`.)*
-```bash
-export ROS_DOMAIN_ID=42
-export ROS_LOCALHOST_ONLY=0
-cd ~/wearable_ws
-source install/setup.bash
-ros2 run visionnav phone_camera_publisher
-```
+# GPIO library for the buttons (Raspberry Pi OS: already installed; Ubuntu 24.04:)
+sudo apt install -y python3-gpiozero python3-lgpio
 
----
-
-## 💻 2. Laptop (AI & SLAM Brain)
-Run these **locally on your laptop** (MSI Sword 15).
-
-**Terminal 3 (Start Localization - Choose ONE):**
-*(Note: `LIBGL_ALWAYS_SOFTWARE=1` is required to fix the RViz Map OpenGL bug)*
-
-*Option A: Indoor SLAM (Cartographer — default)*
-```bash
-export ROS_DOMAIN_ID=42
-export ROS_LOCALHOST_ONLY=0
-export LIBGL_ALWAYS_SOFTWARE=1
-cd ~/wearable_ws
-source install/setup.bash
-ros2 launch visionnav laptop_brain.launch.py
-# Pass your measured rig geometry, e.g.:
-# ros2 launch visionnav laptop_brain.launch.py camera_height:=1.32 camera_pitch_deg:=12 lidar_height:=1.18
-```
-This starts the sensor TFs (`sensor_tf.launch.py`), the body filter (`/scan` → `/scan_filtered`,
-removes your own torso/arms from the LiDAR), Cartographer and RViz.
-It also starts the `wall_structure_mapper` node, which turns the walls in the SLAM map into 3D blocks in RViz
-(**Walls & Structure** display, `/structure_markers`): segments 0.6 m or longer become 2.4 m walls, and
-shorter pieces become 1.3 m obstacle blocks. A detected **door** is cut out of the wall (and made passable
-for Nav2), so routes can go through it; stairs and holes in the floor are kept out of routes with a wide margin. Walls grow longer as you walk around and the LiDAR sees more.
-
-**Remembering the home (saved maps).** The first time, the brain *maps*: walk through every room and
-finish somewhere you have already been, then say or type **`save map`** in the navigation assistant
-(Terminal 5). That saves the map, the objects seen reliably, and your named places in `~/.visionnav/maps/`
-(`home.pbstream`, `home_objects.json`, `home_places.json`). From then on the same command starts in
-**localization** mode: Cartographer loads the saved map and finds you in it (walk a few metres after
-starting), the remembered objects are on the map at once ("go to light switch" works before the camera has
-seen it again), and the map no longer grows or drifts. Options: `map:=office` for another building,
-`localize:=false` to map again from scratch. (The last minute of a mapping walk is not yet usable for
-finding you, which is why the walk should end somewhere already covered.)
-
-*Option B: SLAM Toolbox (legacy)* — `ros2 launch visionnav laptop_brain.launch.py slam:=slam_toolbox`.
-SLAM Toolbox only adds a scan after wheel odometry reports motion; the wearable has none, so the map
-freezes while you walk. Use Cartographer on the wearable.
-
-*Option C: GPS + LiDAR Fusion (Outdoor Mode)*
-```bash
-export ROS_DOMAIN_ID=42
-export ROS_LOCALHOST_ONLY=0
-cd ~/wearable_ws
-source install/setup.bash
-ros2 run nmea_navsat_driver nmea_serial_driver --ros-args -p port:=/dev/ttyACM0 -p baud:=9600
-ros2 launch visionnav gps_localization.launch.py
-```
-
-**Terminal 4 (Start the Vision AI):**
-*(Note: `WEARABLE_CAMERA_MODE=ros` forces the AI to listen to the Pi's Wi-Fi camera stream.
-The first start after the vocabulary changes builds the TensorRT engine (about 2 minutes): the camera window
-opens only when it is done, so leave the terminal open. The log must say `YOLO device: CUDA fp16 (TensorRT)`;
-`YOLO device: CPU` means the NVIDIA driver is not loaded, e.g. after a kernel update — install the matching
-`linux-modules-nvidia-595-open-$(uname -r)` package and reboot.)*
-```bash
-export ROS_DOMAIN_ID=42
-export ROS_LOCALHOST_ONLY=0
-export WEARABLE_CAMERA_MODE=ros
-cd ~/wearable_ws
-source install/setup.bash
-# For standard indoor mode:
-ros2 run visionnav object_perception
-
-# For outdoor mode (longer tracking timeouts):
-WEARABLE_MODE=outdoor ros2 run visionnav object_perception
-```
-
-**Terminal 5 (Start the Navigation Assistant):**
-*(Use this terminal to type commands like `find chair` and `go to chair_1`)*
-```bash
-export ROS_DOMAIN_ID=42
-export ROS_LOCALHOST_ONLY=0
-cd ~/wearable_ws
-source install/setup.bash
-ros2 run visionnav voice_navigation_assistant
-# Voice/keyboard assistant. "go to chair" is routed by Nav2 (Theta* + smoother, started by
-# laptop_brain.launch.py) with spoken turn-by-turn guidance; falls back to the built-in A* if
-# Nav2 is not running (force with WEARABLE_NAV_BACKEND=astar).
-# Any class the vision node detects can be a goal, e.g. "go to light switch", "go to door".
-# Describe objects the way you know them — IDs like table_2 are never needed or spoken, and neither are
-# colours (all distances are in feet):
-#   "find the table where the cup is"   "go to the chair next to the door"   "go to the chair in the kitchen"
-#   "where is the cup on the table"   "go to the nearest chair"   "what is on the table"   "what is around me"
-# Answers say what tells the object apart and where it is from you ("The table, with the cup on it,
-# 7 feet away, at 1 o'clock"). Several matches: "go to the chair" goes to the nearest ("There are 3 chairs.
-# Taking you to the nearest one ..."); say "another one" for the next, or "list them".
-# Name things yourself once you are at them: "call this my chair" — then "go to my chair" works in every
-# session (saved per map in ~/.visionnav/maps/<map>_names.json; "forget name my chair" to remove it).
-# "in the kitchen" uses your saved places. A helper may still say a colour ("the red cup"); set
-# WEARABLE_SPEAK_COLORS=1 for a partially sighted user to also hear colours.
-# Saved maps and places: "save map", "save this place as kitchen" (or "mark kitchen"),
-# "go to kitchen", "where am i", "forget place kitchen".
-# Grasp mode: "grasp cup" (also "grab", "pick up", "reach for"), and automatically on arrival at an
-# object: the camera locks onto the object, tracks your hand, and speaks "Right 4 inches",
-# "Lower 2 inches", "Forward 6 inches" ... until "Stop. The cup is at your hand."
-
-
-# (If Outdoors) Start the GPS Macro-Navigator in background
-# ros2 run visionnav gps_voice_navigator &
-```
-
-**Terminal 6 (Start the Qwen3-VL Scene Describer):**
-*(Type any question — "what colour is the door?", "is there a light switch?", "can I walk straight
-ahead?" — or just press Enter for a description. Answers take ~0.3–2.5 s and are spoken aloud.)*
-Qwen3-VL 2B instruct is the system's only VLM. One-time: `ollama pull qwen3-vl:2b-instruct`
-(the plain `qwen3-vl:2b` tag is the *thinking* variant that gave empty answers; it and moondream were removed).
-```bash
-export ROS_DOMAIN_ID=42
-export ROS_LOCALHOST_ONLY=0
-cd ~/wearable_ws
-source install/setup.bash
-ros2 run visionnav scene_describer
-```
-
----
-
-## 🔘 Push Buttons on the Raspberry Pi 5
-
-Four buttons let the wearer use everything without a keyboard. `pi_button_panel` (on the Pi, started by
-`pi_sensors.launch.py`) reads them and publishes `/button_event`; the navigation assistant (Terminal 5, laptop)
-does the work and speaks the result, and the scene describer (Terminal 6) answers camera questions.
-
-| Button | GPIO (BCM) | Header pin | Tap | Hold |
-|--------|-----------|------------|-----|------|
-| **LOOK** | GPIO17 | pin 11 | Describe what is in front of me (Qwen3-VL) | Ask the camera a question: beep, speak while holding, release |
-| **MODE** | GPIO27 | pin 13 | Switch indoor ↔ outdoor (spoken) | Status: mode, map, how many objects, what is around |
-| **HAND** | GPIO22 | pin 15 | Guide my hand to the object found last (or the nearest one ahead); walks there first if it is more than 1 m away. Tap again to stop | — |
-| **TALK** | GPIO23 | pin 16 | **STOP** everything (speech, walking guidance, hand guidance) | Voice command: beep, speak while holding, release ("find the table with the cup", "go to my chair", "call this my chair") |
-| GND (shared) | — | pin 14 (also 9, 20, 25) | | |
-
-Double-tap **TALK**: "what is around me". A hold is 0.6 s; a double tap is two taps within 0.4 s.
-
-**Parts:** 4 momentary, normally-open push buttons (12 mm tactile or 16-19 mm panel buttons; give each a
-different shape or 1-4 raised dots so they can be told apart by touch), 5 female-to-female jumper wires (or
-female Dupont wires soldered to the buttons), heat-shrink. No resistors: the Pi's internal pull-ups are used.
-
-**Wiring** (Pi switched off). Every button has two sides: one goes to its GPIO pin, the other to GND.
-```
- Pi 5 header (USB ports pointing down, pin 1 top-left)      Buttons
-   pin 11  GPIO17 ─────────────────────────────── LOOK ──┐
-   pin 13  GPIO27 ─────────────────────────────── MODE ──┤
-   pin 15  GPIO22 ─────────────────────────────── HAND ──┤
-   pin 16  GPIO23 ─────────────────────────────── TALK ──┤
-   pin 14  GND    ───────────────────────────────────────┘ (one wire, daisy-chained to the 2nd leg of all four)
-```
-* 4-leg tactile buttons: the two legs on each **long** side are joined inside. Use two **diagonally opposite**
-  legs — they are always on different sides of the switch.
-* Never connect a button to 5 V (pins 2, 4) or 3.3 V (pins 1, 17): the GPIO pins take 3.3 V at most, and a
-  button to a power pin would short it when pressed.
-* The pins avoid I2C (GPIO2/3), UART (GPIO14/15) and SPI, so they stay free for other hardware.
-* Other pins: `ros2 launch visionnav pi_sensors.launch.py` uses the defaults; to change them run the node alone,
-  e.g. `ros2 run visionnav pi_button_panel --ros-args -p look_pin:=5 -p talk_pin:=6`.
-
-**Software on the Pi** (once): gpiozero with the lgpio backend (`RPi.GPIO` does not work on the Pi 5).
-```bash
-# Raspberry Pi OS: already installed.  Ubuntu 24.04:
-sudo apt install python3-gpiozero python3-lgpio
-ls -l /dev/gpiochip*        # your user needs read/write access; if it is root-only:
+# Permissions: LiDAR serial port (dialout) and GPIO pins
+sudo usermod -aG dialout $USER
+ls -l /dev/gpiochip*        # if these are root-only (crw------- root root):
 sudo groupadd -f gpio && sudo usermod -aG gpio $USER
 echo 'SUBSYSTEM=="gpio", KERNEL=="gpiochip*", GROUP="gpio", MODE="0660"' | sudo tee /etc/udev/rules.d/99-gpio.rules
-sudo udevadm control --reload && sudo udevadm trigger     # then log out and back in
-cd ~/wearable_ws && git pull && colcon build --symlink-install --packages-select visionnav
+
+# Start the button program at every boot
+sudo tee /etc/systemd/system/visionnav-buttons.service > /dev/null <<EOF
+[Unit]
+Description=VisionNav push buttons (and the LiDAR and camera they switch on)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=$USER
+Environment=ROS_DOMAIN_ID=42
+Environment=ROS_LOCALHOST_ONLY=0
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source $HOME/wearable_ws/install/setup.bash && exec ros2 run visionnav pi_button_panel'
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable visionnav-buttons
+sudo reboot
 ```
 
-**Test** (Pi, Terminal 1 running): `ros2 topic echo /button_event` in another Pi terminal and press each
-button — you should see `LOOK tap`, `TALK hold_start` / `hold_end`, etc. in the launch log and the echo. Without
-the Pi, button events can be simulated from the laptop:
-`ros2 topic pub --once /button_event std_msgs/msg/String "{data: '{\"button\": \"look\", \"event\": \"tap\"}'}"`.
+After the reboot:
 
-**Voice (TALK / LOOK hold):** the laptop microphone records while the button is held, and Whisper (offline,
-`tiny.en`, cached in `~/.cache/huggingface`) turns it into text in about 0.3-0.6 s. Wait for the beep, then
-speak. Saying "stop" only stops; "exit" shuts the assistant down. For more accuracy in noise:
-`WEARABLE_WHISPER_MODEL=base.en` (downloaded once, needs internet the first time).
-
----
-
-## 📐 Calibrating the Chest Rig (do once, repeat if the mount changes)
-All 3D accuracy depends on the sensor mount values in `sensor_tf.launch.py`. Both SLAM and the
-vision node read them from TF, so there is one place to fix them.
-
-0. **LiDAR direction (most important).** If the map moves the wrong way (walking backward shows as
-   walking forward, or turning left shows as turning right), the LiDAR mounting is wrong. With the Pi
-   LiDAR running, wear the rig and run `ros2 run visionnav lidar_orientation_calibrator`. Then follow
-   the prompts: stand still, walk ~1 m forward, turn left ~90°. It prints the `lidar_yaw_deg` /
-   `lidar_roll_deg` to use. The current default (188°, upright) was measured from camera depth plus
-   your report that backward showed as forward. Confirm it with this walk. RViz's **Your Tracked Path**
-   display shows where SLAM thinks you have been, so a wrong direction is easy to spot.
-1. **Measure** the camera lens height, the LiDAR height and the camera's downward tilt, and pass
-   them as launch arguments (see Option A). A camera tilted 10° that is configured as 0° puts a
-   floor object 3 m away about 2.5 m too far.
-2. **Check the LiDAR overlay:** with the vision node running, press **`l`** in the camera window.
-   The dots are the LiDAR returns drawn where the TF says they are (red = near, blue = far).
-   * The dots should sit on walls, door frames and people's torsos at about chest height.
-   * Dots on the **wrong side** of the image (mirrored): use `lidar_roll_deg:=180` (LiDAR upside down).
-   * The camera picture itself is mirrored: the Pi stream is flipped back by default in ROS mode;
-     set `WEARABLE_CAMERA_FLIP=0` (or `=1` in direct USB mode) for a camera that is not mirrored.
-   * Dots **rotated / shifted sideways**: re-run `lidar_orientation_calibrator` (step 0).
-   * Dots consistently **too high or low**: fix `camera_pitch_deg` / heights.
-3. Every label shows the distance from you, how it was measured (`LiDAR`, `depth` or `cam`), the
-   object's real height, and the surface height for objects on a table. RViz labels show the same,
-   with the distance updated live as you walk.
-4. The indoor map is a **persistent global object map** for the whole session by default. An object
-   seen reliably (15+ sightings over 1 s or more, detected in at least 60 % of the frames the camera was
-   looking at it, with a mean score of 0.40 or more, measured within 6 m, and — while metric depth runs —
-   ranged by LiDAR or depth at least 5 times) stays on the map for as long as the session runs,
-   drawn translucent with `seen:Ns-ago` while out of view. When you look back at it, it is matched to
-   the same object (same name and ID), not duplicated — walking backward or turning also works, as
-   long as the LiDAR direction is calibrated (see **Calibrating the Chest Rig** above). Set
-   `WEARABLE_MEMORY_S=8` (seconds) to go back to the old real-time-only behaviour instead.
-   Walking around the room, a remembered object is **not** removed just because it is not detected from
-   a new angle (the back of a chair). When it is **taken away**, it disappears from the map within about
-   1-2 s once the camera looks at its spot from a direction it was seen from before, within 4 m and with
-   nothing (and nobody) in front of it: after 0.7 s if the depth shows the background behind its spot,
-   otherwise after 2 s of not being detected there (longer for objects whose detection normally flickers,
-   such as an open doorway). Log: `Removed <object> from the map: ...`. If SLAM or the depth estimate shifts it (e.g. a loop closure),
-   the object seen next to its old spot is merged into it and keeps its ID (log: `re-found … keeping its ID`).
-   Objects are also tracked in the image: a detection whose box overlaps the box an object had a moment ago
-   is that object even if its distance estimate jumped, so a noisy distance never creates a second copy.
-   Doors, windows, switches and other things in a wall are drawn in RViz as thin panels along the wall
-   (direction fitted to the LiDAR), not as blocks. The detector also has "negative prompts" (`NEGATIVE_PROMPTS`:
-   floor, door threshold, …) that absorb look-alike false detections such as a step at a doorway threshold.
-   Misdetections are filtered by their **detection rate**: an object must be detected in at least half
-   the frames in which the camera looks at its spot before it is shown at all, so a flickering
-   hallucination never appears in the camera view or on the map. The map holds at most 200 remembered
-   objects; past that, the ones not seen for the longest are dropped first.
-   Each object has its own colour, shared by its 3D shape, its label and the line joining them. People
-   and other moving objects are shown only while detected. They are tracked frame to frame by their image box
-   (two people side by side keep their own IDs), ranged by the LiDAR on their torso, and — when the LiDAR
-   misses them — by metric depth corrected with that person's own LiDAR/depth ratio. Speed ("MOVING 0.8m/s")
-   is reported after half a second of tracking. The camera window shows the frame the boxes were computed on,
-   so boxes stay on moving people. The marker array is also published on
-   `/vision_markers` (identical to `/semantic_markers`) for other tooling.
-
-**Metric depth:** the vision node also runs Depth Anything V2 (indoor, weights in
-`models/depth_anything_v2_metric_indoor_vits.pth`). It gives a real distance to every object, including
-ones below the LiDAR plane (chairs, tables, desk items). Its scale is corrected against the LiDAR every
-frame; the log prints `Depth calibrated by LiDAR: scale …` every 10 s. Disable with `WEARABLE_MONO_DEPTH=0`,
-and trade accuracy for speed with `WEARABLE_DEPTH_SIZE` (default 392, must be a multiple of 14).
-
-**Wrong object distance?** Start the vision node with `WEARABLE_LIDAR_SNAP_DEBUG=1`. Once a second per
-object class it logs whether the LiDAR anchored the object (`reason: snap` / `row`) or why not (for
-example `snap_too_few_pts`: no LiDAR return near the camera's estimate in that object's columns).
-
-Optional: for a calibrated camera, set `WEARABLE_CAMERA_FX/FY/CX/CY` (pixels) instead of relying on
-`WEARABLE_CAMERA_HFOV_DEG` (default 70°).
+* `systemctl status visionnav-buttons` shows it running; `journalctl -u visionnav-buttons -f` shows its log
+  (`Buttons ready: SENSORS=GPIO24, LOOK=GPIO17, …`, and every press).
+* To have the LiDAR and camera on at boot without pressing SENSORS, change the `ExecStart` line to end in
+  `ros2 run visionnav pi_button_panel --ros-args -p sensors_at_start:=true`, then
+  `sudo systemctl daemon-reload && sudo systemctl restart visionnav-buttons`.
+* After `git pull` + `colcon build` on the Pi: `sudo systemctl restart visionnav-buttons`.
 
 ---
 
-## 🔧 Troubleshooting
+## 🔘 3. Push Buttons: Wiring
 
-| Error | Cause | Fix |
-|-------|-------|-----|
-| `cannot access '/dev/ttyUSB0'` | LiDAR not connected or wrong machine | Run `pi_sensors.launch.py` on the **Pi**, not the laptop |
-| `error code: 80008004` | LiDAR serial port unavailable | Check USB cable and run `sudo chmod 666 /dev/ttyUSB0` on the Pi |
-| `numpy.core.multiarray failed` | A pip install pulled NumPy 2 into `~/.local` (ROS Jazzy, cv_bridge and matplotlib need the system NumPy 1.26) | `python3 -m pip uninstall --break-system-packages numpy scipy` (removes only the `~/.local` copies) |
-| `Package 'wearable_sim' not found` | Old package name | The package is now `visionnav`: rebuild as in step 0 and use `ros2 run visionnav <node>` (no `.py`) |
-| Scene describer gives empty or cut-off answers | A *thinking* model (`qwen3-vl:2b`) spends its tokens on hidden reasoning | The describer uses only `qwen3-vl:2b-instruct` (`ollama pull qwen3-vl:2b-instruct`) |
-| Bounding boxes too large on map | Depth estimation overshoot | Already fixed — per-category size clamping applied |
-| Markers in the wrong place / on the wrong side | Sensor mount TF does not match the rig | Follow **Calibrating the Chest Rig** above (press `l` for the LiDAR overlay) |
-| Map smears or stops updating while walking | SLAM Toolbox without odometry, or body hits in the scan | Use the default Cartographer backend (body filter is included) |
+| Button | GPIO (BCM) | Header pin | Main job |
+|--------|-----------|------------|----------|
+| **SENSORS** | GPIO24 | pin 18 | LiDAR + camera on / off / restart |
+| **LOOK** | GPIO17 | pin 11 | Vision AI: describe / ask / off |
+| **MODE** | GPIO27 | pin 13 | Indoor ↔ outdoor, status |
+| **HAND** | GPIO22 | pin 15 | Hand guidance to an object |
+| **TALK** | GPIO23 | pin 16 | STOP / voice command / what is around me |
+| GND (shared) | — | pin 14 (also 9, 20, 25) | Second leg of every button |
+
+**Parts:** 5 momentary, normally-open push buttons (12 mm tactile or 16–19 mm panel buttons; give each a
+different shape or 1–5 raised dots so they can be told apart by touch), 6 female jumper wires (or Dupont wires
+soldered to the buttons), heat-shrink. No resistors: the Pi's internal pull-ups are used.
+
+**Wiring** (Pi switched off). Each button has two sides: one goes to its GPIO pin, the other to GND.
+```
+   pin 18  GPIO24 ─────────────── SENSORS ──┐
+   pin 11  GPIO17 ─────────────── LOOK ─────┤
+   pin 13  GPIO27 ─────────────── MODE ─────┤
+   pin 15  GPIO22 ─────────────── HAND ─────┤
+   pin 16  GPIO23 ─────────────── TALK ─────┤
+   pin 14  GND    ──────────────────────────┘ (one wire, daisy-chained to the 2nd leg of every button)
+```
+
+**Finding the pins.** Pin 1 is the header pin nearest the corner **farthest from the USB/Ethernet ports**, on
+the side **toward the middle of the board**. The header is 20 rows of 2 pins; row 1 is at that end. In each row
+the pin toward the middle of the board is odd (1, 3, 5 …), the pin at the board edge is even (2, 4, 6 …).
+With the USB ports pointing **up** (header on the left edge), count rows from the **bottom**:
+
+```
+          board edge (even)      middle of board (odd)
+ row 10 → pin 20  (GND)          pin 19
+ row 9  → pin 18  SENSORS        pin 17  3.3V ✗   ← do not confuse with pin 18
+ row 8  → pin 16  TALK           pin 15  HAND
+ row 7  → pin 14  GND            pin 13  MODE
+ row 6  → pin 12  (unused)       pin 11  LOOK
+ row 5  → pin 10                 pin 9   (GND)
+ row 4  → pin 8                  pin 7
+ row 3  → pin 6   (GND)          pin 5
+ row 2  → pin 4   5V  ✗          pin 3
+ row 1  → pin 2   5V  ✗          pin 1   3.3V ✗    ← next to the mounting hole
+```
+
+* 4-leg tactile buttons: the two legs on each **long** side are joined inside. Use two **diagonally opposite** legs.
+* Never connect a button to 5 V (pins 2, 4) or 3.3 V (pins 1, 17): a button to a power pin shorts it when pressed.
+* `pinout` on the Pi prints the header for your board.
+* Other pins: add e.g. `-p look_pin:=5` to the service's `ros2 run` line.
+
+**Test each button.** With the service stopped (`sudo systemctl stop visionnav-buttons`), this prints the name
+of every button pressed (Ctrl+C to quit, then `sudo systemctl start visionnav-buttons`):
+```bash
+python3 -c "
+from gpiozero import Button; from signal import pause
+b = {n: Button(p) for n, p in dict(SENSORS=24, LOOK=17, MODE=27, HAND=22, TALK=23).items()}
+for n, v in b.items(): v.when_pressed = lambda n=n: print(n, 'pressed')
+print('Press the buttons (Ctrl+C to quit)'); pause()"
+```
+With the service running: `ros2 topic echo /button_event` (on either computer, `ROS_DOMAIN_ID=42`) shows every
+press, e.g. `{"button": "look", "event": "tap"}`.
+
+---
+
+## 🗺️ 4. Saved Maps (remembering the home)
+
+* **First time: mapping.** With no saved map, indoor mode *maps*. Walk through every room, finish somewhere you
+  have already been, then say **"save map"**. That saves the map, the objects seen reliably, your places and
+  your names in `~/.visionnav/maps/` (`home.pbstream`, `home_objects.json`, `home_places.json`,
+  `home_names.json`). The last minute of a mapping walk is not yet usable for finding you, which is why the walk
+  should end somewhere already covered.
+* **From then on: localization.** Indoor mode loads the saved map and finds you in it (walk a few metres after
+  starting). Remembered objects are on the map at once ("go to light switch" works before the camera has seen it
+  again), and the map no longer grows or drifts.
+* **Another building / map again:** `WEARABLE_BRAIN_ARGS="map:=office"`, or `"localize:=false"` to map from scratch.
+
+**What the object map does:** an object seen reliably stays on the map, drawn translucent while out of view,
+and keeps its name and ID when seen again from another side — it is not forgotten because the back of a chair
+looks different. When an object is **taken away**, it disappears 1–2 s after the camera looks at its spot from a
+direction it was seen from before (log: `Removed <object> from the map`). Flickering misdetections are never
+shown; doors, windows and switches are drawn as thin panels along their wall; people are shown only while
+detected, with their own IDs and speed.
+
+---
+
+## 📐 5. Calibrating the Chest Rig (once, and whenever the mount changes)
+
+All 3D accuracy depends on where the camera and LiDAR sit on the rig. Both the map and the camera AI read it from
+TF (`sensor_tf.launch.py`), so there is one place to fix it.
+
+1. **LiDAR direction (most important).** If the map moves the wrong way (walking backward shows as walking
+   forward, or turning left as turning right), the LiDAR mounting is wrong. With the sensors on, wear the rig and
+   run `ros2 run visionnav lidar_orientation_calibrator` on the laptop; stand still, walk ~1 m forward, turn left
+   ~90° as prompted. It prints the `lidar_yaw_deg` / `lidar_roll_deg` to use. RViz's **Your Tracked Path** shows
+   where the map thinks you have been.
+2. **Measure** the camera lens height, the LiDAR height and the camera's downward tilt, and set them before
+   starting the assistant:
+   `export WEARABLE_BRAIN_ARGS="camera_height:=1.32 camera_pitch_deg:=12 lidar_height:=1.18 lidar_yaw_deg:=188"`.
+   A camera tilted 10° but configured as 0° puts a floor object 3 m away about 2.5 m too far.
+3. **Check the LiDAR overlay:** press **`l`** in the camera window. The dots are the LiDAR returns drawn where TF
+   says they are (red = near, blue = far). They should sit on walls, door frames and people's torsos at chest
+   height. Mirrored: `lidar_roll_deg:=180`. Rotated or shifted sideways: repeat step 1. Too high or low: fix
+   `camera_pitch_deg` / the heights. A mirrored camera picture: `WEARABLE_CAMERA_FLIP=0`/`1`.
+
+Every label in the camera window shows the distance, how it was measured (`LiDAR`, `depth` or `cam`), the
+object's real height and, for objects on a table, the surface height.
+
+---
+
+## 🛠️ 6. Manual Start (debugging)
+
+To run parts yourself (for example to watch their output), start the assistant with `WEARABLE_AUTOSTART=0`, or
+start a part in its own terminal before the assistant — the assistant then uses it instead of starting its own.
+Every terminal needs `export ROS_DOMAIN_ID=42 ROS_LOCALHOST_ONLY=0` and `source ~/wearable_ws/install/setup.bash`.
+
+```bash
+# Pi — LiDAR + camera (the same as pressing SENSORS; the button service may keep running)
+ros2 launch visionnav pi_sensors.launch.py                 # camera:=false for the LiDAR only
+# Laptop — indoor map (TFs, Cartographer, Nav2, walls, RViz)
+LIBGL_ALWAYS_SOFTWARE=1 ros2 launch visionnav laptop_brain.launch.py
+# Laptop — camera AI
+WEARABLE_CAMERA_MODE=ros ros2 run visionnav object_perception
+# Laptop — vision AI (type questions in its terminal)
+ros2 run visionnav scene_describer
+# Laptop — outdoor GPS
+ros2 run nmea_navsat_driver nmea_serial_driver --ros-args -p port:=/dev/ttyACM0 -p baud:=9600
+ros2 launch visionnav gps_localization.launch.py
+ros2 run visionnav gps_voice_navigator
+```
+
+---
+
+## ❓ Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| "Waiting for the Pi…" / "The Pi is not answering" | Pi off, not booted yet, on another Wi-Fi, or another `ROS_DOMAIN_ID` | Switch it on and wait ~30 s; put both on the same network (section 1, hotspot); the button service sets `ROS_DOMAIN_ID=42` |
+| No button does anything | Button service not running, wrong pin, or no GPIO permission | Pi: `systemctl status visionnav-buttons`, `journalctl -u visionnav-buttons -f` (must say `Buttons ready`); test the wiring (section 3) |
+| Presses show in `ros2 topic echo /button_event` but nothing is said | The assistant is not running, or in another `ROS_DOMAIN_ID` | Start the assistant with `ROS_DOMAIN_ID=42` |
+| Camera window shows "Waiting for camera feed…" / "The camera is not running" | LiDAR and camera not switched on | Press **SENSORS**; if it says they could not start, check the USB cables and `~/.visionnav/logs/pi_sensors.log` on the Pi |
+| "The camera and LiDAR could not start" | LiDAR not on `/dev/ttyUSB0`, no `dialout` permission, or camera unplugged | Check cables; `sudo usermod -aG dialout $USER` and reboot the Pi |
+| `error code: 80008004` in `pi_sensors.log` | LiDAR serial port unavailable | Check the LiDAR USB cable; `ls -l /dev/ttyUSB0` |
+| "The vision AI could not start" | Ollama not running or the model missing | `ollama list` must show `qwen3-vl:2b-instruct`; see `~/.visionnav/logs/vision_ai.log` |
+| "… did not start" after a mode switch | That program failed | Read `~/.visionnav/logs/<part>.log` |
+| `YOLO device: CPU` in `perception.log` | NVIDIA driver not loaded | `sudo apt install linux-modules-nvidia-595-open-$(uname -r)` and reboot |
+| `numpy.core.multiarray failed` | A pip install pulled NumPy 2 into `~/.local` | `python3 -m pip uninstall --break-system-packages numpy scipy` (removes only the `~/.local` copies) |
+| Markers in the wrong place / on the wrong side | Rig geometry in TF does not match the rig | Section 5 (press `l` for the LiDAR overlay) |
+| Wrong distance to an object | LiDAR not anchoring it | Start the camera AI by hand with `WEARABLE_LIDAR_SNAP_DEBUG=1` (section 6): once a second per class it logs whether the LiDAR anchored the object and why not |

@@ -914,6 +914,7 @@ class ObjectPerceptionNode(Node):
 
         cv2.setNumThreads(1)
         self._window_name = f"VisionNav AI [{self._mode.upper()}]"
+        self._window_rename = None  # set by a mode switch; applied by the GUI thread
 
         # Auto-detect headless environment
         has_display = "DISPLAY" in os.environ or "WAYLAND_DISPLAY" in os.environ
@@ -1130,16 +1131,10 @@ class ObjectPerceptionNode(Node):
             with self._hud_lock:
                 self._hud_tracks.clear()
 
-            # Update window title
+            # New window title: the window is replaced by the GUI (main) thread. Qt windows may only be touched
+            # from that thread; doing it here, in a ROS callback, crashed the node on every mode switch.
             if self._show_window:
-                try:
-                    cv2.destroyWindow(self._window_name)
-                except Exception:
-                    pass
-
-                self._window_name = f"VisionNav AI [{self._mode.upper()}]"
-                cv2.namedWindow(self._window_name, cv2.WINDOW_NORMAL)
-                cv2.resizeWindow(self._window_name, 800, 600)
+                self._window_rename = f"VisionNav AI [{self._mode.upper()}]"
 
             self.get_logger().info(f"🔄 Mode switched: {old_mode.upper()} → {new_mode.upper()}")
         if new_mode in MODE_PARAMS:
@@ -3438,6 +3433,14 @@ def main(args=None) -> None:
             while rclpy.ok():
                 # The frame the boxes were computed on, so they sit exactly on moving people (the newest
                 # camera frame is ~50 ms ahead of them); the raw feed only when processing stalls
+                if node._window_rename:
+                    try:
+                        cv2.destroyWindow(node._window_name)
+                    except Exception:
+                        pass
+                    node._window_name, node._window_rename = node._window_rename, None
+                    cv2.namedWindow(node._window_name, cv2.WINDOW_NORMAL)
+                    cv2.resizeWindow(node._window_name, 800, 600)
                 frame = node._gui_frame
                 hud_frame = node._hud_frame
                 if hud_frame is not None and time.monotonic() - hud_frame[1] < HUD_SYNC_MAX_AGE:
