@@ -8,6 +8,13 @@
 # the LiDAR and camera. Nothing else has to be typed on the Pi afterwards.
 set -e
 WS="$HOME/wearable_ws"
+
+# Only on the Raspberry Pi: on the laptop it would install a second, button-less panel that confuses the real one
+if ! grep -qi "raspberry pi" /proc/device-tree/model 2>/dev/null; then
+    echo "This is not the Raspberry Pi ($(hostname)). Log in to the Pi first, then run this script there:"
+    echo "    ssh pi@raspberrypi.local"
+    exit 1
+fi
 PINS="SENSORS=24 LOOK=17 MODE=27 HAND=22 TALK=23"
 
 if [ "$1" = "test" ]; then
