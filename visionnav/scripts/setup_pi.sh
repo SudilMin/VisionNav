@@ -63,6 +63,10 @@ Wants=network-online.target
 
 [Service]
 User=$USER
+# lgpio (the Pi 5 GPIO library) writes its notification files in the working directory: "/" is not writable,
+# and the buttons then fail to open while the program keeps running
+WorkingDirectory=$HOME
+Environment=LG_WD=/tmp
 Environment=ROS_DOMAIN_ID=42
 Environment=ROS_LOCALHOST_ONLY=0
 ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source $WS/install/setup.bash && exec ros2 run visionnav pi_button_panel'
@@ -82,7 +86,9 @@ systemctl --no-pager status visionnav-buttons | head -4
 echo "--- last log lines:"
 journalctl -u visionnav-buttons -n 12 --no-pager -o cat
 echo
-if journalctl -u visionnav-buttons -n 50 --no-pager -o cat | grep -q "Buttons ready"; then
+if journalctl -u visionnav-buttons -n 50 --no-pager -o cat | grep -q "unavailable"; then
+    echo "PROBLEM: some buttons could not be opened — see the 'unavailable' lines above."
+elif journalctl -u visionnav-buttons -n 50 --no-pager -o cat | grep -q "Buttons ready: SENSORS"; then
     echo "OK: the buttons are ready. Press SENSORS and watch:  journalctl -u visionnav-buttons -f"
 else
     echo "The button program is not ready yet — see the log above, or run:  journalctl -u visionnav-buttons -f"

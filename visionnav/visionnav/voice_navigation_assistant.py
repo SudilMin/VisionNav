@@ -256,6 +256,9 @@ class FindObjectNode(Node):
         self._sensor_ok = {}
         self._pi_sensors = None  # the Pi's SENSORS button state (pi_button_panel, latched)
         threading.Thread(target=self._system_watch, daemon=True).start()
+        self.create_subscription(String, '/pi_button_status', self._pi_button_status_callback,
+                                 QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                                            durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.create_subscription(String, '/pi_sensors_state', self._pi_sensors_callback,
                                  QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                                             durability=DurabilityPolicy.TRANSIENT_LOCAL))
@@ -481,6 +484,15 @@ class FindObjectNode(Node):
         what = " and the ".join(missing)
         return (f"The {what} {'is' if len(missing) == 1 else 'are'} not running. "
                 f"Press the sensor button on the Pi to turn them on.")
+
+    def _pi_button_status_callback(self, msg: String):
+        """The Pi could not open some buttons (wiring, permissions): say which, instead of staying silent."""
+        if msg.data.startswith("failed"):
+            names = msg.data.split(":", 1)[1].split()
+            what = "all the buttons" if len(names) >= 5 else "the " + " and ".join(names) + " button" + (
+                "s" if len(names) > 1 else "")
+            threading.Thread(target=self.speak, args=(f"The Pi cannot read {what}. Run the setup script on the Pi "
+                                                      f"again, or check the wiring.",), daemon=True).start()
 
     def _pi_sensors_callback(self, msg: String):
         """SENSORS button on the Pi: say what the LiDAR and camera are doing."""

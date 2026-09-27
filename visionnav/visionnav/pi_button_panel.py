@@ -54,6 +54,10 @@ class ButtonPanel(Node):
         self._state_pub = self.create_publisher(
             String, "/pi_sensors_state",
             QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        # Whether the buttons could be opened (latched): the laptop says so aloud if they could not
+        self._status_pub = self.create_publisher(
+            String, "/pi_button_status",
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self._hold_s = float(self.declare_parameter("hold_time", HOLD_S).value)
         self._double_s = float(self.declare_parameter("double_tap_time", DOUBLE_TAP_S).value)
         sensors_at_start = bool(self.declare_parameter("sensors_at_start", False).value)
@@ -80,8 +84,13 @@ class ButtonPanel(Node):
             btn.when_held = lambda n=name: self._on_held(n)
             btn.when_released = lambda n=name: self._on_released(n)
             self._buttons[name] = btn
-        self.get_logger().info("Buttons ready: " + ", ".join(f"{n.upper()}=GPIO{pins[n]}" for n in self._buttons)
-                               + f" (hold {self._hold_s:.1f} s, double tap {self._double_s:.1f} s)")
+        missing = [n for n in BUTTONS if n not in self._buttons]
+        if self._buttons:
+            self.get_logger().info("Buttons ready: " + ", ".join(f"{n.upper()}=GPIO{pins[n]}" for n in self._buttons)
+                                   + f" (hold {self._hold_s:.1f} s, double tap {self._double_s:.1f} s)")
+        if missing:
+            self.get_logger().error(f"Buttons NOT working: {', '.join(m.upper() for m in missing)} (see the errors above)")
+        self._status_pub.publish(String(data="ok" if not missing else "failed: " + " ".join(missing)))
         if sensors_at_start:
             threading.Thread(target=self._sensors_on, daemon=True).start()
 
