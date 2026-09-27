@@ -157,55 +157,28 @@ To turn it off again: `rm ~/.config/autostart/visionnav.desktop`.
 
 ## 🔧 2. One-Time Setup: Raspberry Pi 5
 
-Over SSH on the Pi:
+From the laptop, log in to the Pi, then run the setup script **in the Pi's terminal** (type the lines one at a
+time; do not paste the `ssh` line again once you are logged in — that opens a second login and swallows
+everything pasted after it):
 
 ```bash
-# Code
-cd ~/wearable_ws/src && git pull
-source /opt/ros/jazzy/setup.bash
-cd ~/wearable_ws
-colcon build --symlink-install --packages-select visionnav
-
-# GPIO library for the buttons (Raspberry Pi OS: already installed; Ubuntu 24.04:)
-sudo apt install -y python3-gpiozero python3-lgpio
-
-# Permissions: LiDAR serial port (dialout) and GPIO pins
-sudo usermod -aG dialout $USER
-ls -l /dev/gpiochip*        # if these are root-only (crw------- root root):
-sudo groupadd -f gpio && sudo usermod -aG gpio $USER
-echo 'SUBSYSTEM=="gpio", KERNEL=="gpiochip*", GROUP="gpio", MODE="0660"' | sudo tee /etc/udev/rules.d/99-gpio.rules
-
-# Start the button program at every boot
-sudo tee /etc/systemd/system/visionnav-buttons.service > /dev/null <<EOF
-[Unit]
-Description=VisionNav push buttons (and the LiDAR and camera they switch on)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-User=$USER
-Environment=ROS_DOMAIN_ID=42
-Environment=ROS_LOCALHOST_ONLY=0
-ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source $HOME/wearable_ws/install/setup.bash && exec ros2 run visionnav pi_button_panel'
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-sudo systemctl daemon-reload
-sudo systemctl enable visionnav-buttons
-sudo reboot
+ssh pi@raspberrypi.local                                   # on the laptop (your Pi's user / address)
+cd ~/wearable_ws/src && git pull                           # on the Pi
+bash ~/wearable_ws/src/visionnav/scripts/setup_pi.sh       # on the Pi
 ```
 
-After the reboot:
+The script builds the package, installs the GPIO library, gives your user access to the LiDAR port and the GPIO
+pins, installs the **visionnav-buttons** boot service and starts it. It ends with `OK: the buttons are ready`.
+Run the same two Pi lines again after every update. Then `exit` — the Pi needs no terminal from now on.
 
-* `systemctl status visionnav-buttons` shows it running; `journalctl -u visionnav-buttons -f` shows its log
-  (`Buttons ready: SENSORS=GPIO24, LOOK=GPIO17, …`, and every press).
-* To have the LiDAR and camera on at boot without pressing SENSORS, change the `ExecStart` line to end in
-  `ros2 run visionnav pi_button_panel --ros-args -p sensors_at_start:=true`, then
-  `sudo systemctl daemon-reload && sudo systemctl restart visionnav-buttons`.
-* After `git pull` + `colcon build` on the Pi: `sudo systemctl restart visionnav-buttons`.
+* **Watch the buttons:** `journalctl -u visionnav-buttons -f` shows `Buttons ready: SENSORS=GPIO24, …` and every
+  press (`SENSORS tap`, `sensors: starting`, `sensors: on`). `systemctl status visionnav-buttons` shows whether
+  it runs.
+* **Check the wiring:** `bash ~/wearable_ws/src/visionnav/scripts/setup_pi.sh test` prints the name of every
+  button pressed (Ctrl+C to stop).
+* **LiDAR and camera on at every boot** (without pressing SENSORS):
+  `sudo sed -i 's/pi_button_panel$/pi_button_panel --ros-args -p sensors_at_start:=true/' /etc/systemd/system/visionnav-buttons.service`
+  then `sudo systemctl daemon-reload && sudo systemctl restart visionnav-buttons`.
 
 ---
 
@@ -256,17 +229,11 @@ With the USB ports pointing **up** (header on the left edge), count rows from th
 * 4-leg tactile buttons: the two legs on each **long** side are joined inside. Use two **diagonally opposite** legs.
 * Never connect a button to 5 V (pins 2, 4) or 3.3 V (pins 1, 17): a button to a power pin shorts it when pressed.
 * `pinout` on the Pi prints the header for your board.
-* Other pins: add e.g. `-p look_pin:=5` to the service's `ros2 run` line.
+* Other pins: add e.g. `--ros-args -p look_pin:=5` to the `ExecStart` line in
+  `/etc/systemd/system/visionnav-buttons.service`, then `sudo systemctl daemon-reload && sudo systemctl restart visionnav-buttons`.
 
-**Test each button.** With the service stopped (`sudo systemctl stop visionnav-buttons`), this prints the name
-of every button pressed (Ctrl+C to quit, then `sudo systemctl start visionnav-buttons`):
-```bash
-python3 -c "
-from gpiozero import Button; from signal import pause
-b = {n: Button(p) for n, p in dict(SENSORS=24, LOOK=17, MODE=27, HAND=22, TALK=23).items()}
-for n, v in b.items(): v.when_pressed = lambda n=n: print(n, 'pressed')
-print('Press the buttons (Ctrl+C to quit)'); pause()"
-```
+**Test each button:** `bash ~/wearable_ws/src/visionnav/scripts/setup_pi.sh test` on the Pi prints the name of
+every button pressed and released (Ctrl+C to stop; the button service is paused meanwhile).
 With the service running: `ros2 topic echo /button_event` (on either computer, `ROS_DOMAIN_ID=42`) shows every
 press, e.g. `{"button": "look", "event": "tap"}`.
 
