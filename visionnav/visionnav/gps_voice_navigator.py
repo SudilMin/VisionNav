@@ -67,7 +67,8 @@ class GPSNavNode(Node):
             guidance = "You have arrived at your destination."
             self._dest_lat = None # clear destination
         else:
-            guidance = f"Walk {direction} for {int(dist)} meters."
+            feet = dist * 3.28084  # spoken in feet, like all VisionNav guidance
+            guidance = f"Walk {direction} for {int(round(feet / 10.0)) * 10 if feet >= 100 else int(round(feet))} feet."
 
         self._guidance_pub.publish(String(data=guidance))
         self.get_logger().info(f"Guidance: {guidance}")

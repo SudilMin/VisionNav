@@ -52,7 +52,7 @@ export ROS_LOCALHOST_ONLY=0
 cd ~/wearable_ws
 source install/setup.bash
 sudo chmod 666 /dev/ttyUSB0
-ros2 launch visionnav pi_sensors.launch.py
+ros2 launch visionnav pi_sensors.launch.py        # also starts the push buttons (see below); buttons:=false to skip
 ```
 
 **Terminal 2 (Start the Camera):**
@@ -119,7 +119,11 @@ ros2 launch visionnav gps_localization.launch.py
 ```
 
 **Terminal 4 (Start the Vision AI):**
-*(Note: `WEARABLE_CAMERA_MODE=ros` forces the AI to listen to the Pi's Wi-Fi camera stream)*
+*(Note: `WEARABLE_CAMERA_MODE=ros` forces the AI to listen to the Pi's Wi-Fi camera stream.
+The first start after the vocabulary changes builds the TensorRT engine (about 2 minutes): the camera window
+opens only when it is done, so leave the terminal open. The log must say `YOLO device: CUDA fp16 (TensorRT)`;
+`YOLO device: CPU` means the NVIDIA driver is not loaded, e.g. after a kernel update — install the matching
+`linux-modules-nvidia-595-open-$(uname -r)` package and reboot.)*
 ```bash
 export ROS_DOMAIN_ID=42
 export ROS_LOCALHOST_ONLY=0
@@ -145,11 +149,22 @@ ros2 run visionnav voice_navigation_assistant
 # laptop_brain.launch.py) with spoken turn-by-turn guidance; falls back to the built-in A* if
 # Nav2 is not running (force with WEARABLE_NAV_BACKEND=astar).
 # Any class the vision node detects can be a goal, e.g. "go to light switch", "go to door".
+# Describe objects the way you know them — IDs like table_2 are never needed or spoken, and neither are
+# colours (all distances are in feet):
+#   "find the table where the cup is"   "go to the chair next to the door"   "go to the chair in the kitchen"
+#   "where is the cup on the table"   "go to the nearest chair"   "what is on the table"   "what is around me"
+# Answers say what tells the object apart and where it is from you ("The table, with the cup on it,
+# 7 feet away, at 1 o'clock"). Several matches: "go to the chair" goes to the nearest ("There are 3 chairs.
+# Taking you to the nearest one ..."); say "another one" for the next, or "list them".
+# Name things yourself once you are at them: "call this my chair" — then "go to my chair" works in every
+# session (saved per map in ~/.visionnav/maps/<map>_names.json; "forget name my chair" to remove it).
+# "in the kitchen" uses your saved places. A helper may still say a colour ("the red cup"); set
+# WEARABLE_SPEAK_COLORS=1 for a partially sighted user to also hear colours.
 # Saved maps and places: "save map", "save this place as kitchen" (or "mark kitchen"),
 # "go to kitchen", "where am i", "forget place kitchen".
 # Grasp mode: "grasp cup" (also "grab", "pick up", "reach for"), and automatically on arrival at an
-# object: the camera locks onto the object, tracks your hand, and speaks "Right 10 centimetres",
-# "Lower 5 centimetres", "Forward 15 centimetres" ... until "Stop. The cup is at your hand."
+# object: the camera locks onto the object, tracks your hand, and speaks "Right 4 inches",
+# "Lower 2 inches", "Forward 6 inches" ... until "Stop. The cup is at your hand."
 
 
 # (If Outdoors) Start the GPS Macro-Navigator in background
@@ -168,6 +183,66 @@ cd ~/wearable_ws
 source install/setup.bash
 ros2 run visionnav scene_describer
 ```
+
+---
+
+## 🔘 Push Buttons on the Raspberry Pi 5
+
+Four buttons let the wearer use everything without a keyboard. `pi_button_panel` (on the Pi, started by
+`pi_sensors.launch.py`) reads them and publishes `/button_event`; the navigation assistant (Terminal 5, laptop)
+does the work and speaks the result, and the scene describer (Terminal 6) answers camera questions.
+
+| Button | GPIO (BCM) | Header pin | Tap | Hold |
+|--------|-----------|------------|-----|------|
+| **LOOK** | GPIO17 | pin 11 | Describe what is in front of me (Qwen3-VL) | Ask the camera a question: beep, speak while holding, release |
+| **MODE** | GPIO27 | pin 13 | Switch indoor ↔ outdoor (spoken) | Status: mode, map, how many objects, what is around |
+| **HAND** | GPIO22 | pin 15 | Guide my hand to the object found last (or the nearest one ahead); walks there first if it is more than 1 m away. Tap again to stop | — |
+| **TALK** | GPIO23 | pin 16 | **STOP** everything (speech, walking guidance, hand guidance) | Voice command: beep, speak while holding, release ("find the table with the cup", "go to my chair", "call this my chair") |
+| GND (shared) | — | pin 14 (also 9, 20, 25) | | |
+
+Double-tap **TALK**: "what is around me". A hold is 0.6 s; a double tap is two taps within 0.4 s.
+
+**Parts:** 4 momentary, normally-open push buttons (12 mm tactile or 16-19 mm panel buttons; give each a
+different shape or 1-4 raised dots so they can be told apart by touch), 5 female-to-female jumper wires (or
+female Dupont wires soldered to the buttons), heat-shrink. No resistors: the Pi's internal pull-ups are used.
+
+**Wiring** (Pi switched off). Every button has two sides: one goes to its GPIO pin, the other to GND.
+```
+ Pi 5 header (USB ports pointing down, pin 1 top-left)      Buttons
+   pin 11  GPIO17 ─────────────────────────────── LOOK ──┐
+   pin 13  GPIO27 ─────────────────────────────── MODE ──┤
+   pin 15  GPIO22 ─────────────────────────────── HAND ──┤
+   pin 16  GPIO23 ─────────────────────────────── TALK ──┤
+   pin 14  GND    ───────────────────────────────────────┘ (one wire, daisy-chained to the 2nd leg of all four)
+```
+* 4-leg tactile buttons: the two legs on each **long** side are joined inside. Use two **diagonally opposite**
+  legs — they are always on different sides of the switch.
+* Never connect a button to 5 V (pins 2, 4) or 3.3 V (pins 1, 17): the GPIO pins take 3.3 V at most, and a
+  button to a power pin would short it when pressed.
+* The pins avoid I2C (GPIO2/3), UART (GPIO14/15) and SPI, so they stay free for other hardware.
+* Other pins: `ros2 launch visionnav pi_sensors.launch.py` uses the defaults; to change them run the node alone,
+  e.g. `ros2 run visionnav pi_button_panel --ros-args -p look_pin:=5 -p talk_pin:=6`.
+
+**Software on the Pi** (once): gpiozero with the lgpio backend (`RPi.GPIO` does not work on the Pi 5).
+```bash
+# Raspberry Pi OS: already installed.  Ubuntu 24.04:
+sudo apt install python3-gpiozero python3-lgpio
+ls -l /dev/gpiochip*        # your user needs read/write access; if it is root-only:
+sudo groupadd -f gpio && sudo usermod -aG gpio $USER
+echo 'SUBSYSTEM=="gpio", KERNEL=="gpiochip*", GROUP="gpio", MODE="0660"' | sudo tee /etc/udev/rules.d/99-gpio.rules
+sudo udevadm control --reload && sudo udevadm trigger     # then log out and back in
+cd ~/wearable_ws && git pull && colcon build --symlink-install --packages-select visionnav
+```
+
+**Test** (Pi, Terminal 1 running): `ros2 topic echo /button_event` in another Pi terminal and press each
+button — you should see `LOOK tap`, `TALK hold_start` / `hold_end`, etc. in the launch log and the echo. Without
+the Pi, button events can be simulated from the laptop:
+`ros2 topic pub --once /button_event std_msgs/msg/String "{data: '{\"button\": \"look\", \"event\": \"tap\"}'}"`.
+
+**Voice (TALK / LOOK hold):** the laptop microphone records while the button is held, and Whisper (offline,
+`tiny.en`, cached in `~/.cache/huggingface`) turns it into text in about 0.3-0.6 s. Wait for the beep, then
+speak. Saying "stop" only stops; "exit" shuts the assistant down. For more accuracy in noise:
+`WEARABLE_WHISPER_MODEL=base.en` (downloaded once, needs internet the first time).
 
 ---
 
@@ -197,17 +272,35 @@ vision node read them from TF, so there is one place to fix them.
    object's real height, and the surface height for objects on a table. RViz labels show the same,
    with the distance updated live as you walk.
 4. The indoor map is a **persistent global object map** for the whole session by default. An object
-   seen reliably (12+ sightings over 2 s or more) stays on the map for as long as the session runs,
+   seen reliably (15+ sightings over 1 s or more, detected in at least 60 % of the frames the camera was
+   looking at it, with a mean score of 0.40 or more, measured within 6 m, and — while metric depth runs —
+   ranged by LiDAR or depth at least 5 times) stays on the map for as long as the session runs,
    drawn translucent with `seen:Ns-ago` while out of view. When you look back at it, it is matched to
    the same object (same name and ID), not duplicated — walking backward or turning also works, as
    long as the LiDAR direction is calibrated (see **Calibrating the Chest Rig** above). Set
    `WEARABLE_MEMORY_S=8` (seconds) to go back to the old real-time-only behaviour instead.
-   Misdetections never become reliable and disappear within about 1 s regardless. A reliable, remembered
-   object is removed only when the camera looks straight at its spot — with nothing closer in the way —
-   and doesn't see it there for 3 s; while something else is in front of it, it is left alone. The map
-   holds at most 200 remembered objects; past that, the ones not seen for the longest are dropped first.
+   Walking around the room, a remembered object is **not** removed just because it is not detected from
+   a new angle (the back of a chair). When it is **taken away**, it disappears from the map within about
+   1-2 s once the camera looks at its spot from a direction it was seen from before, within 4 m and with
+   nothing (and nobody) in front of it: after 0.7 s if the depth shows the background behind its spot,
+   otherwise after 2 s of not being detected there (longer for objects whose detection normally flickers,
+   such as an open doorway). Log: `Removed <object> from the map: ...`. If SLAM or the depth estimate shifts it (e.g. a loop closure),
+   the object seen next to its old spot is merged into it and keeps its ID (log: `re-found … keeping its ID`).
+   Objects are also tracked in the image: a detection whose box overlaps the box an object had a moment ago
+   is that object even if its distance estimate jumped, so a noisy distance never creates a second copy.
+   Doors, windows, switches and other things in a wall are drawn in RViz as thin panels along the wall
+   (direction fitted to the LiDAR), not as blocks. The detector also has "negative prompts" (`NEGATIVE_PROMPTS`:
+   floor, door threshold, …) that absorb look-alike false detections such as a step at a doorway threshold.
+   Misdetections are filtered by their **detection rate**: an object must be detected in at least half
+   the frames in which the camera looks at its spot before it is shown at all, so a flickering
+   hallucination never appears in the camera view or on the map. The map holds at most 200 remembered
+   objects; past that, the ones not seen for the longest are dropped first.
    Each object has its own colour, shared by its 3D shape, its label and the line joining them. People
-   and other moving objects are shown only while detected. The marker array is also published on
+   and other moving objects are shown only while detected. They are tracked frame to frame by their image box
+   (two people side by side keep their own IDs), ranged by the LiDAR on their torso, and — when the LiDAR
+   misses them — by metric depth corrected with that person's own LiDAR/depth ratio. Speed ("MOVING 0.8m/s")
+   is reported after half a second of tracking. The camera window shows the frame the boxes were computed on,
+   so boxes stay on moving people. The marker array is also published on
    `/vision_markers` (identical to `/semantic_markers`) for other tooling.
 
 **Metric depth:** the vision node also runs Depth Anything V2 (indoor, weights in

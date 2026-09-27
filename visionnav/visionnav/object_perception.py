@@ -27,6 +27,10 @@ os.environ["QT_QPA_PLATFORM"]  = "xcb"          # force X11/XWayland
 os.environ["QT_LOGGING_RULES"] = "*.debug=false;qt.qpa.fonts=false"
 
 import cv2
+# pip's OpenCV points Qt at a font folder inside its package that ships no fonts (a warning per window).
+# It sets this on import, so it is overridden here, before the first window creates the Qt app.
+if os.path.isdir("/usr/share/fonts/truetype/dejavu"):
+    os.environ["QT_QPA_FONTDIR"] = "/usr/share/fonts/truetype/dejavu"
 import json
 import math
 import time
@@ -64,7 +68,8 @@ MODEL_PATH  = model_path("yoloe-11s-seg.pt")
 # there is no text encoder at run time). Add a word here and the engine is rebuilt automatically.
 VOCABULARY = [
     # doors, stairs and building structure
-    "door", "doorway", "sliding door", "glass door", "door handle", "door knob", "gate", "window",
+    "door", "wooden door", "doorway", "doorway to another room", "entrance to room", "room entrance",
+    "sliding door", "glass door", "door handle", "door knob", "gate", "window",
     "curtain", "window blinds", "staircase", "stairs", "step", "handrail", "railing", "elevator door",
     "escalator", "pillar", "doormat",
     # switches, sockets and other wall-mounted things
@@ -76,7 +81,7 @@ VOCABULARY = [
     "exit sign", "sign", "mirror", "picture frame", "painting", "poster", "whiteboard", "notice board",
     "calendar", "clock", "wall shelf", "hook", "coat hanger", "towel rack",
     # floor hazards
-    "hole in floor", "pothole", "floor step", "ramp", "wet floor sign", "puddle", "cable on floor",
+    "hole in floor", "pothole", "ramp", "wet floor sign", "puddle", "cable on floor",
     "wire", "box", "cardboard box", "bag", "shoe", "slippers", "trash can", "dustbin", "bucket", "mop",
     "broom", "rug", "toy", "ball", "laundry basket", "clothes on floor", "obstacle",
     # furniture
@@ -105,6 +110,12 @@ VOCABULARY = [
     "car", "bicycle", "motorcycle", "three-wheeler", "bus", "truck", "traffic light", "stop sign",
     "fire hydrant", "curb",
 ]
+# Negative prompts: things that are not objects but look like one to an open-vocabulary detector. They are
+# in the model's vocabulary so they win the box (YOLO keeps one class per box), and are never reported.
+# Measured on the rig: the floor past a doorway threshold was a "floor step" in 22-100 % of frames in three
+# views; with these (and without the "floor step" prompt) it was a step in none.
+NEGATIVE_PROMPTS = ["door threshold", "floor", "tiled floor", "kitchen floor", "floor edge", "kitchen cabinet"]
+VOCABULARY = VOCABULARY + NEGATIVE_PROMPTS
 # Several prompts for one thing raise recall; they are reported, mapped and navigated to under one
 # name. Measured on the rig: a switch scores 0.60 as "black switch", 0.44 "electric switch", 0.38
 # "switch", but only 0.01 as "light switch", and without them it was mostly called a "doorbell".
@@ -113,7 +124,12 @@ PROMPT_SYNONYMS = {
     "electric switch": "light switch", "switch": "light switch", "switch board": "light switch",
     "electrical switch panel": "light switch",
     "power outlet": "wall socket", "plug socket": "wall socket",
-    "staircase": "stairs", "floor step": "step", "doorway": "door", "sliding door": "door",
+    "staircase": "stairs", "doorway": "door", "sliding door": "door",
+    # Measured on the rig: a closed wooden door scored 0.67 as "wardrobe" and only 0.65 as "door" (and was
+    # called a wardrobe in 71 % of frames); as "wooden door" it scores 0.89 in every frame. An open doorway
+    # was mostly a "mirror" (0.40-0.47); "entrance to room" (0.62) and "room entrance" win over it.
+    "wooden door": "door", "doorway to another room": "door", "entrance to room": "door", "room entrance": "door",
+    "coffee table": "table", "side table": "table",
     "glass door": "door", "door knob": "door handle", "dustbin": "trash can",
     "cardboard box": "box", "office chair": "chair", "plastic chair": "chair", "desk": "table",
     "dining table": "table", "cupboard": "cabinet", "wall shelf": "shelf",
@@ -123,7 +139,7 @@ PROMPT_SYNONYMS = {
 _VOCAB_HASH = hashlib.sha1("|".join(VOCABULARY).encode()).hexdigest()[:8]
 ENGINE_PATH = model_path(f"yoloe-11s-seg-indoor-{_VOCAB_HASH}.engine")
 
-INDOOR_CLASSES = set(VOCABULARY) - {
+INDOOR_CLASSES = set(VOCABULARY) - set(NEGATIVE_PROMPTS) - {
     "bicycle", "motorcycle", "bus", "truck", "car", "traffic light", "stop sign", "fire hydrant",
     "curb", "pothole", "three-wheeler",
 }
@@ -135,6 +151,10 @@ OUTDOOR_CLASSES = {
 }
 # Drops: a blind user needs more warning before these than before a chair.
 DROP_HAZARDS = {"stairs", "step", "hole in floor", "pothole", "curb", "escalator"}
+# Hazards in the floor itself: a measured top (metric depth or LiDAR) higher than this is not one. The edge
+# of a kitchen counter seen through a doorway was read as a "floor step" on the rig.
+FLOOR_LEVEL_HAZARDS = {"step", "hole in floor", "pothole", "curb"}
+FLOOR_HAZARD_MAX_TOP = 0.5   # m above the floor
 
 # Class-specific NMS is done by YOLO. Across classes, only suppress pairs the model
 # genuinely confuses — a person sitting on a chair must keep both detections.
@@ -143,6 +163,13 @@ CONFUSABLE_GROUPS = [
     {"tv", "monitor", "laptop"},
     # a door and the furniture doors that look just like it
     {"door", "wardrobe", "cabinet", "refrigerator"},
+    # an open doorway looks like a mirror (a framed view of another room); kept apart from the group above
+    # so a mirror and a cabinet are not interchangeable (the kitchen counter through a doorway was renamed
+    # a mirror)
+    {"door", "mirror"},
+    # one table seen as a desk, a coffee table and a table
+    {"table", "coffee table", "side table", "desk", "dining table", "tv stand", "dressing table",
+     "kitchen counter", "chest of drawers"},
     # small plates on a wall
     {"light switch", "wall socket", "doorbell", "thermostat", "intercom", "fire alarm", "smoke detector"},
     {"couch", "sofa", "bed", "chair"},
@@ -161,6 +188,17 @@ RELABEL_RATIO = 1.5
 WALL_MOUNTED = {"light switch", "wall socket", "doorbell", "thermostat", "intercom", "fire alarm",
                 "smoke detector", "door handle", "door knob", "exit sign", "power strip"}
 WALL_MOUNTED_FOOTPRINT = 0.35  # m
+# Flat things in or on a wall: drawn as a thin panel along the wall, not a width x width block (a 1.1 m door
+# was a 1.1 x 1.1 x 2.1 m cube). The wall direction is fitted to the LiDAR points around the object.
+PANEL_OBJECTS = WALL_MOUNTED | {"door", "window", "curtain", "window blinds", "mirror", "picture frame",
+                                "painting", "poster", "whiteboard", "notice board", "calendar", "clock",
+                                "sign", "air conditioner", "circuit breaker panel"}
+PANEL_THICKNESS = 0.05       # m
+WALL_FIT_MIN_PTS = 5         # LiDAR points needed to fit the wall line
+WALL_FIT_MIN_ELONGATION = 6.0  # variance along / across the fitted line
+DOOR_MIN_HEIGHT = 1.9        # m: doors are standard height; a doorway's top is often cut off by the frame
+DOOR_MIN_WIDTH = 0.3         # m: a "door" measured narrower than this (and not cut off by the frame edge) is a
+                             # sliver of frame or wall corner: one 10 cm wide at 1 m became a phantom door
 YOLO_IOU = 0.50
 # Small objects are the ones YOLO misnames most (a door handle as a cup, a remote as a phone),
 # so they need more confidence than furniture before they are shown or mapped.
@@ -169,6 +207,11 @@ SMALL_OBJECTS = {"door handle", "door knob", "keys", "pen", "wallet", "glasses",
                  "scissors", "toothbrush", "spoon", "fork", "knife", "wine glass", "sports ball"}
 CROSS_CLASS_OVERLAP = 0.70   # intersection / smaller box area
 CROSS_CLASS_SAME_BOX_IOU = 0.80  # any two static labels on (almost) the same box are one detection
+# A look-alike label on a box where a better-ranked look-alike was detected this recently is the same
+# object flickering between names (an open doorway alternated "door" / "mirror" on the rig and spawned a
+# second object 7.8 m away, where the LiDAR saw through the opening).
+LOOKALIKE_MEMORY_S = 1.0
+LOOKALIKE_BOX_AGE = 2.0      # s: a confirmed object's last image box claims look-alike detections this long
 
 FRIENDLY_NAMES = {
     **PROMPT_SYNONYMS,
@@ -301,7 +344,11 @@ OBJECT_MAX_ASPECT_RATIOS = {
 FLOOR_OBJECTS = {"door", "stairs", "step", "table", "obstacle", "hole in floor", "pothole", "trash can",
                  "box", "chair", "couch", "bed", "dining table", "toilet", "refrigerator", "oven",
                  "potted plant", "bench", "suitcase", "person", "bicycle", "car", "motorcycle",
-                 "bus", "truck", "dog", "cat", "fire hydrant", "backpack"}
+                 "bus", "truck", "dog", "cat", "fire hydrant", "backpack",
+                 # tall furniture stands on the floor (a wardrobe was drawn "on a 0.37 m surface")
+                 "wardrobe", "cabinet", "shelf", "bookshelf", "chest of drawers", "sofa", "stool",
+                 "tv stand", "dressing table", "kitchen counter", "washing machine", "water dispenser",
+                 "crib", "shoe rack"}
 # Objects that typically sit on tables
 DESKTOP_OBJECTS = {
     "laptop", "mouse", "keyboard", "cup", "bottle", "bowl", "tv",
@@ -352,11 +399,48 @@ MONO_MAX_POINTS = 2000       # object pixels back-projected per detection
 # ── TRACKING PARAMETERS ──
 MIN_HITS_STATIC = 4          # sightings before a static object is mapped / remembered
 MIN_HITS_DYNAMIC = 2
+# ── MOVING OBJECTS (people, pets) ──
+# Constant-velocity pedestrian model, timed by when each camera frame arrived (not when it was processed:
+# processing delay varies and turned into fake speed, 0.5 m/s median for people sitting still on the rig).
+DYN_ACCEL_NOISE = 1.5        # m^2/s^3, white-noise acceleration of a walking person
+DYN_INIT_VEL_VAR = 1.0       # (m/s)^2 before the first two sightings
+DYN_MIN_SIGMA = 0.10         # m: a person's measured centre wobbles this much (arms, torso turning)
+DYN_MAX_SPEED = 3.0          # m/s, indoors
+DYN_SPEED_MIN_AGE = 0.5      # s of tracking before a speed is reported
+DYN_MOVING_ON, DYN_MOVING_OFF = 0.40, 0.25  # m/s: "MOVING" hysteresis
+DYN_SHOW_S = 0.4             # s: a moving object is drawn only this long after its last sighting
+DYN_BOX_IOU = 0.3            # image-space match: a person's box overlaps their box this recently...
+DYN_BOX_MAX_AGE = 0.3        # ...within this many seconds
+DYN_EXTRAPOLATE_S = 0.3      # s a moving object's drawn position may run ahead of its last sighting
+MONO_RATIO_ALPHA = 0.3       # per-person LiDAR/metric-depth ratio, used when the LiDAR misses them
+DYN_REANCHOR_RUN = 3         # consecutive agreeing out-of-gate sightings that move a person's track there
+# A static object must be detected in at least this share of the frames in which the camera is looking at
+# its spot. A real object is found in nearly every frame (chairs 95-100 % on the rig); a hallucination
+# flickers (a "step" on a doorway threshold: 77 % of frames at a mean score of 0.27, so it crossed
+# the 0.30 threshold only now and then). Without it a flicker never timed out and even became "reliable".
+MIN_DETECTION_RATE = 0.5
+RELIABLE_DETECTION_RATE = 0.6  # stricter before an object is remembered for good, so a lucky run of
+                               # detections early in a flicker cannot latch it into the map
+# ...and its mean detection score must reach this. Real objects on the rig averaged 0.52 (an open doorway)
+# to 0.89; the "floor step" hallucination on a doorway threshold came in bursts just over the 0.30
+# threshold and latched on detection rate alone.
+RELIABLE_MIN_MEAN_CONF = 0.40
+# ...and it must have been measured within this range: beyond it the position is a guess (a "mirror" 7.8 m
+# away, where the LiDAR looked through an open doorway, latched into memory). Farther objects are
+# remembered once the wearer comes closer.
+MEMORY_MAX_RANGE = 6.0
+# ...and, while metric depth is running, at least this many of its sightings must have been ranged by the
+# LiDAR or depth. A position from box size alone moves with every view: roaming the room without depth mapped
+# one switch at three places. (Without depth, chairs and tables below the LiDAR plane have nothing else.)
+MEMORY_MIN_RANGED_HITS = 5
+DETECTION_VIEW_MARGIN = 0.03  # fraction of the frame border ignored when counting a missed detection
+DETECTION_VIEW_RANGE = 10.0   # m, objects this close count as in view for the detection rate
 UNCONFIRMED_TIMEOUT = 1.5    # s, tentative tracks die fast (kills one-frame hallucinations)
 TRACK_DEBUG = os.environ.get("WEARABLE_TRACK_DEBUG", "0") == "1"  # log why each new static object is created
 CONFIRMED_TIMEOUT = 30.0    # s a confirmed (MIN_HITS_STATIC) but not yet reliable object survives out of view,
                              # so the next glance at it matches it instead of mapping it again under a new ID
 UNSEEN_DROP_S = 1.0          # s, an object the camera is looking at but no longer detects is removed
+                             # (not yet reliable objects only; a remembered one needs free-space evidence)
 VISIBILITY_MAX_RANGE = 6.0   # m, only apply the rule above to objects this close
 # Real-time map: an object is drawn only while it is being detected right now
 LIVE_WINDOW = 1.0            # s
@@ -364,31 +448,53 @@ LIVE_MIN_HITS = 2            # sightings within LIVE_WINDOW (one stray frame is 
 MARKER_LIFETIME = 0.5        # s, RViz removes an object this soon after it stops being published
 # PERSISTENT GLOBAL MAP (indoor): once an object has been seen reliably it stays on the map, faded,
 # for the rest of the session, and keeps its ID/name when seen again from another angle. Set
-# WEARABLE_MEMORY_S (e.g. 8) for the old real-time-only behaviour instead. A remembered object is
-# dropped when the camera looks straight at its spot, with nothing closer in the way, and does not
-# see it there (UNSEEN_DROP_RELIABLE_S) — or when a live object of the same class stands on it (a
-# duplicate, e.g. one created while its distance estimate briefly jumped).
-MEMORY_MIN_HITS = 12
-MEMORY_MIN_SPAN = 2.0        # s between first and latest sighting
+# WEARABLE_MEMORY_S (e.g. 8) for the old real-time-only behaviour instead. Walking around the room, the
+# detector often misses a remembered object from a new angle (the back of a chair) and SLAM/depth put it
+# a few decimetres off, so "not detected" alone never removes it. It is removed only when the depth map
+# reads clearly past its whole spot, wide enough to absorb that offset, for FREE_SPACE_CLEAR_RELIABLE_S
+# (the object was taken away). A live object of the same class on its spot is merged into it (same ID).
+MEMORY_MIN_HITS = 15
+MEMORY_MIN_SPAN = 1.0        # s between first and latest sighting
 MEMORY_TTL = float(os.environ.get("WEARABLE_MEMORY_S", "inf"))  # s a reliable object outlives its last sighting
-UNSEEN_DROP_RELIABLE_S = 3.0  # s a *reliable* object may go unseen-in-view before it is removed
-                              # (longer than UNSEEN_DROP_S: a real object deserves more benefit of the
-                              # doubt than a fresh, unconfirmed detection)
 BLIND_SPOT_RADIUS = 0.8      # m: a remembered object this close to the wearer is expected to be below
                               # the chest-mounted camera/LiDAR's view, so it is never dropped for going
                               # unseen (memory-anchored terminal navigation needs it to still be there)
 OCCLUSION_DEPTH_MARGIN = 0.3  # m: something this much closer in the same pixel hides the object
 FREE_SPACE_MARGIN = 1.0      # m: live depth this far beyond a remembered object means its spot is empty
 FREE_SPACE_CLEAR_S = 0.4     # s of consistent free-space evidence before it is pruned (rejects depth glitches)
+FREE_SPACE_CLEAR_RELIABLE_S = 1.5  # s of it before a remembered object is removed (seen from a new direction)
+# TAKEN AWAY: a remembered object is removed quickly once the camera looks at its spot from a direction it was
+# detected from before (so "not detected" means something: it is not the back of a chair seen for the first
+# time), close enough, with nothing in front, and it is not there. Only the slow rule above applied before, and
+# its wide patch and 1 m margin never cleared a cup taken off a table or a chair moved away from a wall.
+REMOVE_MAX_RANGE = 4.0       # m
+REMOVE_VIEW_BIN_DEG = 30.0   # viewing directions are remembered in bins this wide (+-1 bin counts as the same)
+REMOVE_UNSEEN_S = 2.0        # s undetected in plain view from a known direction...
+REMOVE_GAP_FACTOR = 3.0      # ...and at least this many times the longest gap it has ever shown between detections
+                             # (an open doorway's detection flickers for 1-2 s; a chair's almost never)
+REMOVE_VISIBLE_FRACTION = 0.6  # share of an object's projected 3-D box inside the frame for "in plain view" (its
+                               # centre in the middle 76 % excluded table-height things low in a chest camera's view)
+REMOVE_PERSON_OVERLAP = 0.3  # share of the object's spot covered by a person's box that counts as hiding it
+REMOVE_FREE_S = 0.7          # s, if the depth also shows the background behind its spot
+REMOVE_FREE_MARGIN = 0.3     # m (+15 % of range) behind the object's range counts as background
+FREE_SPACE_SLACK = 0.3       # m: a remembered object's checked patch is widened by this on each side
+                             # (SLAM and depth error while walking), and its lowest depths are used
 SEE_THROUGH = {"door", "window"}  # open doorways / windows: depth reading past them is expected, not a ghost
 MAX_REMEMBERED_OBJECTS = 200  # oldest-seen remembered objects are evicted first past this count
 REMEMBERED_ALPHA = 0.30      # remembered (not currently seen) objects are drawn translucent
 OBJECTS_PUBLISH_PERIOD = 0.2 # s, /semantic_objects rate (5 Hz)
-STATIC_POS_Q = 0.01          # m^2/s, static objects may slowly be re-estimated / moved
-STATIC_MIN_VAR = 0.08 ** 2   # m^2: a static object's position never gets more certain than this, so each new
-                             # sighting keeps real weight (a moving average that favours the live data)
+# A static object's position is the running average of about the last 1.5 s of sightings at 20 Hz. With an
+# 8 cm floor and 0.01 m^2/s drift, each sighting moved it 25-60 %: with the rig standing still, objects
+# wandered over 22 cm (median) and up to 35 cm on the map. Real shifts (SLAM, a new viewpoint) are handled by
+# the revisit prior, image-space association and re-anchoring, not by trusting every frame.
+STATIC_POS_Q = 0.0005        # m^2/s, static objects may slowly be re-estimated / moved
+STATIC_MIN_VAR = 0.01 ** 2   # m^2: never more certain than this
+STATIC_DIM_ALPHA = 0.08      # smoothing of a static object's width, height and elevation per sighting
 REVISIT_GAP_S = 2.0          # s unseen after which the next sighting is treated as a revisit
 REVISIT_VAR = 0.30 ** 2      # m^2: prior widened to this on a revisit (absorbs SLAM drift / a new viewing angle)
+DRIFT_MERGE_S = 1.5          # s a remembered object may go unseen in plain view, while a newer live object of its
+                             # class stands within the revisit gate, before the two are merged under the old ID
+                             # (a SLAM loop closure or depth jump moved it; it did not become two objects)
 CHI2_GATE_2D = 9.21          # 99 % gate for a 2-D innovation
 SAME_OBJECT_IOU = 0.3        # footprints overlapping this much (and statistically consistent) are one object
 # Two *different* labels on one spot (a cabinet also read as a door and a notice board) are one object when
@@ -398,8 +504,22 @@ SAME_PLACE_IOU = 0.40
 SAME_PLACE_SIZE_RATIO = 1.6
 SAME_PLACE_Z_OVERLAP = 0.5
 BIG_COST = 1e6
+# Image-space association: a static object's box overlapping, this much, the box its track had this recently
+# is that object even when its distance estimate jumped (a table's cut-off box was sized 3 m too far and
+# became a second table). The jumped position is then weighted by the jump, so it barely moves the object.
+BOX_TRACK_IOU = 0.5
+BOX_TRACK_MAX_AGE = 1.0      # s
+# After this many image-only matches in a row ranged by LiDAR or depth that agree with each other within
+# BOX_SNAP_SPREAD, the object really is at the new position (SLAM corrected the map) and is moved there;
+# box-size guesses never move it this way. With 3 unchecked sightings, a door jumped 2 m on the rig whenever
+# a chair in front of it put LiDAR ranges of 0.8 m and 3.1 m into its outline by turns.
+BOX_SNAP_RUN = 10
+BOX_SNAP_SPREAD = 0.2        # m
+BOX_ONLY_COST = 2.0 * CHI2_GATE_2D  # assignment cost of an image-only match (above the 3-D gate, so 3-D matches win)
 HUD_TIMEOUT = 0.7            # s, camera-view boxes vanish this fast once the object is not detected
-HUD_MIN_HITS = 2             # sightings before a box is labelled in the camera view
+HUD_SYNC_MAX_AGE = 0.3       # s: the window shows the frame the boxes were computed on while it is this fresh
+HUD_BOX_ALPHA, HUD_BOX_SCALE_PX = 0.15, 40.0     # static box: weight of a new corner, +1 per this many px moved
+HUD_DEPTH_ALPHA, HUD_DEPTH_SCALE_M = 0.1, 1.0    # static distance label: same, per metre changed
 LABEL_SCALE = 0.15           # RViz text height (m)
 LABEL_CLEAR_XY = 1.0         # m, RViz labels closer than this horizontally are stacked...
 LABEL_CLEAR_Z = 0.40         # ...this far apart vertically (a leader line still ties each to its object)
@@ -409,6 +529,45 @@ OBJECT_PALETTE = [
     (1.00, 0.95, 0.20), (0.60, 0.45, 1.00), (0.20, 1.00, 0.80), (1.00, 0.35, 0.30),
     (0.75, 1.00, 0.20), (0.95, 0.70, 1.00),
 ]
+
+
+# ── OBJECT COLOUR (spoken references: "the red cup", "the brown door") ──
+# Named from the object's own mask pixels, with brightness relative to the frame's white level (the chest
+# camera runs dark: a white wall reads ~0.8, a red cup 0.28, a brown door 0.09-0.16 of it). Measured on the
+# rig: cup 94 % saturated pixels, hue red; door 55-82 %, hue red/orange but dark; chairs <30 %, very dark.
+COLOR_MIN_CHROMA = 0.45      # share of saturated pixels for a chromatic colour
+COLOR_SAT = 60               # HSV saturation (0-255) of a "saturated" pixel
+COLOR_MIN_VREL = 0.08        # ...and its minimum brightness relative to the frame's white level
+COLOR_BROWN_VREL = 0.20      # red/orange/yellow darker than this (or weakly saturated) is brown
+COLOR_BROWN_SAT = 100
+COLOR_HUES = (("red", 0, 8), ("orange", 8, 20), ("yellow", 20, 33), ("green", 33, 85), ("blue", 85, 130),
+              ("purple", 130, 150), ("pink", 150, 170), ("red", 170, 181))  # OpenCV hue 0-180
+COLOR_MIN_VOTES = 3.0        # confidence-weighted sightings before an object's colour is reported
+COLOR_MIN_SHARE = 0.5        # ...and the share of them its colour needs
+
+
+def _color_name(hsv, vref: float, mask):
+    """Everyday colour name of the masked pixels of an HSV frame, or None if too few pixels."""
+    if mask.shape[0] > 12 and mask.shape[1] > 12:
+        mask = cv2.erode(mask, np.ones((5, 5), np.uint8))  # edge pixels mix object and background
+    px = hsv[mask > 0]
+    if len(px) < 30:
+        return None
+    hue, sat = px[:, 0].astype(int), px[:, 1].astype(int)
+    val = px[:, 2].astype(float) / vref
+    chroma = (sat >= COLOR_SAT) & (val >= COLOR_MIN_VREL)
+    if chroma.mean() >= COLOR_MIN_CHROMA:
+        h = hue[chroma]
+        counts = {}
+        for name, lo, hi in COLOR_HUES:
+            counts[name] = counts.get(name, 0) + int(np.count_nonzero((h >= lo) & (h < hi)))
+        name = max(counts, key=counts.get)
+        if name in ("red", "orange", "yellow") and (float(np.median(val[chroma])) < COLOR_BROWN_VREL
+                                                    or float(np.median(sat[chroma])) < COLOR_BROWN_SAT):
+            return "brown"
+        return name
+    v = float(np.median(val))
+    return "black" if v < 0.25 else "white" if v > 0.75 else "grey"
 
 
 def _object_color(name: str):
@@ -422,7 +581,7 @@ MODE_PARAMS = {
     "indoor": {
         "conf_threshold":       0.30,    # open-vocabulary scores run low; track confirmation (MIN_HITS) filters hallucinations
         "static_timeout":       120.0,   # 2 min memory while indoors
-        "dynamic_timeout":      0.5,     # SUPER FAST cleanup for moving objects
+        "dynamic_timeout":      1.0,     # kept this long unseen (re-found under the same ID), drawn only DYN_SHOW_S
         "static_assoc":         1.50,    # hard association limit (m); main gate is statistical
         "dynamic_assoc":        2.00,
         "danger_distance":      1.5,     # Indoor danger threshold
@@ -431,7 +590,7 @@ MODE_PARAMS = {
     "outdoor": {
         "conf_threshold":       0.30,
         "static_timeout":       3.0,     # Very short memory outdoors
-        "dynamic_timeout":      0.5,
+        "dynamic_timeout":      1.0,
         "static_assoc":         2.00,
         "dynamic_assoc":        2.50,
         "danger_distance":      2.0,     # Outdoor needs earlier warnings
@@ -517,6 +676,17 @@ def _same_place(a_xy, a_w, a_z, a_h, b_xy, b_w, b_z, b_h) -> bool:
     return z_overlap >= SAME_PLACE_Z_OVERLAP * min(a_h, b_h)
 
 
+def _box_overlap(a, b) -> float:
+    """Intersection over the smaller box."""
+    inter = max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    return inter / max(min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1])), 1)
+
+
+def _box_iou(a, b) -> float:
+    inter = max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    return inter / max((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter, 1)
+
+
 def _track_var(t) -> float:
     return 0.5 * float(t.P[0, 0] + t.P[1, 1])
 
@@ -542,8 +712,7 @@ class KalmanTracker:
         self.P = np.zeros((6, 6), dtype=np.float64)
         self.P[0, 0] = self.P[1, 1] = sigma * sigma
         if is_dynamic:
-            self.P[2, 2] = self.P[3, 3] = 1.0
-            self.P[4, 4] = self.P[5, 5] = 1.0
+            self.P[2, 2] = self.P[3, 3] = DYN_INIT_VEL_VAR  # constant velocity: acceleration stays 0
         self.conf = conf
         self.is_dynamic = is_dynamic
         self.first_seen = now
@@ -556,25 +725,51 @@ class KalmanTracker:
         self.velocity = 0.0
         self.is_moving = False
         self.hits = 1
+        self.misses = 0  # frames in which the camera looked at it and did not detect it
+        self.conf_sum = conf
+        self.ranged_hits = 0  # sightings ranged by LiDAR or metric depth (not box size alone)
+        self.min_ranged_hits = 0  # set by the node to MEMORY_MIN_RANGED_HITS while metric depth runs
+        self.last_box = None  # image box of the latest sighting, and when (image-space association)
+        self.box_only_xy = []  # positions of consecutive ranged image-only matches (for re-anchoring)
+        self.mono_ratio = None  # (moving objects) LiDAR range / metric depth, for sightings the LiDAR misses
+        self.outlier_run, self.outlier_xy = 0, None  # (moving objects) consecutive out-of-gate sightings
+        self.last_box_t = -math.inf
+        self.is_reliable = False  # latched: once a real object, a bad angle later does not undo it
         self.unseen_in_view = 0.0
         self.free_in_view = 0.0
         self.seen_times = deque([now], maxlen=10)
         self.uid = 0  # globally unique object id (assigned by the node), used for RViz marker ids
         self.votes = {}  # label -> accumulated (priority-weighted) confidence, for look-alike classes
         self.from_memory = False  # reloaded from a saved map, not yet seen in this session
+        self.wall_vec = np.zeros(2)  # weighted sum of (cos 2a, sin 2a) of the wall direction a (map)
+        self.max_gap = 0.0  # longest time in plain view without a detection before it was seen again
+        self.view_bins = set()  # directions (object -> camera, map) it has been detected from, REMOVE_VIEW_BIN_DEG bins
+        self.colors = {}  # colour name -> confidence-weighted sightings
 
         self.H = np.zeros((2, 6), dtype=np.float64)
         self.H[0, 0] = 1.0
         self.H[1, 1] = 1.0
 
     @property
+    def detection_rate(self) -> float:
+        return self.hits / (self.hits + self.misses)
+
+    @property
     def confirmed(self) -> bool:
-        return self.hits >= (MIN_HITS_DYNAMIC if self.is_dynamic else MIN_HITS_STATIC)
+        if self.is_dynamic:
+            return self.hits >= MIN_HITS_DYNAMIC
+        return self.hits >= MIN_HITS_STATIC and (self.is_reliable or self.detection_rate >= MIN_DETECTION_RATE)
 
     @property
     def reliable(self) -> bool:
-        """Seen often enough, over long enough, to be a real object worth remembering."""
-        return self.hits >= MEMORY_MIN_HITS and self.last_seen - self.first_seen >= MEMORY_MIN_SPAN
+        """Seen often enough, over long enough and consistently enough to be a real object worth remembering."""
+        if not self.is_reliable:
+            self.is_reliable = (self.hits >= MEMORY_MIN_HITS and self.last_seen - self.first_seen >= MEMORY_MIN_SPAN
+                                and self.detection_rate >= RELIABLE_DETECTION_RATE
+                                and self.conf_sum / self.hits >= RELIABLE_MIN_MEAN_CONF
+                                and self.dist <= MEMORY_MAX_RANGE
+                                and self.ranged_hits >= self.min_ranged_hits)
+        return self.is_reliable
 
     def remembered(self, now: float) -> bool:
         """Not detected now, but a reliable object seen within MEMORY_TTL."""
@@ -582,7 +777,16 @@ class KalmanTracker:
 
     def live(self, now: float) -> bool:
         """Confirmed and still being detected right now."""
+        if self.is_dynamic and now - self.last_seen > DYN_SHOW_S:
+            return False
         return self.confirmed and sum(1 for t in self.seen_times if now - t <= LIVE_WINDOW) >= LIVE_MIN_HITS
+
+    def position_at(self, now: float):
+        """(x, y) now: a moving object's last estimate carried forward by its velocity (briefly)."""
+        if not self.is_dynamic:
+            return float(self.x[0]), float(self.x[1])
+        dt = max(0.0, min(now - self.last_predict, DYN_EXTRAPOLATE_S))
+        return float(self.x[0] + self.x[2] * dt), float(self.x[1] + self.x[3] * dt)
 
     def predict(self, now: float):
         # dt is measured from the previous predict (not the last sighting), so calling this
@@ -602,19 +806,19 @@ class KalmanTracker:
                 self.P[1, 1] = max(self.P[1, 1], REVISIT_VAR)
             return
 
+        # Constant velocity: position += velocity * dt, white-noise acceleration (a walking person)
         F = np.eye(6, dtype=np.float64)
-        # Position += Velocity * dt + 0.5 * Accel * dt^2 ; Velocity += Accel * dt
         F[0, 2] = F[1, 3] = dt
-        F[0, 4] = F[1, 5] = 0.5 * dt * dt
-        F[2, 4] = F[3, 5] = dt
-        Q = np.diag([0.02, 0.02, 0.5, 0.5, 2.0, 2.0]) * dt
+        q = DYN_ACCEL_NOISE
+        Q = np.zeros((6, 6))
+        for p, v in ((0, 2), (1, 3)):
+            Q[p, p], Q[p, v], Q[v, p], Q[v, v] = q * dt ** 3 / 3, q * dt ** 2 / 2, q * dt ** 2 / 2, q * dt
         self.x = F @ self.x
         self.P = F @ self.P @ F.T + Q
 
         # Unobserved objects coast to a stop instead of drifting forever
         if now - self.last_seen > 0.3:
-            self.x[2:6] *= 0.80 ** (dt / 0.05)
-        self.velocity = float(math.hypot(self.x[2], self.x[3]))
+            self.x[2:4] *= 0.80 ** (dt / 0.05)
 
     def mahalanobis_sq(self, px: float, py: float, sigma: float) -> float:
         y = np.array([px - self.x[0], py - self.x[1]])
@@ -639,24 +843,48 @@ class KalmanTracker:
             self.P[1, 1] = max(self.P[1, 1], STATIC_MIN_VAR)
 
         # Size / elevation: plain exponential smoothing
-        dim_alpha = 0.40 if self.is_dynamic else 0.25
+        dim_alpha = 0.40 if self.is_dynamic else STATIC_DIM_ALPHA
         self.width = (1.0 - dim_alpha) * self.width + dim_alpha * max(0.05, float(width))
         self.height = (1.0 - dim_alpha) * self.height + dim_alpha * max(0.05, float(height))
         self.z = (1.0 - dim_alpha) * self.z + dim_alpha * float(z)
         self.dist = 0.5 * self.dist + 0.5 * float(dist)
 
         self.conf = max(conf, self.conf * 0.98)
+        self.conf_sum += conf
         self.hits += 1
         self.last_seen = now
         self.seen_times.append(now)
+        self.max_gap = max(self.max_gap, self.unseen_in_view)
         self.unseen_in_view = 0.0
         self.free_in_view = 0.0
-        self.velocity = float(math.hypot(self.x[2], self.x[3]))
-        self.is_moving = self.is_dynamic and self.hits >= 4 and self.velocity > 0.30
+        if self.is_dynamic:
+            speed = float(math.hypot(self.x[2], self.x[3]))
+            if speed > DYN_MAX_SPEED:
+                self.x[2:4] *= DYN_MAX_SPEED / speed
+                speed = DYN_MAX_SPEED
+            # A speed from the first few sightings is mostly noise
+            self.velocity = speed if now - self.first_seen >= DYN_SPEED_MIN_AGE else 0.0
+            self.is_moving = self.velocity > (DYN_MOVING_OFF if self.is_moving else DYN_MOVING_ON)
 
     @property
     def distance(self) -> float:
         return float(math.hypot(self.x[0], self.x[1]))
+
+    @property
+    def color(self):
+        """Colour agreed on by most sightings, or None while unsure."""
+        total = sum(self.colors.values())
+        if total < COLOR_MIN_VOTES:
+            return None
+        name = max(self.colors, key=self.colors.get)
+        return name if self.colors[name] >= COLOR_MIN_SHARE * total else None
+
+    @property
+    def wall_yaw(self):
+        """Direction (map) of the wall this panel lies in, or None if not known yet."""
+        if np.linalg.norm(self.wall_vec) < 1e-6:
+            return None
+        return 0.5 * math.atan2(self.wall_vec[1], self.wall_vec[0])
 
 
 class _InferredTable:
@@ -697,10 +925,6 @@ class ObjectPerceptionNode(Node):
             if show_window_env != "0":
                 self.get_logger().warn("No display detected. Forcing WEARABLE_SHOW_WINDOW=0 (Headless Mode).")
 
-        if self._show_window:
-            cv2.namedWindow(self._window_name, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(self._window_name, 800, 600)
-            cv2.waitKey(1)
         # Press 'l' in the window to toggle the LiDAR-on-camera calibration overlay
         self._show_lidar_overlay = os.environ.get("WEARABLE_SHOW_LIDAR_OVERLAY", "0") == "1"
         # Diagnostics for the LiDAR snap (see _lidar_hits_in_box): logs, once per second per class,
@@ -712,6 +936,11 @@ class ObjectPerceptionNode(Node):
         self.get_logger().info(f"Loading YOLO model: {MODEL_PATH}")
         self._load_model()
         self.get_logger().info("Model loaded. Ready for detections.")
+        # Opened only now: during a first-start engine build (minutes) the window would sit frozen
+        if self._show_window:
+            cv2.namedWindow(self._window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(self._window_name, 800, 600)
+            cv2.waitKey(1)
 
         from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
         realtime_qos = QoSProfile(
@@ -732,8 +961,11 @@ class ObjectPerceptionNode(Node):
         self._inference_lock = threading.Lock()
         self._latest_frame = None
         self._latest_frame_stamp = None
+        self._latest_frame_rx = 0.0  # monotonic time the frame arrived (measurement time of moving objects)
+        self._hud_frame = None       # (frame, time) the HUD boxes were computed on, for a synchronized display
         self._inference_results = None
         self._inference_busy = False
+        self._recent_dets = deque()  # (time, detection) kept in the last LOOKALIKE_MEMORY_S (worker thread only)
         self._inference_thread = threading.Thread(target=self._yolo_worker, daemon=True)
         self._inference_thread.start()
 
@@ -762,6 +994,8 @@ class ObjectPerceptionNode(Node):
                 self.get_logger().error("Failed to open any camera. Check USB connection.")
 
         # Tracking and TF2 timer (runs in background ROS thread)
+        # Finished inference is picked up within 10 ms (was up to 50 ms); prediction and markers at 20 Hz
+        self._results_timer = self.create_timer(0.01, self._results_callback)
         self._tracking_timer = self.create_timer(0.05, self._tracking_callback)
 
         # Recent scans, so each image is fused with the scan taken at the same moment
@@ -826,6 +1060,11 @@ class ObjectPerceptionNode(Node):
         self._mode_sub = self.create_subscription(
             String, "/perception_mode", self._mode_callback, 10
         )
+        # The current mode, latched, so the MODE button (voice_navigation_assistant) knows which way to switch
+        self._mode_state_pub = self.create_publisher(
+            String, "/perception_mode_state",
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self._mode_state_pub.publish(String(data=self._mode))
 
         # ── SAVED MAPS (map_manager): reload the objects of a saved home, save them on request ──
         self._objects_file = None
@@ -903,6 +1142,8 @@ class ObjectPerceptionNode(Node):
                 cv2.resizeWindow(self._window_name, 800, 600)
 
             self.get_logger().info(f"🔄 Mode switched: {old_mode.upper()} → {new_mode.upper()}")
+        if new_mode in MODE_PARAMS:
+            self._mode_state_pub.publish(String(data=self._mode))
 
     def _open_direct_camera(self):
         """Open the USB camera directly with low-latency V4L2 backend."""
@@ -947,10 +1188,12 @@ class ObjectPerceptionNode(Node):
             self._gui_frame = frame
 
             # 2. Feed freshest frame to YOLO worker (non-blocking)
+            # Always the newest frame: the worker takes it the moment it finishes the previous one (a frame was
+            # only kept while the worker was idle, so it then waited up to a frame period: 12.6 Hz, not 17)
             with self._inference_lock:
-                if not self._inference_busy:
-                    self._latest_frame = frame.copy()
-                    self._latest_frame_stamp = self.get_clock().now().to_msg()
+                self._latest_frame = frame.copy()
+                self._latest_frame_stamp = self.get_clock().now().to_msg()
+                self._latest_frame_rx = now_mono
 
             # 3. Throttled ROS2 publisher (5Hz, only when subscribed)
             if now_mono - last_ros_pub >= 0.20:
@@ -985,10 +1228,11 @@ class ObjectPerceptionNode(Node):
         self._last_image_time = now_mono
         self._gui_frame = frame
 
+        # Always the newest frame: the worker takes it the moment it finishes the previous one
         with self._inference_lock:
-            if not self._inference_busy:
-                self._latest_frame = frame.copy()
-                self._latest_frame_stamp = msg.header.stamp
+            self._latest_frame = frame
+            self._latest_frame_stamp = msg.header.stamp
+            self._latest_frame_rx = now_mono
 
     def _scan_callback(self, msg: LaserScan) -> None:
         self._scan_buffer.append(msg)
@@ -1122,8 +1366,9 @@ class ObjectPerceptionNode(Node):
             return None
         u, v, xy, horiz, _ = proj
         x1, y1, x2, y2 = box
-        shrink = 0.15 * (x2 - x1)
-        in_cols = (u >= x1 + shrink) & (u <= x2 - shrink)
+        # central 70 % of the box, but never narrower than 10 px (a switch is ~10 px wide)
+        half = max(0.35 * (x2 - x1), 5.0)
+        in_cols = np.abs(u - 0.5 * (x1 + x2)) <= half
         sel = np.nonzero(in_cols & (v >= y1 - LIDAR_ROW_TOL_PX) & (v <= y2 + LIDAR_ROW_TOL_PX))[0]
         if debug is not None:
             debug['in_cols'] = int(in_cols.sum())
@@ -1203,6 +1448,26 @@ class ObjectPerceptionNode(Node):
                 return float(np.median(r[start:end + 1]))
             start = end + 1
         return None
+
+    def _wall_angle(self, proj, box, depth: float, ray_xy):
+        """Direction (base_footprint, radians mod pi) of the wall a flat object lies in, and its weight.
+
+        Fits a line to the LiDAR returns at the object's range in and beside its image columns (the wall
+        around a switch, the jambs and wall either side of a door). Without enough of them, the object is
+        assumed to face the camera (weak weight, so a later LiDAR fit wins).
+        """
+        if proj is not None:
+            u, _, xy, horiz, _ = proj
+            x1, _, x2, _ = box
+            pad = max(20.0, 0.5 * (x2 - x1))
+            sel = (u >= x1 - pad) & (u <= x2 + pad) & (np.abs(horiz - depth) < max(0.4, 0.15 * depth))
+            if int(sel.sum()) >= WALL_FIT_MIN_PTS:
+                pts = xy[sel] - xy[sel].mean(axis=0)
+                evals, evecs = np.linalg.eigh(np.cov(pts.T))
+                if evals[1] > WALL_FIT_MIN_ELONGATION * max(evals[0], 1e-6):
+                    d = evecs[:, 1]
+                    return math.atan2(d[1], d[0]), 1.0
+        return math.atan2(ray_xy[1], ray_xy[0]) + math.pi / 2, 0.1
 
     def _log_lidar_snap_debug(self, label: str, depth_hint: float, lidar, info: dict):
         """Rate-limited (WEARABLE_LIDAR_SNAP_DEBUG=1) diagnostic for why an object did or did not get
@@ -1370,10 +1635,17 @@ class ObjectPerceptionNode(Node):
             top_est = self._height_along_ray(self._pixel_ray(u_mid, y1, K), depth)
             if top_est < self._lidar_t[2] - LIDAR_SNAP_PLANE_MARGIN:
                 snap_hint = None
-        lidar = self._lidar_hits_in_box(proj, det["box"], det.get("mask"), depth_hint=snap_hint, debug=lidar_debug)
+        # A wall-mounted plate is flush with its wall: the return from the wall right beside it is its range
+        # (its own mask is too small to contain a scan point)
+        obj_mask = None if label in WALL_MOUNTED else det.get("mask")
+        lidar_info = {} if lidar_debug is None else lidar_debug
+        lidar = self._lidar_hits_in_box(proj, det["box"], obj_mask, depth_hint=snap_hint, debug=lidar_info)
         if lidar_debug is not None:
             self._log_lidar_snap_debug(label, depth, lidar, lidar_debug)
-        lidar_gate = 4.0 if (known_size or mono is not None) else 1e6
+        # Returns inside the object's own mask at the scan row are the object: no optical estimate may veto
+        # them (a person's cut-off box, sized 2.3 m too far, discarded a correct LiDAR range). Only the weaker
+        # column-only "snap" match must agree with the camera.
+        lidar_gate = 1e6 if lidar_info.get("reason") == "row" else (4.0 if (known_size or mono is not None) else 1e6)
         if lidar is not None and depth / lidar_gate < lidar[0] < depth * lidar_gate:
             depth, front_xy, _ = lidar
             sigma_d = 0.04 + 0.01 * depth
@@ -1426,12 +1698,16 @@ class ObjectPerceptionNode(Node):
         height_m = z_top - base_z
         if cut_t:
             height_m = max(height_m, typ_h)
+        if is_door:
+            height_m = max(height_m, DOOR_MIN_HEIGHT)
         height_m = max(0.05, min(height_m, max_h))
+        wall = self._wall_angle(proj, det["box"], depth, direction) if label in PANEL_OBJECTS else None
 
         sigma_xy = math.sqrt(sigma_d ** 2 + (0.02 * depth) ** 2)
         return {
             **det,
-            "is_dynamic": is_dynamic,
+            "is_dynamic": is_dynamic, "z_top": z_top, "wall": wall,
+            "mono_dist": mono["dist"] if mono is not None else None,  # raw metric depth (per-person calibration)
             "bx": float(center_xy[0]), "by": float(center_xy[1]),
             "depth": depth, "sigma": sigma_xy, "source": source,
             "z": base_z, "width_m": width_m, "height_m": height_m,
@@ -1465,11 +1741,13 @@ class ObjectPerceptionNode(Node):
         if torch.cuda.is_available():
             if not os.path.isfile(ENGINE_PATH):
                 self.get_logger().info(f"Building TensorRT engine {os.path.basename(ENGINE_PATH)} "
-                                       f"({len(VOCABULARY)} classes, one-time, a few minutes)...")
+                                       f"({len(VOCABULARY)} classes, one-time, 3-6 minutes; the camera window "
+                                       f"opens when it is done — do not close this terminal)...")
                 try:
                     model = YOLOE(MODEL_PATH)
                     model.set_classes(VOCABULARY, model.get_text_pe(VOCABULARY))
-                    built = model.export(format="engine", half=True, workspace=4, imgsz=640, device=0)
+                    # 2 GB workspace: the RTX 2050 has 4 GB, and a 4 GB request ran the GPU out of memory
+                    built = model.export(format="engine", half=True, workspace=2, imgsz=640, device=0)
                     shutil.move(str(built), ENGINE_PATH)
                     for old in glob.glob(model_path("yoloe-11s-seg-indoor-*.engine")):  # older vocabularies
                         if old != ENGINE_PATH:
@@ -1560,6 +1838,7 @@ class ObjectPerceptionNode(Node):
                 if self._latest_frame is not None:
                     frame = self._latest_frame
                     stamp = self._latest_frame_stamp
+                    rx = self._latest_frame_rx
                     self._latest_frame = None
                     self._inference_busy = True
 
@@ -1645,31 +1924,59 @@ class ObjectPerceptionNode(Node):
                 if not duplicate:
                     kept.append(d)
 
+            # A switch or socket is never on the door leaf itself: there it is the door handle (read as an
+            # "electric switch" on the rig), or something seen through an open doorway
+            doors = [k["box"] for k in kept if k["label"] == "door"]
+            if doors:
+                def inside(a, b):
+                    inter = max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(0, min(a[3], b[3]) - max(a[1], b[1]))
+                    return inter >= 0.8 * max(1, (a[2] - a[0]) * (a[3] - a[1]))
+                kept = [d for d in kept if not (d["label"] in WALL_MOUNTED and d["label"] not in ("door handle", "door knob")
+                                                and any(inside(d["box"], b) for b in doors))]
+
+            # Across frames: a label flicker to a worse-ranked look-alike on the same box is dropped
+            t_now = time.monotonic()
+            while self._recent_dets and t_now - self._recent_dets[0][0] > LOOKALIKE_MEMORY_S:
+                self._recent_dets.popleft()
+
+            def flicker(d):
+                ax1, ay1, ax2, ay2 = d["box"]
+                for _, r in self._recent_dets:
+                    if r["label"] == d["label"] or _ranking_score(r) <= _ranking_score(d) or not (
+                            self._confusable(r["label"], d["label"]) or self._confusable(r["raw_label"], d["raw_label"])):
+                        continue
+                    bx1, by1, bx2, by2 = r["box"]
+                    inter = max(0, min(ax2, bx2) - max(ax1, bx1)) * max(0, min(ay2, by2) - max(ay1, by1))
+                    if inter / max(min((ax2 - ax1) * (ay2 - ay1), (bx2 - bx1) * (by2 - by1)), 1) > CROSS_CLASS_OVERLAP:
+                        return True
+                return False
+
+            kept = [d for d in kept if not flicker(d)]
+            self._recent_dets.extend((t_now, d) for d in kept)
+
             with self._inference_lock:
-                self._inference_results = (stamp, kept, frame, dmap)
+                self._inference_results = (stamp, kept, frame, dmap, rx)
                 self._inference_busy = False
 
     # ══════════════════════════════════════════════════════════════════════
     # ── TRACKING ──
     # ══════════════════════════════════════════════════════════════════════
+    def _results_callback(self):
+        """Process a finished inference as soon as it is ready."""
+        with self._inference_lock:
+            new_results, self._inference_results = self._inference_results, None
+        if new_results is not None:
+            stamp, dets, frame, dmap, rx = new_results
+            now = time.monotonic()
+            self._process_detections(stamp, dets, frame, now, dmap, t_meas=min(rx, now))
+            self._publish_markers(now)
+
     def _tracking_callback(self):
         now = time.monotonic()
-
-        new_results = None
-        with self._inference_lock:
-            if self._inference_results is not None:
-                new_results = self._inference_results
-                self._inference_results = None
-
-        if new_results is not None:
-            stamp, dets, frame, dmap = new_results
-            self._process_detections(stamp, dets, frame, now, dmap)
-        else:
-            # Predict step for smooth interpolation
-            for tracks in list(self._dynamic_tracks.values()) + list(self._static_tracks.values()):
-                for track in tracks:
-                    track.predict(now)
-
+        # Static objects only: a moving object's state stays at its last sighting (drawn carried forward)
+        for tracks in self._static_tracks.values():
+            for track in tracks:
+                track.predict(now)
         self._publish_markers(now)
 
     def _associate(self, label: str, meas: list, is_dynamic: bool, now: float):
@@ -1689,11 +1996,17 @@ class ObjectPerceptionNode(Node):
             cost = np.full((len(meas), len(tracks)), BIG_COST)
             for i, m in enumerate(meas):
                 for j, t in enumerate(tracks):
+                    if is_dynamic:
+                        cost[i, j] = self._dynamic_cost(m, t, now, max_gate)
+                        continue
                     e = math.hypot(m["px"] - t.x[0], m["py"] - t.x[1])
                     m2 = t.mahalanobis_sq(m["px"], m["py"], m["sigma"])
                     if e <= max_gate and (m2 <= CHI2_GATE_2D or e <= min_sep):
                         size_penalty = abs(m["width_m"] - t.width) / max(t.width, 0.1)
                         cost[i, j] = m2 + 2.0 * size_penalty
+                    elif (t.last_box is not None and now - t.last_box_t <= BOX_TRACK_MAX_AGE
+                          and _box_iou(m["box"], t.last_box) >= BOX_TRACK_IOU):
+                        cost[i, j] = BOX_ONLY_COST  # same object in the image; worse than any 3-D match
             if linear_sum_assignment is not None:
                 rows, cols = linear_sum_assignment(cost)
                 pairs = zip(rows, cols)
@@ -1707,12 +2020,14 @@ class ObjectPerceptionNode(Node):
             for i, j in pairs:
                 if cost[i, j] < BIG_COST:
                     assigned[i] = tracks[j]
+                    meas[i]["box_only"] = not is_dynamic and cost[i, j] == BOX_ONLY_COST
 
         for i, m in enumerate(meas):
             t = assigned[i]
             if t is None:
                 # A second detection on top of an existing object is a duplicate, never a new object
-                near = [tr for tr in tracks if _same_object((m["px"], m["py"]), _dedup_width(label, m["width_m"]),
+                # (not for people: two can stand side by side)
+                near = [] if is_dynamic else [tr for tr in tracks if _same_object((m["px"], m["py"]), _dedup_width(label, m["width_m"]),
                                                             m["sigma"] ** 2, tr.x[:2], _dedup_width(label, tr.width),
                                                             _track_var(tr), min_sep)]
                 if near:
@@ -1734,12 +2049,53 @@ class ObjectPerceptionNode(Node):
                         f"w={m['width_m']:.2f} | nearby: {near_txt or 'none'}")
                 t = KalmanTracker(track_id, m["px"], m["py"], m["z"], m["width_m"], m["height_m"],
                                   m["conf"], now, is_dynamic, m["sigma"], m["depth"])
+                t.min_ranged_hits = MEMORY_MIN_RANGED_HITS if self._depth_model is not None else 0
                 t.uid = self._next_uid
                 self._next_uid += 1
                 tracks.append(t)
             else:
-                t.update(m["px"], m["py"], m["z"], m["width_m"], m["height_m"], m["conf"],
-                         now, m["sigma"], m["depth"])
+                # Matched in the image only: weight the position by how far it jumped
+                sigma = m["sigma"]
+                if is_dynamic:
+                    sigma = max(sigma, DYN_MIN_SIGMA)
+                    # Outside the 99 % gate of where the person should be: the range hit something else (the
+                    # wall behind, the person next to them) — keep the track, weight that range by its jump.
+                    # Such flips were the fake 1-2 m/s speeds of people standing still.
+                    if t.mahalanobis_sq(m["px"], m["py"], sigma) > CHI2_GATE_2D:
+                        prev = t.outlier_xy
+                        t.outlier_xy = (m["px"], m["py"])
+                        t.outlier_run = t.outlier_run + 1 if prev is not None and math.hypot(
+                            m["px"] - prev[0], m["py"] - prev[1]) <= 3 * DYN_MIN_SIGMA else 1
+                        if t.outlier_run >= DYN_REANCHOR_RUN:
+                            # Several sightings agree on the new place: the track was wrong, not them. Re-anchor
+                            # there at rest (coasting on a speed made from a range flip gave 1.5 m/s to a
+                            # person standing still)
+                            t.x[:2], t.x[2:4] = (m["px"], m["py"]), 0.0
+                            t.P[:] = 0.0
+                            t.P[0, 0] = t.P[1, 1] = sigma * sigma
+                            t.P[2, 2] = t.P[3, 3] = DYN_INIT_VEL_VAR
+                            t.outlier_run, t.outlier_xy = 0, None
+                        else:
+                            sigma = max(sigma, math.hypot(m["px"] - t.x[0], m["py"] - t.x[1]))
+                    else:
+                        t.outlier_run, t.outlier_xy = 0, None
+                keep_shape = False
+                if not is_dynamic and not m.get("box_only"):
+                    t.box_only_xy = []
+                elif not is_dynamic:
+                    if m["source"] != "optical":
+                        t.box_only_xy = (t.box_only_xy + [(m["px"], m["py"])])[-BOX_SNAP_RUN:]
+                    run = np.array(t.box_only_xy)
+                    if len(run) >= BOX_SNAP_RUN and np.linalg.norm(run - np.median(run, axis=0), axis=1).max() <= BOX_SNAP_SPREAD:
+                        t.box_only_xy = []
+                        t.x[:2] = np.median(run, axis=0)
+                        t.P[0, 0] = t.P[1, 1] = max(sigma * sigma, STATIC_MIN_VAR)
+                    else:
+                        # A range that disagrees with the map: the object stays put and keeps its shape
+                        sigma = max(sigma, math.hypot(m["px"] - t.x[0], m["py"] - t.x[1]))
+                        keep_shape = True
+                t.update(m["px"], m["py"], t.z if keep_shape else m["z"], t.width if keep_shape else m["width_m"],
+                         t.height if keep_shape else m["height_m"], m["conf"], now, sigma, m["depth"])
                 if t.from_memory:
                     t.from_memory = False
                     if not self._memory_confirmed:
@@ -1748,33 +2104,67 @@ class ObjectPerceptionNode(Node):
                                                f"it was saved; the saved object map is live")
             m["track"] = t
 
+        if is_dynamic:
+            return  # two people sitting side by side are two people, never "duplicates" to merge
         merged_into = self._merge_duplicate_tracks(tracks, label)
         self._deleted_uids.extend(t.uid for t in merged_into.pop("_removed", []))
         for m in meas:
             m["track"] = merged_into.get(id(m["track"]), m["track"])
 
+    def _dynamic_cost(self, m, t, now, max_gate):
+        """Matching cost of a moving object's sighting to a track. Image continuity first: people close
+        together (two sitting side by side at the same range) are told apart by their boxes, which move on
+        smoothly from frame to frame, far better than by 3-D distance."""
+        if t.last_box is not None and now - t.last_box_t <= DYN_BOX_MAX_AGE:
+            iou = _box_iou(m["box"], t.last_box)
+            if iou >= DYN_BOX_IOU:
+                return 10.0 * (1.0 - iou)
+        e = math.hypot(m["px"] - t.x[0], m["py"] - t.x[1])
+        m2 = t.mahalanobis_sq(m["px"], m["py"], max(m["sigma"], DYN_MIN_SIGMA))
+        if e <= max_gate and m2 <= CHI2_GATE_2D:
+            return 10.0 + m2
+        return BIG_COST
+
     def _lookalike_track(self, m):
         """Label of a static track of another class on this measurement's spot (same physical object):
-        a look-alike on an overlapping footprint, or any label on the same footprint, size and height."""
+        a look-alike on an overlapping footprint, or any label on the same footprint, size and height.
+        Returns (label, image_only) or (None, False); image_only when it matched only in the image."""
         def same(t, lbl, min_sep=0.0):
             return _same_object((m["px"], m["py"]), _dedup_width(m["label"], m["width_m"]), m["sigma"] ** 2,
                                 t.x[:2], _dedup_width(lbl, t.width), _track_var(t), min_sep)
 
         min_sep = _min_separation(m["label"])
         if any(same(t, m["label"], min_sep) for t in self._static_tracks.get(m["label"], [])):
-            return None
+            return None, False
+        # In the image: a look-alike's box where a confirmed object was just seen is that object, whatever
+        # the distance says (an open doorway's "mirror" sightings ranged through the opening, 7.8 m away)
+        now = time.monotonic()
         best = None
+        for lbl, tracks in self._static_tracks.items():
+            if lbl == m["label"] or not self._confusable(lbl, m["label"]):
+                continue
+            for t in tracks:
+                if (t.confirmed and t.last_box is not None and now - t.last_box_t <= LOOKALIKE_BOX_AGE
+                        and _box_overlap(m["box"], t.last_box) > CROSS_CLASS_OVERLAP
+                        and (best is None or t.hits > best[1].hits)):
+                    best = (lbl, t)
+        if best is not None:
+            in_3d = _same_object((m["px"], m["py"]), _dedup_width(m["label"], m["width_m"]), m["sigma"] ** 2,
+                                 best[1].x[:2], _dedup_width(best[0], best[1].width), _track_var(best[1]))
+            return best[0], not in_3d
         for lbl, tracks in self._static_tracks.items():
             if lbl == m["label"]:
                 continue
             confusable = self._confusable(lbl, m["label"])
             for t in tracks:
+                if not t.confirmed:  # a flickering hallucination may not claim a real object's sightings
+                    continue
                 match = same(t, lbl) if confusable else _same_place(
                     (m["px"], m["py"]), _dedup_width(m["label"], m["width_m"]), m["z"], m["height_m"],
                     t.x[:2], _dedup_width(lbl, t.width), t.z, t.height)
                 if match and (best is None or t.hits > best[1].hits):
                     best = (lbl, t)
-        return best[0] if best else None
+        return (best[0], False) if best else (None, False)
 
     def _relabel_tracks(self):
         """Rename a track whose evidence clearly favours a look-alike label (wardrobe_1 -> door_1).
@@ -1868,7 +2258,8 @@ class ObjectPerceptionNode(Node):
 
     def _save_objects(self):
         objects = [{"class": label, "x": round(float(t.x[0]), 3), "y": round(float(t.x[1]), 3),
-                    "z": round(float(t.z), 3), "w": round(t.width, 3), "h": round(t.height, 3), "hits": t.hits}
+                    "z": round(float(t.z), 3), "w": round(t.width, 3), "h": round(t.height, 3), "hits": t.hits,
+                    **({"color": t.color} if t.color else {})}
                    for label, tracks in self._static_tracks.items() for t in tracks if t.reliable]
         try:
             with open(self._objects_file, "w") as f:
@@ -1895,10 +2286,15 @@ class ObjectPerceptionNode(Node):
                               False, math.sqrt(REVISIT_VAR), 0.0)
             # Reliable and remembered, but not live: drawn faded until the camera sees it again
             t.hits = max(int(o.get("hits", 0)), MEMORY_MIN_HITS)
+            t.is_reliable = True
+            t.conf_sum = 0.5 * t.hits
+            t.ranged_hits = t.hits
             t.first_seen = now - MEMORY_MIN_SPAN - REVISIT_GAP_S - 1.0
             t.last_seen = now - REVISIT_GAP_S - 1.0
             t.seen_times.clear()
             t.from_memory = True
+            if o.get("color"):
+                t.colors = {o["color"]: COLOR_MIN_VOTES}
             t.uid = self._next_uid
             self._next_uid += 1
             tracks.append(t)
@@ -1939,6 +2335,15 @@ class ObjectPerceptionNode(Node):
         twin.x[:2] = (wa * twin.x[:2] + wb * t.x[:2]) / (wa + wb)
         twin.P[:2, :2] = np.eye(2) / (wa + wb)
         twin.hits += t.hits
+        twin.misses += t.misses
+        twin.wall_vec = twin.wall_vec + t.wall_vec
+        twin.view_bins |= t.view_bins
+        twin.max_gap = max(twin.max_gap, t.max_gap)
+        for c, v in t.colors.items():
+            twin.colors[c] = twin.colors.get(c, 0.0) + v
+        twin.conf_sum += t.conf_sum
+        twin.ranged_hits += t.ranged_hits
+        twin.is_reliable = twin.is_reliable or t.is_reliable
         twin.first_seen = min(twin.first_seen, t.first_seen)
         twin.last_seen = max(twin.last_seen, t.last_seen)
         twin.seen_times.extend(t.seen_times)
@@ -1967,7 +2372,8 @@ class ObjectPerceptionNode(Node):
     def _merge_same_place_tracks(self):
         """Fold static tracks of different labels that sit on one spot (one object mapped under several
         names from different views) into the best-supported one. Returns {id(folded track): (kept, label)}."""
-        entries = sorted(((lbl, t) for lbl, tracks in self._static_tracks.items() for t in tracks),
+        # Unconfirmed tracks take no part: a frequent but flickering misdetection must not absorb a real object
+        entries = sorted(((lbl, t) for lbl, tracks in self._static_tracks.items() for t in tracks if t.confirmed),
                          key=lambda e: -e[1].hits)
         kept, folded = [], {}
         for lbl, t in entries:
@@ -1993,7 +2399,8 @@ class ObjectPerceptionNode(Node):
             folded[id(t)] = host
         return folded
 
-    def _in_view_batch(self, xyz: np.ndarray, pose, K, h: int):
+    def _in_view_batch(self, xyz: np.ndarray, pose, K, h: int, margin: float = 0.12,
+                       max_range: float = VISIBILITY_MAX_RANGE):
         """Which mapped objects (rows of xyz: x, y, z_mid in the map) should the camera be seeing now?
 
         One vectorised projection for all objects. Returns (in_view, u, v, cam_depth) arrays: the pixel
@@ -2006,12 +2413,13 @@ class ObjectPerceptionNode(Node):
         dx, dy = xyz[:, 0] - px, xyz[:, 1] - py
         p_base = np.stack([c * dx + s * dy, -s * dx + c * dy, xyz[:, 2]], axis=1)
         pc = (p_base - self._cam_t) @ self._cam_R
-        near = np.hypot(p_base[:, 0] - self._cam_t[0], p_base[:, 1] - self._cam_t[1]) <= VISIBILITY_MAX_RANGE
+        near = np.hypot(p_base[:, 0] - self._cam_t[0], p_base[:, 1] - self._cam_t[1]) <= max_range
         front = pc[:, 2] >= 0.5
         zc = np.where(front, pc[:, 2], 1.0)
         u = fx * pc[:, 0] / zc + cx
         v = fy * pc[:, 1] / zc + cy
-        in_view = near & front & (0.12 * w < u) & (u < 0.88 * w) & (0.12 * h < v) & (v < 0.88 * h)
+        lo, hi = margin, 1.0 - margin
+        in_view = near & front & (lo * w < u) & (u < hi * w) & (lo * h < v) & (v < hi * h)
         return in_view, u, v, pc[:, 2]
 
     def _occluded(self, u: float, v: float, cam_depth: float, dmap, w: int, h: int, proj=None,
@@ -2021,35 +2429,109 @@ class ObjectPerceptionNode(Node):
             if proj is None:
                 return False
             pu, _, _, _, zc = proj
-            return int(np.count_nonzero((np.abs(pu - u) < half_px) & (zc < cam_depth - OCCLUSION_DEPTH_MARGIN))) >= 2
+            # Most of the returns in the object's columns must be closer: a door jamb at the edge of an object
+            # seen through a doorway does not hide it
+            col = zc[np.abs(pu - u) < half_px]
+            return col.size >= 3 and float(np.median(col)) < cam_depth - OCCLUSION_DEPTH_MARGIN
         ui, vi = int(u), int(v)
         if not (0 <= ui < w and 0 <= vi < h):
             return False
         d = dmap[vi, ui] * self._depth_scale
         return d > 0.05 and d < cam_depth - OCCLUSION_DEPTH_MARGIN
 
+    @staticmethod
+    def _view_bin(obj_xy, cam_xy) -> int:
+        a = math.degrees(math.atan2(cam_xy[1] - obj_xy[1], cam_xy[0] - obj_xy[0])) % 360.0
+        return int(a // REMOVE_VIEW_BIN_DEG)
+
+    def _seen_from_here(self, t, cam_xy) -> bool:
+        n = int(round(360.0 / REMOVE_VIEW_BIN_DEG))
+        b = self._view_bin(t.x[:2], cam_xy)
+        return any((b + k) % n in t.view_bins for k in (-1, 0, 1))
+
+    def _visible_fraction(self, t, pose, K, w: int, h: int) -> float:
+        """Share of the object's projected 3-D box (footprint x height) that falls inside the image."""
+        fx, fy, cx, cy, _ = K
+        px, py, yaw = pose
+        c, s_ = math.cos(yaw), math.sin(yaw)
+        half = 0.5 * t.width
+        corners = np.array([(t.x[0] + dx, t.x[1] + dy, z) for dx in (-half, half) for dy in (-half, half)
+                            for z in (t.z, t.z + t.height)])
+        dx, dy = corners[:, 0] - px, corners[:, 1] - py
+        p_base = np.stack([c * dx + s_ * dy, -s_ * dx + c * dy, corners[:, 2]], axis=1)
+        pc = (p_base - self._cam_t) @ self._cam_R
+        if np.any(pc[:, 2] < 0.3):
+            return 0.0
+        us, vs = fx * pc[:, 0] / pc[:, 2] + cx, fy * pc[:, 1] / pc[:, 2] + cy
+        x1, x2, y1, y2 = us.min(), us.max(), vs.min(), vs.max()
+        area = max(1.0, (x2 - x1) * (y2 - y1))
+        inside = max(0.0, min(x2, w) - max(x1, 0)) * max(0.0, min(y2, h) - max(y1, 0))
+        return inside / area
+
+    def _spot_empty(self, u: float, v: float, cam_depth: float, t, K, dmap) -> bool:
+        """Does the depth at the object's own spot (its size, not widened) read clearly behind it?"""
+        if dmap is None:
+            return False
+        fx = K[0]
+        H, W = dmap.shape
+        half = max(3, int(0.3 * fx * t.width / max(cam_depth, 0.1)))
+        ui, vi = int(u), int(v)
+        patch = dmap[max(0, vi - half):min(H, vi + half + 1), max(0, ui - half):min(W, ui + half + 1)]
+        margin = max(REMOVE_FREE_MARGIN, 0.15 * cam_depth)
+        return patch.size > 0 and float(np.median(patch)) * self._depth_scale > cam_depth + margin
+
     def _free_space(self, u: float, v: float, cam_depth: float, t, K, dmap, proj) -> bool:
         """Ray-cast clearing: does live depth show open space well beyond a remembered object's spot?
 
         Uses the low percentile of a patch of the depth map (or, without depth, the LiDAR points
         crossing the object's columns while the scan plane could physically hit it), so any surface
-        still at the object's range keeps it alive.
+        still at the object's range keeps it alive. A remembered object's patch is widened by
+        FREE_SPACE_SLACK and its 10th percentile used, so a few decimetres of SLAM/depth offset while
+        walking cannot make the patch miss the object and read the wall behind it.
         """
         fx, _, _, _, w = K
-        half_px = max(3, int(0.3 * fx * t.width / max(cam_depth, 0.1)))
+        if t.reliable:
+            half_px = max(3, int(0.5 * fx * (t.width + 2 * FREE_SPACE_SLACK) / max(cam_depth, 0.1)))
+            pct = 10
+        else:
+            half_px = max(3, int(0.3 * fx * t.width / max(cam_depth, 0.1)))
+            pct = 25
         limit = cam_depth + FREE_SPACE_MARGIN
         if dmap is not None:
             H, W = dmap.shape
             ui, vi = int(u), int(v)
             patch = dmap[max(0, vi - half_px):min(H, vi + half_px + 1), max(0, ui - half_px):min(W, ui + half_px + 1)]
-            return patch.size > 0 and float(np.percentile(patch, 25)) * self._depth_scale > limit
+            return patch.size > 0 and float(np.percentile(patch, pct)) * self._depth_scale > limit
         if proj is not None and self._lidar_t is not None and t.z <= self._lidar_t[2] <= t.z + t.height:
             pu, _, _, _, zc = proj
             col = zc[np.abs(pu - u) < half_px]
             return col.size >= 3 and float(col.min()) > limit
         return False
 
-    def _process_detections(self, msg_stamp, dets, frame, now, dmap=None):
+    def _dynamic_box_match(self, m, t):
+        """The moving-object track whose recent image box this measurement's box overlaps most, or None."""
+        best, best_iou = None, DYN_BOX_IOU
+        for tr in self._dynamic_tracks.get(m["label"], []):
+            if tr.last_box is not None and t - tr.last_box_t <= DYN_BOX_MAX_AGE:
+                iou = _box_iou(m["box"], tr.last_box)
+                if iou >= best_iou:
+                    best, best_iou = tr, iou
+        return best
+
+    def _rescale_measurement(self, m, depth, pose):
+        """Move a measurement along its viewing ray to a corrected range."""
+        px0, py0, yaw0 = pose
+        cam = self._cam_t[:2]
+        k = depth / max(m["depth"], 1e-3)
+        m["bx"], m["by"] = cam[0] + (m["bx"] - cam[0]) * k, cam[1] + (m["by"] - cam[1]) * k
+        c, s_ = math.cos(yaw0), math.sin(yaw0)
+        m["px"], m["py"] = px0 + c * m["bx"] - s_ * m["by"], py0 + s_ * m["bx"] + c * m["by"]
+        m["depth"] = depth
+        m["sigma"] = 0.05 + 0.05 * depth
+
+    def _process_detections(self, msg_stamp, dets, frame, now, dmap=None, t_meas=None):
+        """`t_meas`: when the frame arrived (monotonic) — the time moving objects are tracked at."""
+        t_meas = now if t_meas is None else t_meas
         h, w = frame.shape[:2]
         frame_dt = min(0.5, now - self._last_process_time)
         self._last_process_time = now
@@ -2087,11 +2569,22 @@ class ObjectPerceptionNode(Node):
         px0, py0, yaw0 = pose
         cyaw, syaw = math.cos(yaw0), math.sin(yaw0)
 
+        # Colour references are relative to the frame's white level (95th percentile of brightness)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV) if any(d.get("mask") is not None for d in dets) else None
+        vref = max(120.0, float(np.percentile(hsv[..., 2], 95))) if hsv is not None else 255.0
+
         measurements = []
         for det in dets:
             m = self._measure_detection(det, K, h, proj, dmap)
+            if m["label"] in FLOOR_LEVEL_HAZARDS and m["source"] != "optical" and m["z_top"] > FLOOR_HAZARD_MAX_TOP:
+                continue  # measured well above the floor: not a step or hole (a counter edge, a shelf)
+            if (m["label"] == "door" and m["width_m"] < DOOR_MIN_WIDTH
+                    and BOX_EDGE_PX < m["box"][0] and m["box"][2] < w - BOX_EDGE_PX):
+                continue
             m["px"] = px0 + cyaw * m["bx"] - syaw * m["by"]
             m["py"] = py0 + syaw * m["bx"] + cyaw * m["by"]
+            if m["wall"] is not None:
+                m["wall"] = (m["wall"][0] + yaw0, m["wall"][1])
             measurements.append(m)
 
         # The same physical object seen under a look-alike label (a door read as a wardrobe) updates
@@ -2099,16 +2592,50 @@ class ObjectPerceptionNode(Node):
         for m in measurements:
             m["seen_label"] = m["label"]
             if not m["is_dynamic"]:
-                lookalike = self._lookalike_track(m)
+                lookalike, image_only = self._lookalike_track(m)
                 if lookalike is not None:
                     m["label"] = lookalike
+                    if image_only:
+                        # Same box, but ranged somewhere else (seen through an open doorway): it is that
+                        # object, and no evidence for renaming it
+                        m["seen_label"] = lookalike
+
+        # Camera position in the map (viewing directions of objects)
+        cam_xy_map = (px0 + cyaw * self._cam_t[0] - syaw * self._cam_t[1], py0 + syaw * self._cam_t[0] + cyaw * self._cam_t[1])
+
+        # A person the LiDAR misses this frame (arm's-length, bent down, between scan points): their metric
+        # depth, corrected by their own LiDAR/depth ratio from earlier frames (depth read people 0.37 m long)
+        for m in measurements:
+            if m["is_dynamic"] and m["source"] != "lidar" and m.get("mono_dist"):
+                tr = self._dynamic_box_match(m, t_meas)
+                if tr is not None and tr.mono_ratio is not None:
+                    self._rescale_measurement(m, tr.mono_ratio * m["mono_dist"], pose)
+                    m["source"] = "depth"
 
         groups = {}
         for m in measurements:
             groups.setdefault((m["label"], m["is_dynamic"]), []).append(m)
         for (label, is_dynamic), group in groups.items():
-            self._associate(label, group, is_dynamic, now)
+            self._associate(label, group, is_dynamic, t_meas if is_dynamic else now)
         for m in measurements:
+            t_obs = t_meas if m["is_dynamic"] else now
+            if m["source"] != "optical" and m["track"].last_seen == t_obs:
+                m["track"].ranged_hits += 1
+            if m["is_dynamic"] and m["source"] == "lidar" and m.get("mono_dist"):
+                r = max(0.5, min(2.0, m["depth"] / m["mono_dist"]))
+                tr = m["track"]
+                tr.mono_ratio = r if tr.mono_ratio is None else (1 - MONO_RATIO_ALPHA) * tr.mono_ratio + MONO_RATIO_ALPHA * r
+            if hsv is not None and not m["is_dynamic"] and m.get("mask") is not None:
+                x1, y1, x2, y2 = m["box"]
+                color = _color_name(hsv[y1:y2, x1:x2], vref, m["mask"][y1:y2, x1:x2])
+                if color is not None:
+                    m["track"].colors[color] = m["track"].colors.get(color, 0.0) + m["conf"]
+            m["track"].last_box, m["track"].last_box_t = m["box"], t_obs
+            if not m["is_dynamic"] and m["track"].last_seen == now:
+                m["track"].view_bins.add(self._view_bin(m["track"].x[:2], cam_xy_map))
+            if m["wall"] is not None:
+                a, wt = m["wall"]
+                m["track"].wall_vec = m["track"].wall_vec + wt * np.array([math.cos(2 * a), math.sin(2 * a)])
             votes = m["track"].votes
             boost = PRIORITY_BOOST if m["seen_label"] in PRIORITY_LABELS else 1.0
             votes[m["seen_label"]] = votes.get(m["seen_label"], 0.0) + m["conf"] * boost
@@ -2152,17 +2679,22 @@ class ObjectPerceptionNode(Node):
             with self._hud_lock:
                 prev_hud = self._hud_tracks.get(final_label)
                 if prev_hud is not None:
-                    alpha = 0.70 if is_dynamic else 0.55
-                    x1_s = int(round((1 - alpha) * prev_hud['x1'] + alpha * x1))
-                    y1_s = int(round((1 - alpha) * prev_hud['y1'] + alpha * y1))
-                    x2_s = int(round((1 - alpha) * prev_hud['x2'] + alpha * x2))
-                    y2_s = int(round((1 - alpha) * prev_hud['y2'] + alpha * y2))
-                    depth_s = (1 - alpha) * prev_hud['depth'] + alpha * depth
+                    # Moving objects: the box is drawn on the frame it was detected in, so smoothing would
+                    # only make it trail the person; their distance is smoothed lightly
+                    # Static objects: small detector jitter is smoothed strongly, a real move of the box (the
+                    # wearer turning) is followed at once — adaptive, like a one-euro filter
+                    def smooth(old, new, scale, floor):
+                        a = 1.0 if is_dynamic else min(1.0, floor + abs(new - old) / scale)
+                        return (1 - a) * old + a * new
+                    x1_s, y1_s, x2_s, y2_s = (int(round(smooth(prev_hud[k], v, HUD_BOX_SCALE_PX, HUD_BOX_ALPHA)))
+                                              for k, v in (('x1', x1), ('y1', y1), ('x2', x2), ('y2', y2)))
+                    depth_s = ((1 - 0.6) * prev_hud['depth'] + 0.6 * depth) if is_dynamic else \
+                        smooth(prev_hud['depth'], depth, HUD_DEPTH_SCALE_M, HUD_DEPTH_ALPHA)
                 else:
                     x1_s, y1_s, x2_s, y2_s, depth_s = x1, y1, x2, y2, depth
 
-                # A single-frame detection is often a misclassification: label it once seen twice
-                if track.hits >= HUD_MIN_HITS:
+                # Only confirmed objects are drawn: a flickering misdetection never reaches the screen
+                if track.confirmed:
                     self._hud_tracks[final_label] = {
                         'x1': x1_s, 'y1': y1_s, 'x2': x2_s, 'y2': y2_s,
                         'label': final_label, 'conf': conf, 'is_dynamic': is_dynamic,
@@ -2174,7 +2706,7 @@ class ObjectPerceptionNode(Node):
 
             # ── 5. STRUCTURED ASSISTIVE HAZARD COMMUNICATION ──
             danger_d = self._danger_distance * (2.0 if raw_label in DROP_HAZARDS or label in DROP_HAZARDS else 1.0)
-            if depth_s < danger_d * 2.0:
+            if track.confirmed and depth_s < danger_d * 2.0:
                 severity = "DANGER" if depth_s < danger_d else "WARNING"
                 hazard_msg = (f"[{severity}] {label} at {depth_s:.1f}m {rel_pos_text}, "
                               f"size {track.width:.1f}x{track.height:.1f}m, {motion_text}")
@@ -2194,7 +2726,7 @@ class ObjectPerceptionNode(Node):
         self._hazard_history = current_hazards
 
         # Objects within arm's reach: expected to have dropped into the chest sensors' blind spot,
-        # so negative evidence and the stale-duplicate rule below must not remove them.
+        # so negative evidence below must not remove them.
         near_user = (lambda t: t.reliable and math.hypot(t.x[0] - px0, t.x[1] - py0) < BLIND_SPOT_RADIUS) \
             if self._mode == "indoor" else (lambda t: False)
 
@@ -2203,46 +2735,76 @@ class ObjectPerceptionNode(Node):
             self._purge_tracks(tracks, True, now)
         for label, tracks in self._static_tracks.items():
             self._purge_tracks(tracks, False, now)
-            # A remembered object next to a live one of the same class is a stale duplicate of it,
-            # e.g. created while its distance estimate jumped, or out of view below the camera.
-            live = [t for t in tracks if t.live(now)]
-            stale = [t for t in tracks if not t.live(now) and not near_user(t) and not self._protected(t)
-                     and any(_same_object(t.x[:2], t.width, _track_var(t), l.x[:2], l.width, _track_var(l),
-                                          _min_separation(label))
-                             for l in live)]
-            for t in stale:
-                self._deleted_uids.append(t.uid)
-            tracks[:] = [t for t in tracks if t not in stale]
+            # A remembered object and a live one of the same class on one spot (created while the distance
+            # estimate or SLAM jumped) are one object: merged, keeping the better-established ID
+            merged_into = self._merge_duplicate_tracks(tracks, label)
+            self._deleted_uids.extend(t.uid for t in merged_into.pop("_removed", []))
+            for m in measurements:
+                m["track"] = merged_into.get(id(m["track"]), m["track"])
 
-        # ── NEGATIVE EVIDENCE: mapped objects that are in plain view but no longer detected ──
-        # A misdetection disappears as soon as the camera looks at that spot again and sees nothing.
-        # A *reliable* (remembered) object gets more benefit of the doubt (UNSEEN_DROP_RELIABLE_S) and
-        # is not counted as "not there" if something closer occludes its spot in the depth map, or if
-        # it is within BLIND_SPOT_RADIUS of the wearer (below the chest sensors' view, not truly gone).
+        # ── NEGATIVE EVIDENCE: mapped objects that are in plain view but not detected ──
+        # Every frame the camera looks at an object's spot (nothing closer in the way) without detecting it
+        # counts as a miss for its detection rate (MIN_DETECTION_RATE). A misdetection that is not yet
+        # reliable disappears once it goes UNSEEN_DROP_S unseen in plain view. A reliable (remembered)
+        # object is only removed on sustained free-space evidence (the depth map reads past its whole
+        # spot): not being detected from a new angle while walking around must not erase the room's map.
+        # Objects within BLIND_SPOT_RADIUS of the wearer are below the chest sensors' view and left alone.
         matched = {id(m["track"]) for m in measurements}
         all_static = [t for tracks in self._static_tracks.values() for t in tracks]
         view = {}
         if all_static:
             xyz = np.array([(t.x[0], t.x[1], t.z + 0.5 * t.height) for t in all_static])
             vis, us, vs, depths = self._in_view_batch(xyz, pose, K, h)
-            view = {id(t): (bool(vis[i]), us[i], vs[i], float(depths[i])) for i, t in enumerate(all_static)}
+            vis_loose = self._in_view_batch(xyz, pose, K, h, DETECTION_VIEW_MARGIN, DETECTION_VIEW_RANGE)[0]
+            view = {id(t): (bool(vis[i]), bool(vis_loose[i]), us[i], vs[i], float(depths[i]))
+                    for i, t in enumerate(all_static)}
         fx_px = K[0]
+        # People (and pets) in front of an object hide it from the detector even when its centre pixel is clear
+        person_boxes = [m["box"] for m in measurements if m["is_dynamic"]]
+
+        def hidden_by_person(u, v, half_w, half_h):
+            spot = (u - half_w, v - half_h, u + half_w, v + half_h)
+            area = max(1.0, 4 * half_w * half_h)
+            return any(max(0, min(spot[2], b[2]) - max(spot[0], b[0])) * max(0, min(spot[3], b[3]) - max(spot[1], b[1]))
+                       >= REMOVE_PERSON_OVERLAP * area for b in person_boxes)
+
         for label, tracks in self._static_tracks.items():
             survivors = []
             for t in tracks:
                 if id(t) not in matched and not near_user(t) and not self._protected(t):
-                    in_view, u, v, cam_depth = view[id(t)]
+                    in_view, in_view_loose, u, v, cam_depth = view[id(t)]
                     half_px = 0.5 * fx_px * t.width / max(cam_depth, 0.1)
-                    if in_view and not self._occluded(u, v, cam_depth, dmap, w, h, proj, half_px):
+                    clear = (not self._occluded(u, v, cam_depth, dmap, w, h, proj, half_px)
+                             and not hidden_by_person(u, v, half_px, 0.5 * fx_px * t.height / max(cam_depth, 0.1)))
+                    # In frame: its centre, or (a switch at the image edge, a chair low in the view) most of its box
+                    frac = self._visible_fraction(t, pose, K, w, h) if (in_view_loose or t.reliable) else 0.0
+                    visible = clear and (in_view_loose or frac >= REMOVE_VISIBLE_FRACTION)
+                    if visible:
+                        t.misses += 1
+                    known_view = (t.reliable and visible and frac >= REMOVE_VISIBLE_FRACTION
+                                  and cam_depth <= REMOVE_MAX_RANGE and self._seen_from_here(t, cam_xy_map))
+                    if (in_view or known_view) and visible:
                         t.unseen_in_view += frame_dt
-                        t.free_in_view = (t.free_in_view + frame_dt
-                                          if label not in SEE_THROUGH
-                                          and self._free_space(u, v, cam_depth, t, K, dmap, proj) else 0.0)
-                        drop_after = UNSEEN_DROP_RELIABLE_S if t.reliable else UNSEEN_DROP_S
-                        if t.unseen_in_view > drop_after or t.free_in_view > FREE_SPACE_CLEAR_S:
-                            if t.free_in_view > FREE_SPACE_CLEAR_S:
-                                self.get_logger().info(f"🧹 Cleared ghost {label}_{t.id}: "
-                                                       f"depth reads >{FREE_SPACE_MARGIN:.1f} m past it")
+                        if known_view:
+                            # Looking at its spot from a direction it was seen from: it has been taken away
+                            empty = label not in SEE_THROUGH and self._spot_empty(u, v, cam_depth, t, K, dmap)
+                            t.free_in_view = t.free_in_view + frame_dt if empty else 0.0
+                            patience = max(REMOVE_UNSEEN_S, REMOVE_GAP_FACTOR * t.max_gap)
+                            gone = t.free_in_view > REMOVE_FREE_S or t.unseen_in_view > patience
+                            why = "its spot is empty" if t.free_in_view > REMOVE_FREE_S else \
+                                f"not seen there for {t.unseen_in_view:.1f} s"
+                        else:
+                            t.free_in_view = (t.free_in_view + frame_dt
+                                              if label not in SEE_THROUGH
+                                              and self._free_space(u, v, cam_depth, t, K, dmap, proj) else 0.0)
+                            if t.reliable:
+                                gone = t.free_in_view > FREE_SPACE_CLEAR_RELIABLE_S
+                            else:
+                                gone = t.unseen_in_view > UNSEEN_DROP_S or t.free_in_view > FREE_SPACE_CLEAR_S
+                            why = f"depth reads >{FREE_SPACE_MARGIN:.1f} m past its spot"
+                        if gone:
+                            if t.reliable:
+                                self.get_logger().info(f"🧹 Removed {label}_{t.id} from the map: {why} (taken away?)")
                             self._deleted_uids.append(t.uid)
                             continue
                     else:
@@ -2250,6 +2812,45 @@ class ObjectPerceptionNode(Node):
                         t.free_in_view = 0.0
                 survivors.append(t)
             tracks[:] = survivors
+
+        # ── SLAM / DEPTH JUMP: a remembered object not seen where it was, with a newer live object of its class
+        # right next to it, is that object. It keeps its old ID and takes the live position. All remembered,
+        # unseen objects of a class are matched to the newer live ones at once (Hungarian): a jump moves every
+        # object together, so nearest-first pairing handed a door's new sighting to the doorway next to it.
+        for label, tracks in self._static_tracks.items():
+            old = [t for t in tracks if t.is_reliable and not t.live(now)]
+            if not old:
+                continue
+            new = [l for l in tracks if l.live(now) and l.first_seen > min(t.first_seen for t in old)]
+            if not new:
+                continue
+            cost = np.full((len(old), len(new)), BIG_COST)
+            for i, t in enumerate(old):
+                for j, l in enumerate(new):
+                    d2 = (l.x[0] - t.x[0]) ** 2 + (l.x[1] - t.x[1]) ** 2
+                    if (l.first_seen > t.first_seen and d2 <= self._static_association_distance ** 2
+                            and d2 <= CHI2_GATE_2D * (REVISIT_VAR + _track_var(l))):
+                        cost[i, j] = d2
+            if linear_sum_assignment is not None:
+                pairs = zip(*linear_sum_assignment(cost))
+            else:
+                pairs, used = [], set()
+                for i in np.argsort(cost.min(axis=1)):
+                    j = int(np.argmin(np.where([k in used for k in range(len(new))], BIG_COST, cost[i])))
+                    pairs.append((i, j))
+                    used.add(j)
+            for i, j in pairs:
+                t, l = old[i], new[j]
+                # Only once the camera has looked at the old spot long enough without seeing it there
+                if cost[i, j] >= BIG_COST or t.unseen_in_view <= DRIFT_MERGE_S:
+                    continue
+                shift = math.hypot(l.x[0] - t.x[0], l.x[1] - t.x[1])
+                self._fold_track(t, l)
+                t.unseen_in_view = t.free_in_view = 0.0
+                tracks.remove(l)
+                self._deleted_uids.append(l.uid)
+                self.get_logger().info(f"🔗 {label}_{t.id} re-found {shift:.2f} m from where it was remembered "
+                                       f"(SLAM/depth shift); keeping its ID")
 
         # ── MEMORY CAP: evict the oldest-seen remembered objects once over the limit ──
         remembered = sorted((t for tracks in self._static_tracks.values() for t in tracks
@@ -2262,6 +2863,8 @@ class ObjectPerceptionNode(Node):
 
         if self._mode == "indoor":
             self._infer_tables(now)
+        # The camera window shows this frame with these boxes, so they line up even on a moving person
+        self._hud_frame = (frame, now)
 
     def _infer_tables(self, now: float):
         """SMART TABLE INFERENCE: desktop objects floating at desk height imply a table YOLO missed."""
@@ -2334,10 +2937,10 @@ class ObjectPerceptionNode(Node):
                     if not self._shown(track, is_dynamic, now):
                         continue
                     final_label = f"{label.replace(' ', '_')}_{track.id}"
+                    pos = track.position_at(now)
                     self._add_track_marker(
                         current_markers, labels, track, final_label, now_msg, lifetime, is_dynamic, marker_frame,
-                        distance=away(track.x[0], track.x[1]),
-                        seen_ago=None if is_live else now - track.last_seen,
+                        distance=away(*pos), seen_ago=None if is_live else now - track.last_seen, pos=pos,
                     )
 
         for table in self._inferred_tables:
@@ -2380,20 +2983,27 @@ class ObjectPerceptionNode(Node):
                     live = t.live(now)
                     if not self._shown(t, is_dynamic, now):
                         continue
+                    x, y = t.position_at(now)
                     objects.append({
                         "name": f"{label.replace(' ', '_')}_{t.id}", "class": label, "uid": t.uid,
-                        "x": round(float(t.x[0]), 3), "y": round(float(t.x[1]), 3), "z": round(float(t.z), 3),
+                        "x": round(x, 3), "y": round(y, 3), "z": round(float(t.z), 3),
                         "w": round(float(t.width), 3), "h": round(float(t.height), 3),
                         "vx": round(float(t.x[2]), 3), "vy": round(float(t.x[3]), 3),
                         "dynamic": is_dynamic, "live": live, "seen_ago": round(now - t.last_seen, 1),
                     })
+                    if t.color is not None:
+                        objects[-1]["color"] = t.color
+                    if not is_dynamic and label in PANEL_OBJECTS and t.wall_yaw is not None:
+                        objects[-1]["yaw"] = round(t.wall_yaw, 3)  # direction of the wall it lies in
         self._objects_pub.publish(String(data=json.dumps({"frame": frame_id, "objects": objects})))
 
     @staticmethod
     def _declutter_labels(labels):
-        """Stack the text labels of objects standing close together so each one stays readable."""
+        """Stack the text labels of objects standing close together so each one stays readable.
+        Fixed order (by marker id, i.e. by object): sorting by height reshuffled the stack whenever two
+        heights jittered past each other, making labels jump 0.4 m."""
         placed = []
-        for text, _, _ in sorted(labels, key=lambda l: l[0].pose.position.z):
+        for text, _, _ in sorted(labels, key=lambda l: (l[0].ns, l[0].id)):
             p = text.pose.position
             for _ in range(20):
                 if not any(math.hypot(p.x - q.x, p.y - q.y) < LABEL_CLEAR_XY and abs(p.z - q.z) < LABEL_CLEAR_Z
@@ -2403,8 +3013,8 @@ class ObjectPerceptionNode(Node):
             placed.append(p)
 
     def _add_track_marker(self, current_markers, labels, track, label_text, now_msg, marker_lifetime, is_dynamic,
-                          frame_id, distance=0.0, base_label=None, seen_ago=None):
-        px, py = float(track.x[0]), float(track.x[1])
+                          frame_id, distance=0.0, base_label=None, seen_ago=None, pos=None):
+        px, py = pos if pos is not None else (float(track.x[0]), float(track.x[1]))
         obj_width = max(0.05, float(track.width))
         obj_height = max(0.05, float(track.height))
 
@@ -2497,6 +3107,20 @@ class ObjectPerceptionNode(Node):
                 leg.color = ColorRGBA(r=r * 0.7, g=g * 0.7, b=b * 0.7, a=0.6)
                 leg.lifetime = marker_lifetime
                 current_markers.append(leg)
+            return
+
+        wall_yaw = getattr(track, "wall_yaw", None) if base_label in PANEL_OBJECTS else None
+        if wall_yaw is not None:
+            # Thin panel along its wall: local y runs along the wall, x is the thickness
+            yaw = wall_yaw - math.pi / 2
+            cube_marker.type = Marker.CUBE
+            cube_marker.pose.position.z = base_z + obj_height / 2.0
+            cube_marker.pose.orientation.z, cube_marker.pose.orientation.w = math.sin(yaw / 2), math.cos(yaw / 2)
+            cube_marker.scale.x = PANEL_THICKNESS
+            cube_marker.scale.y = obj_width
+            cube_marker.scale.z = obj_height
+            cube_marker.color = marker_color
+            current_markers.append(cube_marker)
             return
 
         # Tesla-style semantic 3D rendering (Cylinders for people, spheres for balls, cubes for furniture)
@@ -2792,7 +3416,16 @@ def main(args=None) -> None:
     node = ObjectPerceptionNode(mode=mode)
 
     # ── ZERO-LAG ARCHITECTURE: Offload ROS 2 spin to background thread ──
-    ros_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+    def spin():
+        try:
+            rclpy.spin(node)
+        except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
+            pass  # Ctrl+C shuts the context down under the spinning thread
+        except Exception:
+            if rclpy.ok():
+                raise  # a real error; anything else is a callback caught mid-shutdown (publish on a dead context)
+
+    ros_thread = threading.Thread(target=spin, daemon=True)
     ros_thread.start()
 
     # ── MAIN THREAD: High-speed OpenCV GUI loop (maximum FPS, 0ms delay) ──
@@ -2803,7 +3436,12 @@ def main(args=None) -> None:
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
 
             while rclpy.ok():
+                # The frame the boxes were computed on, so they sit exactly on moving people (the newest
+                # camera frame is ~50 ms ahead of them); the raw feed only when processing stalls
                 frame = node._gui_frame
+                hud_frame = node._hud_frame
+                if hud_frame is not None and time.monotonic() - hud_frame[1] < HUD_SYNC_MAX_AGE:
+                    frame = hud_frame[0]
                 if frame is not None:
                     display_frame = frame.copy()
                     node._draw_cached_boxes(display_frame)
