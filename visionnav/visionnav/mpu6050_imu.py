@@ -27,7 +27,8 @@ unplugged IMU never leaves the map waiting for it. A lost connection (loose wire
 
   ros2 run visionnav mpu6050_imu              the node (normally started by pi_sensors.launch.py)
   ros2 run visionnav mpu6050_imu calibrate    wiring check, then the imu_* mount arguments: stand straight,
-                                              then lean forward (runs next to the node; needs no ROS)
+                                              then lean forward (needs no ROS; `setup_pi.sh imu` runs it with
+                                              the sensors paused, as the node would restart the chip under it)
 """
 
 import json
@@ -61,6 +62,10 @@ REG_SMPLRT_DIV, REG_CONFIG, REG_GYRO_CONFIG, REG_ACCEL_CONFIG = 0x19, 0x1A, 0x1B
 REG_ACCEL_XOUT_H, REG_PWR_MGMT_1, REG_WHO_AM_I = 0x3B, 0x6B, 0x75
 KNOWN_CHIPS = {0x68: "MPU-6050", 0x70: "MPU-6500", 0x71: "MPU-9250", 0x72: "MPU-6050 clone", 0x73: "MPU-9255",
                0x98: "MPU-6050 clone"}
+
+
+class ChipAsleep(OSError):
+    """The chip answers but measures nothing: it restarted (its power dropped) and sleeps, as after power-on."""
 
 
 class MPU6050:
@@ -106,6 +111,8 @@ class MPU6050:
     def read(self):
         raw = np.frombuffer(bytes(self.bus.read_i2c_block_data(self.address, REG_ACCEL_XOUT_H, 14)), dtype=">i2")
         raw = raw.astype(np.float64)
+        if not raw[[0, 1, 2, 4, 5, 6]].any():  # an awake chip always has some noise
+            raise ChipAsleep("the chip restarted and is asleep")
         return raw[0:3] * self.acc_scale, raw[4:7] * self.gyro_scale, raw[3] / 340.0 + 36.53
 
 
@@ -215,7 +222,14 @@ def calibrate_mount():
     """Wiring check and mount measurement, in a terminal on the Pi."""
     imu = MPU6050()
     try:
-        imu.open(reset=False)
+        for attempt in range(10):  # a loose contact may miss the first tries: the check below counts that
+            try:
+                imu.open()
+                break
+            except OSError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.1)
     except ImportError:
         print("The I2C library is missing: sudo apt-get install python3-smbus i2c-tools "
               "(or run setup_pi.sh, which installs it).")
@@ -226,31 +240,76 @@ def calibrate_mount():
               "`i2cdetect -y 1` must show 68.")
         return 1
     print(f"Found {KNOWN_CHIPS.get(imu.who, 'an unknown chip')} (WHO_AM_I 0x{imu.who:02x}) at 0x{ADDRESS:02x}.")
+    trouble = {"errors": 0, "restarts": 0}
 
-    def average(seconds, label):
-        acc, gyro = [], []
+    def sample(seconds):
+        """Readings for `seconds`, riding over dropouts (counted): a restarted chip is woken again."""
+        acc, gyro, temp = [], [], None
         t_end = time.monotonic() + seconds
         while time.monotonic() < t_end:
-            a, g, temp = imu.read()
-            acc.append(a)
-            gyro.append(g)
+            try:
+                a, g, temp = imu.read()
+                acc.append(a)
+                gyro.append(g)
+            except ChipAsleep:
+                trouble["restarts"] += 1
+                try:
+                    imu.open(reset=False)
+                except OSError:
+                    trouble["errors"] += 1
+            except OSError:
+                trouble["errors"] += 1
+                time.sleep(0.05)
             time.sleep(1.0 / RATE_HZ)
-        acc, gyro = np.array(acc), np.array(gyro)
+        return np.array(acc), np.array(gyro), temp
+
+    # Wiring check: 3 s of reads. A good connection has no errors and no restarts at all.
+    print("\nChecking the connection (3 s, keep the rig still)...")
+    acc, gyro, temp = sample(3.0)
+    n_ok = len(acc)
+    print(f"  {n_ok} good readings, {trouble['errors']} failed reads (chip not answering), "
+          f"{trouble['restarts']} chip restarts (power dropped)")
+    if n_ok:
+        a = acc.mean(axis=0)
+        print(f"  accel {np.round(a, 2)} m/s^2 (|a| {np.linalg.norm(a):.2f}, should be ~9.8), "
+              f"gyro {np.round(np.degrees(gyro.mean(axis=0)), 2)} deg/s, {temp:.0f} C — {describe_up(a)}")
+    if trouble["errors"] or trouble["restarts"] or n_ok < 100:
+        print("\nThe connection is unreliable, so the mount is not measured. The chip was found, so SDA/SCL are on\n"
+              "the right pins; a chip that restarts or stops answering has a loose contact, most often:\n"
+              "  * the GY-521's 8-pin header not soldered (only pushed through the holes): solder all 8 pins\n"
+              "  * a loose jumper on VCC (pin 1) or GND (pin 9): push each fully on, or replace it\n"
+              "  * long or thin wires: keep them under ~30 cm\n"
+              "Pi switched off for any rewiring. Then run this again.")
+        imu.close()
+        return 1
+    if abs(np.linalg.norm(acc.mean(axis=0)) - G) > 0.1 * G:
+        print("  |a| is not ~9.8 m/s^2: the chip is not reading correctly (a bad clone?).")
+        imu.close()
+        return 1
+    print("  Connection OK.")
+
+    def average(seconds, label):
+        acc, gyro, temp = sample(seconds)
+        if len(acc) < 0.5 * seconds * RATE_HZ:
+            raise OSError("too many failed reads: the connection became unreliable")
         a = acc.mean(axis=0)
         print(f"  {label}: accel {np.round(a, 2)} m/s^2 (|a| {np.linalg.norm(a):.2f}), "
               f"gyro {np.round(np.degrees(gyro.mean(axis=0)), 2)} deg/s, {temp:.0f} C — {describe_up(a)}")
         return a, np.degrees(gyro.std(axis=0)).max() < 1.5
 
-    print("\nWear the rig. Stand up straight and still (3 s)...")
-    time.sleep(1.0)
-    up1, still = average(2.0, "straight")
-    if abs(np.linalg.norm(up1) - G) > 0.1 * G:
-        print("  |a| is not ~9.8 m/s^2: the chip is not reading correctly (wrong full-scale, or a bad clone).")
-    if not still:
-        print("  (you were moving: the result may be off by a few degrees)")
-    print("\nNow lean your chest forward about 30 degrees, like a bow, and hold it (starts in 3 s)...")
-    time.sleep(3.0)
-    up2, _ = average(2.0, "leaning")
+    try:
+        print("\nWear the rig. Stand up straight and still (3 s)...")
+        time.sleep(1.0)
+        up1, still = average(2.0, "straight")
+        if not still:
+            print("  (you were moving: the result may be off by a few degrees)")
+        print("\nNow lean your chest forward about 30 degrees, like a bow, and hold it (starts in 3 s)...")
+        time.sleep(3.0)
+        up2, _ = average(2.0, "leaning")
+    except OSError as e:
+        print(f"\n{e}. Check the VCC and GND contacts (see above), then run this again.")
+        imu.close()
+        return 1
     rpy = mount_rpy(up1, up2)
     if rpy is None:
         print("\nThe lean was too small to find the forward direction. Run it again and lean further.")
@@ -298,11 +357,11 @@ def main(args=None):
             try:
                 self._imu.close()
                 self._imu.open()
-            except (OSError, FileNotFoundError) as e:
+                acc = np.mean([self._imu.read()[0] for _ in range(20)], axis=0)
+            except (OSError, FileNotFoundError) as e:  # ChipAsleep too: it restarted again while being set up
                 return str(e)
             except ImportError:
                 return "the I2C library is missing (sudo apt-get install python3-smbus, or run setup_pi.sh)"
-            acc = np.mean([self._imu.read()[0] for _ in range(20)], axis=0)
             self.get_logger().info(
                 f"{KNOWN_CHIPS.get(self._imu.who, 'Unknown chip')} (WHO_AM_I 0x{self._imu.who:02x}) on "
                 f"/dev/i2c-{self._imu.bus_no} at 0x{self._imu.address:02x}, {self._rate:.0f} Hz; at rest "
@@ -335,6 +394,11 @@ def main(args=None):
                 try:
                     acc, gyro_raw, temp = self._imu.read()
                     errors = 0
+                except ChipAsleep:
+                    self.get_logger().warn("IMU chip restarted (its power dropped: check the VCC and GND wires); "
+                                           "setting it up again")
+                    connected = False
+                    continue
                 except OSError as e:
                     errors += 1
                     if errors >= 10:
@@ -353,7 +417,12 @@ def main(args=None):
                 gyro = gyro_raw - (self._bias.bias if self._bias.bias is not None else 0.0)
                 q = self._level.update(gyro, acc, (now - last_t) if last_t is not None else period)
                 last_t = now
-                self._publish(stamp, q, gyro, acc)
+                try:
+                    self._publish(stamp, q, gyro, acc)
+                except Exception:  # shutting down (Ctrl+C invalidates the context under this thread)
+                    if not rclpy.ok():
+                        break
+                    raise
                 n += 1
                 if now - last_log > 60.0:
                     self.get_logger().info(f"IMU: {n / (now - last_log):.0f} Hz, {temp:.0f} C, gyro bias "

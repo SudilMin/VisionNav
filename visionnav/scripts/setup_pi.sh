@@ -85,12 +85,17 @@ if [ "$1" = "imu" ]; then
         echo "Your user was just given access to the I2C bus: reboot the Pi (sudo reboot), then run this again."
         exit 1
     fi
+    # The IMU node (started with the sensors) would restart the chip under the check: pause the sensors
+    echo "Pausing the button service and sensors during the check (started again at the end)..."
+    sudo systemctl stop visionnav-buttons 2>/dev/null || true
+    trap 'echo; sudo systemctl start visionnav-buttons 2>/dev/null || true; echo "Button service started again (press SENSORS to turn the sensors on)."' EXIT
     echo
     echo "I2C bus 1 (header pins 3 and 5) — the MPU-6050 shows as 68:"
     sudo i2cdetect -y 1
     source /opt/ros/jazzy/setup.bash
     source "$WS/install/setup.bash"
-    exec ros2 run visionnav mpu6050_imu calibrate
+    ros2 run visionnav mpu6050_imu calibrate || true
+    exit 0
 fi
 
 echo "== 1/6  Build the visionnav package"
