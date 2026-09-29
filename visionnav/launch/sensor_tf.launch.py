@@ -31,6 +31,13 @@ ARGS = {
     'camera_pitch_deg': ('0.0', 'Camera downward tilt, positive = looking down (deg)'),
     'camera_yaw_deg': ('0.0', 'Camera yaw relative to the body, positive = left (deg)'),
 }
+# Not numbers: outdoor mode (outdoor_sensors.launch.py) runs these TFs without the SLAM brain, under its own
+# node names (so the brain's nodes lingering in the network's node list after a mode switch are not mistaken
+# for them), and without odom -> base_footprint (outdoors everything is drawn around the wearer, base_footprint).
+FLAGS = {
+    'name_prefix': ('', 'Prefix of the static TF publisher node names'),
+    'odom_tf': ('true', "Publish the identity odom -> base_footprint ('false' when an EKF publishes it)"),
+}
 
 
 def _static_tf(name, parent, child, x=0.0, y=0.0, z=0.0, roll=0.0, pitch=0.0, yaw=0.0):
@@ -46,24 +53,25 @@ def _static_tf(name, parent, child, x=0.0, y=0.0, z=0.0, roll=0.0, pitch=0.0, ya
 
 def _launch_setup(context):
     val = {k: float(LaunchConfiguration(k).perform(context)) for k in ARGS}
-    return [
-        _static_tf('odom_to_base', 'odom', 'base_footprint'),
-        _static_tf('lidar_mount', 'base_footprint', 'laser',
+    pre = LaunchConfiguration('name_prefix').perform(context)
+    odom = LaunchConfiguration('odom_tf').perform(context).lower() == 'true'
+    return ([_static_tf(pre + 'odom_to_base', 'odom', 'base_footprint')] if odom else []) + [
+        _static_tf(pre + 'lidar_mount', 'base_footprint', 'laser',
                    z=val['lidar_height'],
                    roll=math.radians(val['lidar_roll_deg']),
                    yaw=math.radians(val['lidar_yaw_deg'])),
-        _static_tf('camera_mount', 'base_footprint', 'camera_mount',
+        _static_tf(pre + 'camera_mount', 'base_footprint', 'camera_mount',
                    z=val['camera_height'],
                    pitch=math.radians(val['camera_pitch_deg']),
                    yaw=math.radians(val['camera_yaw_deg'])),
         # Body frame (x forward) -> optical frame (z forward, x right, y down)
-        _static_tf('camera_optical', 'camera_mount', 'camera_link',
+        _static_tf(pre + 'camera_optical', 'camera_mount', 'camera_link',
                    roll=-math.pi / 2.0, yaw=-math.pi / 2.0),
     ]
 
 
 def generate_launch_description():
     return LaunchDescription(
-        [DeclareLaunchArgument(k, default_value=d, description=desc) for k, (d, desc) in ARGS.items()]
+        [DeclareLaunchArgument(k, default_value=d, description=desc) for k, (d, desc) in {**ARGS, **FLAGS}.items()]
         + [OpaqueFunction(function=_launch_setup)]
     )

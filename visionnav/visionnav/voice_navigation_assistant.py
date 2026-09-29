@@ -86,6 +86,17 @@ HELP_TEXT = ("Five buttons. Sensor button: turn the camera and LiDAR on or off. 
              "an object. Talk: tap to stop; hold it to speak a command; tap twice for what is around you. "
              "You can say: find the table with the cup, go to the chair, what is around me, call this my chair, "
              "save map.")
+HELP_TEXT_OUTDOOR = ("Outdoor mode warns you about obstacles, holes, low branches and vehicles, with their distance. "
+                     "Talk: tap to stop and quiet the warnings for a few seconds; tap twice for what is ahead. "
+                     "You can say: what is ahead, what colour is the light, can I cross, quiet warnings, "
+                     "warnings on.")
+# Outdoor mode (object_perception + outdoor_awareness.py): spoken hazard alerts on /outdoor_alert
+ALERT_MAX_AGE_S = 2.0     # an alert not yet spoken after this long is out of date (the wearer has moved on)
+ALERT_MUTE_TAP_S = 6.0    # a TALK tap quiets non-critical alerts this long (critical ones are always spoken)
+ALERT_MUTE_SAID_S = 120.0 # "quiet warnings": non-critical alerts off this long (or until "warnings on")
+SCENE_MAX_AGE_S = 3.0
+OUTDOOR_AHEAD = ("what is ahead", "what s ahead", "whats ahead", "what is in front of me", "what s in front of me",
+                 "whats in front of me", "what is in front", "is the path clear", "is the way clear")
 # The Pi's sensors (pi_sensors.launch.py): said aloud when one is missing, lost or back
 SENSORS = {"/camera/image_raw/compressed": "camera", "/scan": "LiDAR"}
 # Colours are not spoken unless asked for (someone blind from birth may not know them); set 1 for low vision
@@ -208,6 +219,11 @@ def suppress_stderr():
         os.close(old_fd)
         os.close(devnull)
 
+def lang_vehicles():
+    from visionnav.outdoor_awareness import VEHICLES
+    return VEHICLES
+
+
 class FindObjectNode(Node):
     def __init__(self):
         super().__init__('voice_navigation_assistant')
@@ -298,6 +314,16 @@ class FindObjectNode(Node):
 
         # Listen for Emergency Hazards from vision node
         self._hazard_sub = self.create_subscription(String, '/hazard_warning', self._hazard_callback, 10)
+        # Outdoor mode: one alert at a time, the most urgent; a critical one cuts off whatever is being said
+        self._alert_lock = threading.Lock()
+        self._alert_pending = None
+        self._alert_event = threading.Event()
+        self._alerts_muted_until = 0.0
+        self._listening = False  # push-to-talk recording: nothing but critical alerts is said meanwhile
+        self._outdoor_scene = None
+        self.create_subscription(String, '/outdoor_alert', self._outdoor_alert_callback, 10)
+        self.create_subscription(String, '/outdoor_scene', self._outdoor_scene_callback, 10)
+        threading.Thread(target=self._alert_loop, daemon=True).start()
         
         self.get_logger().info("Find Object Node Started! Waiting for AI to map objects...")
         
@@ -338,6 +364,95 @@ class FindObjectNode(Node):
     def _hazard_callback(self, msg: String):
         """Hazard warnings are disabled here so they don't interrupt your typing."""
         pass
+
+    # ── OUTDOOR MODE: spoken hazard alerts (object_perception decides what and when; this node says it) ──
+    def _outdoor_alert_callback(self, msg: String):
+        if self._mode != "outdoor" or not self._active:
+            return
+        try:
+            a = json.loads(msg.data)
+            a["level"] = int(a.get("level", 1))
+        except (ValueError, TypeError):
+            return
+        now = time.monotonic()
+        if a["level"] < 3 and (now < self._alerts_muted_until or self._listening):
+            return
+        a["t"] = now
+        with self._alert_lock:
+            if self._alert_pending is None or a["level"] >= self._alert_pending["level"]:
+                self._alert_pending = a
+        if a["level"] >= 3:
+            self.stop_speech()  # "Stop. Car coming..." must not wait for the end of another sentence
+        self._alert_event.set()
+
+    def _alert_loop(self):
+        while rclpy.ok():
+            self._alert_event.wait(0.5)
+            self._alert_event.clear()
+            with self._alert_lock:
+                a, self._alert_pending = self._alert_pending, None
+            if a is None or time.monotonic() - a["t"] > ALERT_MAX_AGE_S or self._mode != "outdoor":
+                continue
+            if a["level"] >= 3:
+                self._haptic_pub.publish(String(data="danger"))
+            self.speak(a["text"])
+
+    def _outdoor_scene_callback(self, msg: String):
+        try:
+            self._outdoor_scene = json.loads(msg.data)
+            self._outdoor_scene["_t"] = time.monotonic()
+        except ValueError:
+            pass
+
+    def _scene(self):
+        sc = self._outdoor_scene
+        return sc if sc is not None and time.monotonic() - sc["_t"] <= SCENE_MAX_AGE_S else None
+
+    def _outdoor_command(self, target) -> bool:
+        """Outdoor questions, answered from what the camera AI sees now. True when handled."""
+        if target in ("help", "what can i do", "what can i say", "how does it work"):
+            self.speak(HELP_TEXT_OUTDOOR)
+        elif target in ("quiet", "quiet warnings", "mute", "mute warnings", "be quiet", "silence"):
+            self._alerts_muted_until = time.monotonic() + ALERT_MUTE_SAID_S
+            self.speak("Warnings quiet for two minutes. I will still warn you of immediate danger.")
+        elif target in ("warnings on", "unmute", "unmute warnings", "talk to me", "resume warnings"):
+            self._alerts_muted_until = 0.0
+            self.speak("Warnings on.")
+        elif target in AROUND_COMMANDS or target in OUTDOOR_AHEAD:
+            sc = self._scene()
+            self.speak(sc["summary"] if sc else "The camera AI is not seeing anything yet.")
+        elif " cross" in f" {target}" or "zebra" in target:
+            self.speak(self._crossing_answer())
+        elif ("light" in target or "signal" in target) and not target.startswith("describe"):
+            sc = self._scene()
+            sig = (sc or {}).get("signal")
+            self.speak(sig["text"] if sig else "I do not see a traffic light or pedestrian signal ahead.")
+        else:
+            return False
+        return True
+
+    def _crossing_answer(self):
+        """Where the crossing is, what its signal shows and which vehicles are coming. Never says it is safe:
+        the camera cannot see everything (a car hidden by a bus, a bike behind)."""
+        sc = self._scene()
+        if sc is None:
+            return "The camera AI is not seeing anything yet."
+        parts = []
+        cross = min((o for o in sc["objects"] if o["class"] == "zebra crossing"), key=lambda o: o["dist"], default=None)
+        if cross is not None:
+            parts.append(f"Zebra crossing {int(round(cross['dist'] * 3.28084))} feet ahead.")
+        if sc.get("signal"):
+            parts.append(sc["signal"]["text"])
+        coming = [o for o in sc["objects"] if o["class"] in lang_vehicles() and (o.get("closing") or 0) > 1.5]
+        if coming:
+            o = min(coming, key=lambda o: o["dist"])
+            side = "on your left" if o["y"] > 1 else "on your right" if o["y"] < -1 else "ahead"
+            parts.append(f"A {o['class']} is coming {side}, {int(round(o['dist'] * 3.28084))} feet away."
+                         + (f" {len(coming) - 1} more vehicles are moving." if len(coming) > 1 else ""))
+        else:
+            parts.append("I see no vehicle coming.")
+        parts.append("Listen for traffic before you cross.")
+        return " ".join(parts)
 
     def _marker_callback(self, msg: MarkerArray):
         for marker in msg.markers:
@@ -389,6 +504,7 @@ class FindObjectNode(Node):
         if button in ("talk", "look") and event == "hold_start":
             # Push-to-talk: silence the speaker (it would be recorded), beep, record while held
             self.stop_speech()
+            self._listening = True
             subprocess.Popen(["aplay", "-q", _beep_wav()], stderr=subprocess.DEVNULL)
             self._ptt.start()
         elif button in ("talk", "look") and event == "hold_end":
@@ -398,6 +514,7 @@ class FindObjectNode(Node):
 
     def _ptt_finish(self, button):
         text = self._ptt.stop()
+        self._listening = False
         if not text:
             self.speak("I did not catch that.")
             return
@@ -428,8 +545,11 @@ class FindObjectNode(Node):
             self._around()
 
     def _stop_all(self, say="Stopped."):
-        """TALK tap: stop talking, navigating and hand guidance at once."""
+        """TALK tap: stop talking, navigating and hand guidance at once (outdoors: and quiet the warnings for a
+        few seconds; a critical one is still said)."""
         self.stop_speech()
+        if self._mode == "outdoor":
+            self._alerts_muted_until = max(self._alerts_muted_until, time.monotonic() + ALERT_MUTE_TAP_S)
         self._pending = None
         if self.grasping:
             self.grasping = False
@@ -443,8 +563,8 @@ class FindObjectNode(Node):
     # ── PARTS OF THE SYSTEM (system_manager.py): started and stopped by the buttons ──
     def _switch_mode(self, mode, startup=False):
         """Start the parts the mode needs, stop the other mode's, and say when it is active.
-        Indoor: SLAM brain (map, Nav2, walls) + camera AI. Outdoor: GPS receiver, GPS positioning and guidance
-        + camera AI (collision warnings). The camera AI switches mode without a restart."""
+        Indoor: SLAM brain (map, Nav2, walls) + camera AI. Outdoor: sensor mounts and the live RViz view + camera AI
+        (hazard warnings). The camera AI switches mode without a restart."""
         self._switching = True
         try:
             self.speak(f"Starting {mode} mode." if startup else f"Switching to {mode} mode.")
@@ -455,7 +575,7 @@ class FindObjectNode(Node):
                     self._map_cmd_pub.publish(String(data="save"))
                     time.sleep(3.0)
                 self._sys.stop(part)
-            wanted = [p for p in MODE_PARTS[mode] if self._sys.available(p)]
+            wanted = list(MODE_PARTS[mode])
             for part in wanted:
                 self._sys.start(part, wait=False)  # all at once; then wait for each
             failed = [p for p in wanted if not self._sys.wait_ready(p)]
@@ -463,13 +583,14 @@ class FindObjectNode(Node):
             self._active = True
             self._mode_pub.publish(String(data=mode))
             msg = f"{mode.capitalize()} mode activated."
-            if mode == "outdoor" and not self._sys.available("gps_driver"):
-                msg += " No GPS receiver is plugged in, so I will only warn you about obstacles."
             if failed:
                 msg += " " + " ".join(f"{self._sys.name(p).capitalize()} did not start." for p in failed)
             missing = self._missing_sensors()
             if missing:
                 msg += " " + self._sensor_sentence(missing)
+            # The switch is done: the next MODE press must work while this is still being said (it was
+            # refused with "Still switching" for as long as the sentence and the first outdoor alerts took)
+            self._switching = False
             self.speak(msg)
         finally:
             self._switching = False
@@ -612,6 +733,16 @@ class FindObjectNode(Node):
             parts.append(self._sensor_sentence(missing))
         if not self._sys.running("perception"):
             parts.append("The camera AI is not running.")
+        if self._mode == "outdoor":
+            sc = self._scene()
+            if sc is not None:
+                if not sc.get("lidar"):
+                    parts.append("The LiDAR is not in use.")
+                parts.append(sc["summary"])
+            if time.monotonic() < self._alerts_muted_until:
+                parts.append("Warnings are quiet.")
+            self.speak(" ".join(parts))
+            return
         if self._mode == "indoor" and self._map_info:
             parts.append(f"Using your saved map {self._map_info['name']}." if self._map_info.get("mode") == "localization"
                          else "Mapping a new area.")
@@ -894,7 +1025,11 @@ class FindObjectNode(Node):
         return True
 
     def _around(self):
-        """The nearest objects with their directions ("what is around me")."""
+        """The nearest objects with their directions ("what is around me"). Outdoors: what is ahead now."""
+        if self._mode == "outdoor":
+            sc = self._scene()
+            self.speak(sc["summary"] if sc else "The camera AI is not seeing anything yet.")
+            return
         objects = self._static_objects()
         pose = self.get_robot_pose()
         if pose is None or not objects:
@@ -1129,6 +1264,9 @@ class FindObjectNode(Node):
                 else:
                     self._stop_all()
                 
+            elif self._mode == "outdoor" and self._outdoor_command(target):
+                pass  # answered from what the camera sees now (outdoor_awareness.py)
+
             elif target in ("help", "what can i do", "what can i say", "how does it work"):
                 self.speak(HELP_TEXT)
 
@@ -1672,7 +1810,7 @@ def main(args=None):
     except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
     finally:
-        node._sys.stop_all()  # the parts it started (brain, camera AI, vision AI, GPS)
+        node._sys.stop_all()  # the parts it started (brain, camera AI, vision AI, outdoor view)
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

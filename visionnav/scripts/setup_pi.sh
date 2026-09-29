@@ -85,17 +85,20 @@ WantedBy=multi-user.target
 EOF
 sudo systemctl daemon-reload
 sudo systemctl enable visionnav-buttons
+START="$(date '+%Y-%m-%d %H:%M:%S')"
 sudo systemctl restart visionnav-buttons
 
 echo "== 5/5  Check"
 sleep 8
 systemctl --no-pager status visionnav-buttons | head -4
-echo "--- last log lines:"
-journalctl -u visionnav-buttons -n 12 --no-pager -o cat
+echo "--- log since this start:"
+# Only this start: older runs' errors in the journal are not this run's problem
+LOG="$(journalctl -u visionnav-buttons --since "$START" --no-pager -o cat)"
+echo "$LOG" | tail -12
 echo
-if journalctl -u visionnav-buttons -n 50 --no-pager -o cat | grep -q "unavailable"; then
+if echo "$LOG" | grep -q "unavailable"; then
     echo "PROBLEM: some buttons could not be opened — see the 'unavailable' lines above."
-elif journalctl -u visionnav-buttons -n 50 --no-pager -o cat | grep -q "Buttons ready: SENSORS"; then
+elif echo "$LOG" | grep -q "Buttons ready: SENSORS"; then
     echo "OK: the buttons are ready. Press SENSORS and watch:  journalctl -u visionnav-buttons -f"
 else
     echo "The button program is not ready yet — see the log above, or run:  journalctl -u visionnav-buttons -f"

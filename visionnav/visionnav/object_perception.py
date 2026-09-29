@@ -6,7 +6,9 @@ ROS 2 Jazzy – Wearable Blind-Assist Vision Node  (Ultralytics YOLOE open-vocab
 
 Tesla AI-Grade Dual-Mode Perception System:
   INDOOR  – Persistent spatial memory map, scene recall, object finding
-  OUTDOOR – Forward-only collision avoidance, no memory, maximum responsiveness
+  OUTDOOR – Live hazard warnings, no memory (outdoor_awareness.py): its own detector vocabulary and outdoor
+            metric depth, LiDAR walking corridor, ground analysis (obstacles, drops, head-height hazards),
+            zebra crossings, traffic / pedestrian light colours, approaching vehicles; spoken on /outdoor_alert
 
 Geometry pipeline (per detection):
   1. Camera and LiDAR extrinsics come from TF (sensor_tf.launch.py), so the objects and the
@@ -46,6 +48,9 @@ from cv_bridge import CvBridge
 from rclpy.node import Node
 
 from visionnav.grasp_tracker import GraspTracker
+from visionnav import outdoor_awareness as oa
+from visionnav.lidar_odometry import ScanOdometry
+from nav_msgs.msg import Odometry
 from visionnav.model_paths import model_path
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
@@ -138,16 +143,20 @@ PROMPT_SYNONYMS = {
 }
 _VOCAB_HASH = hashlib.sha1("|".join(VOCABULARY).encode()).hexdigest()[:8]
 ENGINE_PATH = model_path(f"yoloe-11s-seg-indoor-{_VOCAB_HASH}.engine")
+# Outdoor mode has its own vocabulary (outdoor_awareness.py) and engine: one engine for both would make outdoor
+# prompts compete with indoor ones for every box (a filtered-out class still wins the box it takes).
+_OUTDOOR_HASH = hashlib.sha1("|".join(oa.OUTDOOR_VOCABULARY).encode()).hexdigest()[:8]
+OUTDOOR_ENGINE_PATH = model_path(f"yoloe-11s-seg-outdoor-{_OUTDOOR_HASH}.engine")
 
 INDOOR_CLASSES = set(VOCABULARY) - set(NEGATIVE_PROMPTS) - {
     "bicycle", "motorcycle", "bus", "truck", "car", "traffic light", "stop sign", "fire hydrant",
     "curb", "pothole", "three-wheeler",
 }
-OUTDOOR_CLASSES = {
-    "person", "bicycle", "car", "motorcycle", "bus", "truck", "dog", "cat",
-    "traffic light", "stop sign", "fire hydrant", "bench", "chair", "potted plant", "backpack",
-    "umbrella", "stairs", "staircase", "step", "curb", "pothole", "hole in floor", "obstacle", "door",
-    "trash can", "three-wheeler", "dustbin",
+OUTDOOR_CLASSES = set(oa.OUTDOOR_VOCABULARY) - set(oa.OUTDOOR_NEGATIVE_PROMPTS)
+# (vocabulary, engine, reported classes, prompt -> reported name) of each mode's detector
+DETECTORS = {
+    "indoor": (VOCABULARY, ENGINE_PATH, INDOOR_CLASSES, None),
+    "outdoor": (oa.OUTDOOR_VOCABULARY, OUTDOOR_ENGINE_PATH, OUTDOOR_CLASSES, oa.OUTDOOR_SYNONYMS),
 }
 # Drops: a blind user needs more warning before these than before a chair.
 DROP_HAZARDS = {"stairs", "step", "hole in floor", "pothole", "curb", "escalator"}
@@ -294,6 +303,8 @@ OBJECT_MAX_SIZES = {
     "hydrant":      (0.40, 0.90),
     "suitcase":     (0.55, 0.80),
 }
+for _k, _v in oa.OUTDOOR_MAX_SIZES.items():
+    OBJECT_MAX_SIZES.setdefault(_k, _v)
 OBJECT_MAX_SIZE_DEFAULT = (1.50, 1.50)
 
 # ── TYPICAL SIZES (width_m, height_m) for the known-size depth prior ──
@@ -319,6 +330,8 @@ OBJECT_TYPICAL_SIZES = {
     "truck": (7.00, 3.00), "dog": (0.60, 0.55), "cat": (0.40, 0.28), "bench": (1.50, 0.80),
     "traffic light": (0.30, 0.90), "stop sign": (0.75, 0.75), "fire hydrant": (0.30, 0.70),
 }
+for _k, _v in oa.OUTDOOR_TYPICAL_SIZES.items():
+    OBJECT_TYPICAL_SIZES.setdefault(_k, _v)
 # Objects usually seen from above: their pixel height is mostly foreshortening, so only
 # their width says anything about distance.
 FLAT_OBJECTS = {"keyboard", "mouse", "cell phone", "smartphone", "book", "laptop", "remote",
@@ -389,11 +402,19 @@ R_BODY_OPTICAL = np.array([[0.0, 0.0, 1.0],
 # are ranged too. Its scale is corrected every frame against the LiDAR's true ranges.
 MONO_DEPTH_ENABLED = os.environ.get("WEARABLE_MONO_DEPTH", "1") == "1"
 DEPTH_WEIGHTS = model_path("depth_anything_v2_metric_indoor_vits.pth")
+# Outdoor: the model trained on street scenes (Virtual KITTI, up to 80 m). The indoor one tops out at 20 m.
+# Fetch: curl -L -o models/depth_anything_v2_metric_outdoor_vits.pth https://huggingface.co/depth-anything/
+#        Depth-Anything-V2-Metric-VKITTI-Small/resolve/main/depth_anything_v2_metric_vkitti_vits.pth
+DEPTH_WEIGHTS_OUTDOOR = model_path("depth_anything_v2_metric_outdoor_vits.pth")
+DEPTH_MAX = {"indoor": 20.0, "outdoor": 80.0}
 DEPTH_INPUT_SIZE = int(os.environ.get("WEARABLE_DEPTH_SIZE", "392"))  # short side, multiple of 14
 DEPTH_SCALE_MIN_PTS = 15     # LiDAR points needed to (re)calibrate the depth scale
 DEPTH_SCALE_ALPHA = 0.2      # smoothing of the per-frame scale estimate
 DEPTH_SCALE_MAX_RESID = 0.15 # a frame whose depth/LiDAR ratios spread more than this is not used to calibrate
 DEPTH_SCALE_FRESH_S = 3.0    # s: the scale only earns the tight range sigma while calibrated this recently
+# Range of the LiDAR scale correction. The outdoor (street-trained) model read a room twice too far on the rig
+# (true scale ~0.5, pinned at the old 0.5 floor), so outdoors it may correct more.
+DEPTH_SCALE_LIMITS = {"indoor": (0.5, 2.0), "outdoor": (0.3, 3.0)}
 MONO_MAX_POINTS = 2000       # object pixels back-projected per detection
 
 # ── TRACKING PARAMETERS ──
@@ -517,6 +538,11 @@ BOX_SNAP_RUN = 10
 BOX_SNAP_SPREAD = 0.2        # m
 BOX_ONLY_COST = 2.0 * CHI2_GATE_2D  # assignment cost of an image-only match (above the 3-D gate, so 3-D matches win)
 HUD_TIMEOUT = 0.7            # s, camera-view boxes vanish this fast once the object is not detected
+RECORD_PERIOD_S = 2.0        # s between frames saved with WEARABLE_RECORD_DIR (besides every spoken alert)
+OUTDOOR_SHOW_S = 0.3         # s: outdoors an object is drawn in RViz only this long after it was last detected
+OUTDOOR_STRUCTURE = {"wall", "fence", "railing", "gate", "bus stop", "construction site"}  # drawn by the occupancy
+                             # grid, not as objects (a wall was a 3 m block on the rig)
+OUTDOOR_MARKER_LIFETIME = 0.5  # s: RViz drops the outdoor view this soon if frames stop coming
 HUD_SYNC_MAX_AGE = 0.3       # s: the window shows the frame the boxes were computed on while it is this fresh
 HUD_BOX_ALPHA, HUD_BOX_SCALE_PX = 0.15, 40.0     # static box: weight of a new corner, +1 per this many px moved
 HUD_DEPTH_ALPHA, HUD_DEPTH_SCALE_M = 0.1, 1.0    # static distance label: same, per metre changed
@@ -586,6 +612,7 @@ MODE_PARAMS = {
         "dynamic_assoc":        2.00,
         "danger_distance":      1.5,     # Indoor danger threshold
         "collision_corridor_w": 0.8,     # Narrow indoor corridor
+        "max_range":            15.0,    # m, farthest distance an object is placed at
     },
     "outdoor": {
         "conf_threshold":       0.30,
@@ -594,7 +621,8 @@ MODE_PARAMS = {
         "static_assoc":         2.00,
         "dynamic_assoc":        2.50,
         "danger_distance":      2.0,     # Outdoor needs earlier warnings
-        "collision_corridor_w": 1.2,     # Shoulder-width walking corridor
+        "collision_corridor_w": 2 * oa.CORRIDOR_HALF,  # shoulder-width walking corridor
+        "max_range":            40.0,    # vehicles matter far away
     },
 }
 
@@ -1022,8 +1050,38 @@ class ObjectPerceptionNode(Node):
         # Dynamic object tracking for live map markers and warnings.
         self._hazard_pub = self.create_publisher(String, "/hazard_warning", 10)
         self._hazard_history = {}  # {label_id: (cx, cy, area, time)}
-        self._dynamic_classes = {"person", "bicycle", "car", "motorcycle", "bus", "truck", "dog", "cat"}
-        self._hazard_classes = self._dynamic_classes
+
+        # ── OUTDOOR MODE (outdoor_awareness.py): live hazards, no map ──
+        # /outdoor_alert: the one sentence to say now (JSON text/level/kind; the assistant speaks it, a critical
+        # one interrupting); /outdoor_scene: what is ahead, 2 Hz (JSON; "what is around me", the status)
+        self._outdoor_tracker = oa.OutdoorTracker()
+        self._alert_policy = oa.AlertPolicy()
+        self._outdoor_alert_pub = self.create_publisher(String, "/outdoor_alert", 10)
+        self._outdoor_scene_pub = self.create_publisher(String, "/outdoor_scene", 10)
+        # RViz (rviz/visionnav_outdoor.rviz, fixed frame base_footprint: the wearer stays at the centre): only
+        # what is detected right now. Nothing is remembered: an object that leaves the camera view is gone
+        # from RViz on the next frame.
+        self._outdoor_marker_pub = self.create_publisher(MarkerArray, "/outdoor_markers", 10)
+        # Like a car: its own motion (LiDAR odometry, also on /odom), everything tracked world-fixed
+        # (a parked car is still, a car's speed is its own), LiDAR objects tracked 360° and named by the camera,
+        # and a live occupancy grid of the last few seconds (/outdoor_occupancy). Nothing is saved.
+        self._odo = ScanOdometry()
+        self._odom_enabled = os.environ.get("WEARABLE_OUTDOOR_ODOM", "1") == "1"
+        self._ego_hist = deque(maxlen=60)   # (receive time, pose, velocity) per scan
+        self._odom_good_run, self._odom_bad_since, self._odom_good = 0, None, False
+        self._odom_pub = self.create_publisher(Odometry, "/odom", 10)
+        self._occ = oa.LocalOccupancy()
+        self._occ_pub = self.create_publisher(MarkerArray, "/outdoor_occupancy", 10)
+        self._last_occ_pub = 0.0
+        self._last_scene_pub = 0.0
+        self._outdoor_hud = None     # corridor, lanes, crossing, last alert: drawn by the GUI thread
+        self._last_alert = None      # (text, level, time)
+        # WEARABLE_RECORD_DIR: every spoken alert (and a frame every RECORD_PERIOD_S) is saved there as an
+        # annotated image + a line of alerts.jsonl, to review an outdoor walk afterwards
+        self._record_dir = os.environ.get("WEARABLE_RECORD_DIR")
+        self._last_record = 0.0
+        if self._record_dir:
+            os.makedirs(self._record_dir, exist_ok=True)
 
         # ── CAMERA MODEL ──
         # Intrinsics: HFOV-derived pinhole unless calibrated values are given.
@@ -1113,6 +1171,12 @@ class ObjectPerceptionNode(Node):
         self._dynamic_association_distance = p["dynamic_assoc"]
         self._danger_distance = p["danger_distance"]
         self._collision_corridor_w = p["collision_corridor_w"]
+        self._max_range = p["max_range"]
+        # Moving things (tracked with velocity). Outdoors also vans, three-wheelers, cows...
+        self._dynamic_classes = {"person", "bicycle", "car", "motorcycle", "bus", "truck", "dog", "cat"}
+        if self._mode == "outdoor":
+            self._dynamic_classes = self._dynamic_classes | oa.MOVERS
+        self._hazard_classes = self._dynamic_classes
 
     def _mode_callback(self, msg: String):
         """Runtime mode switching via /perception_mode topic."""
@@ -1130,6 +1194,21 @@ class ObjectPerceptionNode(Node):
             self._inferred_tables = []
             with self._hud_lock:
                 self._hud_tracks.clear()
+            self._outdoor_tracker.clear()
+            self._alert_policy.reset()
+            self._outdoor_hud = None
+            clear = Marker()
+            clear.action = Marker.DELETEALL
+            self._outdoor_marker_pub.publish(MarkerArray(markers=[clear]))
+            self._occ_pub.publish(MarkerArray(markers=[clear]))
+            self._odo.reset()
+            self._ego_hist.clear()
+            self._odom_good_run, self._odom_bad_since, self._odom_good = 0, None, False
+            self._occ.reset()
+            # Each mode has its own depth model, with its own scale
+            if getattr(self, "_depth_models", None):
+                self._depth_model = self._depth_models.get(self._mode)
+                self._depth_scale, self._depth_scale_valid, self._depth_scale_t = 1.0, False, -math.inf
 
             # New window title: the window is replaced by the GUI (main) thread. Qt windows may only be touched
             # from that thread; doing it here, in a ROS callback, crashed the node on every mode switch.
@@ -1231,6 +1310,8 @@ class ObjectPerceptionNode(Node):
 
     def _scan_callback(self, msg: LaserScan) -> None:
         self._scan_buffer.append(msg)
+        if self._mode == "outdoor":
+            self._outdoor_scan(msg, time.monotonic())
 
     # ══════════════════════════════════════════════════════════════════════
     # ── SENSOR GEOMETRY ──
@@ -1485,7 +1566,8 @@ class ObjectPerceptionNode(Node):
             return
         d = dmap[v[ok].astype(int), u[ok].astype(int)]
         ratio = zc[ok] / np.maximum(d, 0.05)
-        ratio = ratio[(ratio > 0.4) & (ratio < 2.5)]
+        lo, hi = DEPTH_SCALE_LIMITS[self._mode]
+        ratio = ratio[(ratio > 0.8 * lo) & (ratio < 1.25 * hi)]
         if ratio.size < DEPTH_SCALE_MIN_PTS:
             return
         r = float(np.median(ratio))
@@ -1494,7 +1576,7 @@ class ObjectPerceptionNode(Node):
             return  # LiDAR and depth disagree in shape this frame (glitch / wrong row): keep the old scale
         self._depth_scale = r if not self._depth_scale_valid else (
             (1 - DEPTH_SCALE_ALPHA) * self._depth_scale + DEPTH_SCALE_ALPHA * r)
-        self._depth_scale = max(0.5, min(2.0, self._depth_scale))
+        self._depth_scale = max(lo, min(hi, self._depth_scale))
         self._depth_scale_valid = True
         self._depth_scale_resid = spread
         self._depth_scale_t = time.monotonic()
@@ -1553,7 +1635,9 @@ class ObjectPerceptionNode(Node):
         fx, fy, cx0, cy0, w = K
         x1, y1, x2, y2 = det["box"]
         label, raw = det["label"], det["raw_label"]
-        is_dynamic = raw in self._dynamic_classes
+        is_dynamic = raw in self._dynamic_classes or label in self._dynamic_classes
+        outdoor = self._mode == "outdoor"
+        max_range = self._max_range
         pix_w, pix_h = max(1.0, x2 - x1), max(1.0, y2 - y1)
         u_mid = 0.5 * (x1 + x2)
         cut_l, cut_r = x1 <= BOX_EDGE_PX, x2 >= w - BOX_EDGE_PX
@@ -1565,14 +1649,14 @@ class ObjectPerceptionNode(Node):
             _lookup(OBJECT_MAX_SIZES, label, raw) is not None
         size_gate = 3.0 if known_size else 1e6
         cam_z = float(self._cam_t[2])
-        on_floor = raw in FLOOR_OBJECTS or label in FLOOR_OBJECTS or is_dynamic
-        on_desk = not on_floor and (raw in DESKTOP_OBJECTS or label in DESKTOP_OBJECTS)
+        on_floor = raw in FLOOR_OBJECTS or label in FLOOR_OBJECTS or is_dynamic or (outdoor and label in oa.OUTDOOR_GROUND)
+        on_desk = not outdoor and not on_floor and (raw in DESKTOP_OBJECTS or label in DESKTOP_OBJECTS)
 
         # ── 1. OPTICAL DEPTH CANDIDATES (depth, sigma) ──
         # Known-size prior, using only box dimensions not cut off by the frame edge
         d_w = typ_w * fx / pix_w
         d_h = typ_h * fy / pix_h
-        if label in FLAT_OBJECTS or raw in FLAT_OBJECTS or raw == "person":
+        if label in FLAT_OBJECTS or raw in FLAT_OBJECTS or raw == "person" or (outdoor and label in oa.OUTDOOR_FLAT):
             size_d = d_h if (raw == "person" and not (cut_t or cut_b)) else d_w
         elif not (cut_t or cut_b) and not (cut_l or cut_r):
             size_d = math.sqrt(d_w * d_h)
@@ -1585,7 +1669,7 @@ class ObjectPerceptionNode(Node):
         estimates = [(size_d, (0.35 if known_size else 1.5) * size_d + 0.05)]
 
         def plausible(d):
-            return d is not None and 0.3 < d < 15.0 and size_d / size_gate < d < size_d * size_gate
+            return d is not None and 0.3 < d < max_range and size_d / size_gate < d < size_d * size_gate
 
         # Support-plane contact: the box's bottom edge touches the floor / desk
         support_z = 0.0 if on_floor else (_lookup(SUPPORT_HEIGHTS, label, raw, DESK_HEIGHT) if on_desk else None)
@@ -1607,7 +1691,7 @@ class ObjectPerceptionNode(Node):
         # Metric depth of the object's own pixels — the main range source below the LiDAR plane
         mono = self._mono_object(det, K, dmap)
         mono_gate = 4.0 if known_size else 1e6
-        if mono is not None and not (0.3 < mono["dist"] < 15.0 and size_d / mono_gate < mono["dist"] < size_d * mono_gate):
+        if mono is not None and not (0.3 < mono["dist"] < max_range and size_d / mono_gate < mono["dist"] < size_d * mono_gate):
             mono = None
         if mono is not None:
             fresh = time.monotonic() - self._depth_scale_t <= DEPTH_SCALE_FRESH_S
@@ -1654,7 +1738,7 @@ class ObjectPerceptionNode(Node):
                 depth, sigma_d, source = jambs, 0.04 + 0.01 * jambs, "lidar"
                 ray = self._pixel_ray(u_mid, 0.5 * (y1 + y2), K)
                 front_xy = self._cam_t[:2] + depth * ray[:2] / max(np.linalg.norm(ray[:2]), 1e-6)
-        depth = max(0.3, min(depth, 15.0))
+        depth = max(0.3, min(depth, max_range))
 
         # ── 3. POSITION (base_footprint) ──
         cam_xy = self._cam_t[:2]
@@ -1725,27 +1809,28 @@ class ObjectPerceptionNode(Node):
     # ══════════════════════════════════════════════════════════════════════
     # ── DETECTION ──
     # ══════════════════════════════════════════════════════════════════════
-    def _load_detector(self, torch):
-        """YOLOE with the offline VOCABULARY. Returns (model, is_tensorrt_engine).
+    def _load_detector(self, torch, mode: str):
+        """YOLOE with the mode's offline vocabulary. Returns (model, is_tensorrt_engine).
 
         Text embeddings are computed once by set_classes() and baked into the TensorRT engine, so
         the per-frame path never runs a text encoder. The engine is built on first start (or after
         the vocabulary changes), before the ROS loop begins.
         """
         from ultralytics import YOLO, YOLOE
+        vocabulary, engine_path, _, _ = DETECTORS[mode]
         if torch.cuda.is_available():
-            if not os.path.isfile(ENGINE_PATH):
-                self.get_logger().info(f"Building TensorRT engine {os.path.basename(ENGINE_PATH)} "
-                                       f"({len(VOCABULARY)} classes, one-time, 3-6 minutes; the camera window "
+            if not os.path.isfile(engine_path):
+                self.get_logger().info(f"Building TensorRT engine {os.path.basename(engine_path)} "
+                                       f"({len(vocabulary)} classes, one-time, 3-6 minutes; the camera window "
                                        f"opens when it is done — do not close this terminal)...")
                 try:
                     model = YOLOE(MODEL_PATH)
-                    model.set_classes(VOCABULARY, model.get_text_pe(VOCABULARY))
+                    model.set_classes(vocabulary, model.get_text_pe(vocabulary))
                     # 2 GB workspace: the RTX 2050 has 4 GB, and a 4 GB request ran the GPU out of memory
                     built = model.export(format="engine", half=True, workspace=2, imgsz=640, device=0)
-                    shutil.move(str(built), ENGINE_PATH)
-                    for old in glob.glob(model_path("yoloe-11s-seg-indoor-*.engine")):  # older vocabularies
-                        if old != ENGINE_PATH:
+                    shutil.move(str(built), engine_path)
+                    for old in glob.glob(model_path(f"yoloe-11s-seg-{mode}-*.engine")):  # older vocabularies
+                        if old != engine_path:
                             os.remove(old)
                     stem = os.path.splitext(MODEL_PATH)[0]
                     for onnx in (stem + ".onnx", stem + ".fp16.onnx"):  # export intermediates
@@ -1755,34 +1840,39 @@ class ObjectPerceptionNode(Node):
                     torch.cuda.empty_cache()
                 except Exception as e:
                     self.get_logger().error(f"TensorRT export failed, using PyTorch weights: {e}")
-            if os.path.isfile(ENGINE_PATH):
-                model = YOLO(ENGINE_PATH, task="segment")
+            if os.path.isfile(engine_path):
+                model = YOLO(engine_path, task="segment")
                 return model, True
         model = YOLOE(MODEL_PATH)
-        model.set_classes(VOCABULARY, model.get_text_pe(VOCABULARY))
+        model.set_classes(vocabulary, model.get_text_pe(vocabulary))
         return model, False
 
     def _load_model(self):
         import torch
         from ultralytics.cfg import DEFAULT_CFG_DICT
-        self._yolo_model, on_engine = self._load_detector(torch)
         self._use_half = torch.cuda.is_available()
-        # The TensorRT engine is already fp16; newer Ultralytics replaced half=True with quantize="fp16"
-        if on_engine or not self._use_half:
-            self._precision_kwargs = {}
-        elif "quantize" in DEFAULT_CFG_DICT:
-            self._precision_kwargs = {"quantize": "fp16"}
-        else:
-            self._precision_kwargs = {"half": True}
-        self._model_names = self._yolo_model.names
-        self._class_ids = {
-            mode: [i for i, n in self._model_names.items() if n in classes]
-            for mode, classes in (("indoor", INDOOR_CLASSES), ("outdoor", OUTDOOR_CLASSES))
-        }
+        # Both modes' detectors stay loaded (~0.2 GB each), so the MODE button switches at once
+        self._detectors = {}
+        engines = []
+        for mode, (_, _, classes, _) in DETECTORS.items():
+            model, on_engine = self._load_detector(torch, mode)
+            engines.append(on_engine)
+            # The TensorRT engine is already fp16; newer Ultralytics replaced half=True with quantize="fp16"
+            if on_engine or not self._use_half:
+                precision = {}
+            elif "quantize" in DEFAULT_CFG_DICT:
+                precision = {"quantize": "fp16"}
+            else:
+                precision = {"half": True}
+            names = model.names
+            self._detectors[mode] = (model, names, [i for i, n in names.items() if n in classes], precision)
+            self.get_logger().info(f"YOLO {mode} detector: {'CUDA fp16' if self._use_half else 'CPU'}"
+                                   f"{' (TensorRT)' if on_engine else ''}, {len(classes)} classes")
         self.get_logger().info(f"YOLO device: {'CUDA fp16' if self._use_half else 'CPU'}"
-                               f"{' (TensorRT)' if on_engine else ''}")
+                               f"{' (TensorRT)' if all(engines) else ''}")
 
         self._depth_model = None
+        self._depth_models = {}
         self._depth_scale, self._depth_scale_valid, self._depth_scale_resid = 1.0, False, 0.0
         self._depth_scale_t = -math.inf
         self._last_depth_log = 0.0
@@ -1796,17 +1886,30 @@ class ObjectPerceptionNode(Node):
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")  # "xFormers not available" is harmless
                 from visionnav.depth_anything_v2.dpt import DepthAnythingV2
-            model = DepthAnythingV2(encoder='vits', features=64, out_channels=[48, 96, 192, 384], max_depth=20)
-            model.load_state_dict(torch.load(DEPTH_WEIGHTS, map_location='cpu'))
-            self._depth_model = model.cuda().half().eval()
+            for mode, weights in (("indoor", DEPTH_WEIGHTS), ("outdoor", DEPTH_WEIGHTS_OUTDOOR)):
+                if not os.path.isfile(weights):
+                    self.get_logger().warn(f"No {os.path.basename(weights)}: {mode} mode uses the indoor depth model "
+                                           f"(it reads no farther than 20 m).")
+                    continue
+                model = DepthAnythingV2(encoder='vits', features=64, out_channels=[48, 96, 192, 384],
+                                        max_depth=DEPTH_MAX[mode])
+                model.load_state_dict(torch.load(weights, map_location='cpu'))
+                self._depth_models[mode] = model.cuda().half().eval()
+            self._depth_models.setdefault("outdoor", self._depth_models.get("indoor"))
+            self._depth_model = self._depth_models.get(self._mode)
             self._depth_mean = torch.tensor([0.485, 0.456, 0.406], device='cuda').view(1, 3, 1, 1)
             self._depth_std = torch.tensor([0.229, 0.224, 0.225], device='cuda').view(1, 3, 1, 1)
-            self.get_logger().info(f"Metric depth: Depth Anything V2 indoor (input {DEPTH_INPUT_SIZE}px, CUDA fp16)")
+            self.get_logger().info(f"Metric depth: Depth Anything V2 indoor"
+                                   f"{' + outdoor' if self._depth_models['outdoor'] is not self._depth_models['indoor'] else ''}"
+                                   f" (input {DEPTH_INPUT_SIZE}px, CUDA fp16)")
         except Exception as e:
+            self._depth_model = None
+            self._depth_models = {}
             self.get_logger().warn(f"Metric depth disabled: {e}")
 
-    def _infer_depth(self, bgr):
+    def _infer_depth(self, bgr, model=None):
         """Per-pixel metric depth (m, along the optical axis) for the processed frame."""
+        model = model or self._depth_model
         import torch
         import torch.nn.functional as F
         h, w = bgr.shape[:2]
@@ -1817,7 +1920,7 @@ class ObjectPerceptionNode(Node):
             x = torch.from_numpy(bgr).cuda()[..., [2, 1, 0]].permute(2, 0, 1)[None].float().div_(255.0)
             x = F.interpolate(x, (ih, iw), mode='bilinear', align_corners=False)
             x = ((x - self._depth_mean) / self._depth_std).half()
-            d = self._depth_model(x)[:, None].float()
+            d = model(x)[:, None].float()
             d = F.interpolate(d, (h, w), mode='bilinear', align_corners=False)[0, 0]
         return d.cpu().numpy()
 
@@ -1842,10 +1945,15 @@ class ObjectPerceptionNode(Node):
                 continue
 
             h, w = frame.shape[:2]
+            mode = self._mode
+            outdoor = mode == "outdoor"
+            yolo_model, model_names, class_ids, precision = self._detectors[mode]
+            friendly = oa.OUTDOOR_SYNONYMS if outdoor else FRIENDLY_NAMES
+            confusable = oa._confusable if outdoor else self._confusable
             try:
-                results = self._yolo_model.predict(
+                results = yolo_model.predict(
                     frame, conf=self._conf_threshold, iou=YOLO_IOU,
-                    classes=self._class_ids[self._mode], verbose=False, **self._precision_kwargs,
+                    classes=class_ids, verbose=False, **precision,
                 )[0]
             except Exception as e:
                 self.get_logger().error(f"YOLO inference failed: {e}")
@@ -1861,15 +1969,16 @@ class ObjectPerceptionNode(Node):
                 polys = results.masks.xy if results.masks is not None else [None] * len(xyxy)
 
                 for (x1, y1, x2, y2), conf, cid, poly in zip(xyxy, confs, clss, polys):
-                    raw_label = self._model_names.get(int(cid), "unknown")
-                    if raw_label in SMALL_OBJECTS and conf < max(SMALL_OBJECT_CONF, self._conf_threshold):
+                    raw_label = model_names.get(int(cid), "unknown")
+                    if not outdoor and raw_label in SMALL_OBJECTS and conf < max(SMALL_OBJECT_CONF, self._conf_threshold):
                         continue
                     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
                     bw_, bh_ = max(1, x2 - x1), max(1, y2 - y1)
 
-                    if bh_ / float(bw_) > OBJECT_REJECT_ASPECT_RATIOS.get(raw_label, 1e9):
+                    # Box-shape corrections tuned on indoor furniture (a car seen head-on is taller than 0.8 x wide)
+                    if not outdoor and bh_ / float(bw_) > OBJECT_REJECT_ASPECT_RATIOS.get(raw_label, 1e9):
                         continue
-                    max_aspect = OBJECT_MAX_ASPECT_RATIOS.get(raw_label, 100.0)
+                    max_aspect = 100.0 if outdoor else OBJECT_MAX_ASPECT_RATIOS.get(raw_label, 100.0)
                     if bh_ / float(bw_) > max_aspect:
                         # Anchor to the bottom (desk/floor) and slice the top off
                         y1 = max(0, int(y2 - bw_ * max_aspect))
@@ -1881,13 +1990,15 @@ class ObjectPerceptionNode(Node):
 
                     dets.append({
                         "box": (x1, y1, x2, y2), "conf": float(conf), "raw_label": raw_label,
-                        "label": FRIENDLY_NAMES.get(raw_label, raw_label), "mask": mask,
+                        "label": friendly.get(raw_label, raw_label), "mask": mask,
                     })
 
             dmap = None
-            if self._depth_model is not None and (dets or self._grasp.active):
+            depth_model = self._depth_model
+            # Outdoors every frame: the ground analysis sees what the detector has no name for
+            if depth_model is not None and (dets or self._grasp.active or outdoor):
                 try:
-                    dmap = self._infer_depth(frame)
+                    dmap = self._infer_depth(frame, depth_model)
                 except Exception as e:
                     self._warn_once("depth_fail", f"Metric depth inference failed: {e}")
 
@@ -1905,13 +2016,13 @@ class ObjectPerceptionNode(Node):
                     bx1, by1, bx2, by2 = k["box"]
                     inter = max(0, min(ax2, bx2) - max(ax1, bx1)) * max(0, min(ay2, by2) - max(ay1, by1))
                     area_a, area_b = (ax2 - ax1) * (ay2 - ay1), (bx2 - bx1) * (by2 - by1)
-                    both_static = (k["raw_label"] not in self._dynamic_classes
-                                   and d["raw_label"] not in self._dynamic_classes)
+                    both_static = (k["raw_label"] not in self._dynamic_classes and k["label"] not in self._dynamic_classes
+                                   and d["raw_label"] not in self._dynamic_classes and d["label"] not in self._dynamic_classes)
                     if both_static and inter / max(area_a + area_b - inter, 1) >= CROSS_CLASS_SAME_BOX_IOU:
                         duplicate = True
                         break
-                    if not (k["label"] == d["label"] or self._confusable(k["label"], d["label"])
-                            or self._confusable(k["raw_label"], d["raw_label"])):
+                    if not (k["label"] == d["label"] or confusable(k["label"], d["label"])
+                            or confusable(k["raw_label"], d["raw_label"])):
                         continue
                     if inter / max(min(area_a, area_b), 1) > CROSS_CLASS_OVERLAP:
                         duplicate = True
@@ -1938,7 +2049,7 @@ class ObjectPerceptionNode(Node):
                 ax1, ay1, ax2, ay2 = d["box"]
                 for _, r in self._recent_dets:
                     if r["label"] == d["label"] or _ranking_score(r) <= _ranking_score(d) or not (
-                            self._confusable(r["label"], d["label"]) or self._confusable(r["raw_label"], d["raw_label"])):
+                            confusable(r["label"], d["label"]) or confusable(r["raw_label"], d["raw_label"])):
                         continue
                     bx1, by1, bx2, by2 = r["box"]
                     inter = max(0, min(ax2, bx2) - max(ax1, bx1)) * max(0, min(ay2, by2) - max(ay1, by1))
@@ -1950,7 +2061,7 @@ class ObjectPerceptionNode(Node):
             self._recent_dets.extend((t_now, d) for d in kept)
 
             with self._inference_lock:
-                self._inference_results = (stamp, kept, frame, dmap, rx)
+                self._inference_results = (stamp, kept, frame, dmap, rx, mode)
                 self._inference_busy = False
 
     # ══════════════════════════════════════════════════════════════════════
@@ -1961,7 +2072,9 @@ class ObjectPerceptionNode(Node):
         with self._inference_lock:
             new_results, self._inference_results = self._inference_results, None
         if new_results is not None:
-            stamp, dets, frame, dmap, rx = new_results
+            stamp, dets, frame, dmap, rx, mode = new_results
+            if mode != self._mode:
+                return  # computed just before a mode switch, with the other mode's detector
             now = time.monotonic()
             self._process_detections(stamp, dets, frame, now, dmap, t_meas=min(rx, now))
             self._publish_markers(now)
@@ -2553,6 +2666,11 @@ class ObjectPerceptionNode(Node):
             else:
                 self.get_logger().warn("📏 Depth not LiDAR-calibrated yet (no scan points in view)")
 
+        if self._mode == "outdoor":
+            self._process_outdoor(msg_stamp, dets, frame, now, dmap, proj, K, t_meas)
+            self._hud_frame = (frame, now)
+            return
+
         # base_footprint -> map at the moment the image was taken
         if self._mode == "indoor":
             pose = self._lookup_base_pose(msg_stamp)
@@ -2860,6 +2978,515 @@ class ObjectPerceptionNode(Node):
             self._infer_tables(now)
         # The camera window shows this frame with these boxes, so they line up even on a moving person
         self._hud_frame = (frame, now)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ── OUTDOOR: live hazards (outdoor_awareness.py) ──
+    # ══════════════════════════════════════════════════════════════════════
+    def _scan_xy_base(self, scan):
+        """All LiDAR returns (360°) in base_footprint (N,2), the wearer's body excluded, or None."""
+        if scan is None or self._lidar_R is None or scan.header.frame_id != self._lidar_frame:
+            return None
+        ranges = np.asarray(scan.ranges, dtype=np.float64)
+        angles = scan.angle_min + np.arange(len(ranges)) * scan.angle_increment
+        ok = np.isfinite(ranges) & (ranges >= max(scan.range_min, LIDAR_BODY_RANGE)) & (ranges <= scan.range_max)
+        r, a = ranges[ok], angles[ok]
+        pts = np.stack([r * np.cos(a), r * np.sin(a), np.zeros_like(r)], axis=1) @ self._lidar_R.T + self._lidar_t
+        return pts[:, :2]
+
+    def _project_base(self, pts, K):
+        """Pixels (u, v) of base_footprint points (N,3); v is NaN behind the camera."""
+        fx, fy, cx, cy, _ = K
+        pc = (np.asarray(pts, dtype=np.float64) - self._cam_t) @ self._cam_R
+        z = np.where(pc[:, 2] > 0.05, pc[:, 2], np.nan)
+        return fx * pc[:, 0] / z + cx, fy * pc[:, 1] / z + cy
+
+    def _horizon_row(self, K, h: int) -> int:
+        """Image row of the horizon (a point far ahead at camera height), clamped to the frame."""
+        u, v = self._project_base(np.array([[100.0, 0.0, self._cam_t[2]]]), K)
+        return int(max(0, min(h - 1, v[0]))) if np.isfinite(v[0]) else h // 2
+
+    def _ground_point(self, u: float, v: float, K, ground):
+        """base_footprint (x, y) where pixel (u, v) meets the ground (the fitted plane, else z = 0), or None."""
+        ray = self._pixel_ray(u, v, K)
+        if ground is not None and ground.fitted:
+            n, d = ground.plane
+            denom = float(n @ ray)
+            if abs(denom) < 1e-6:
+                return None
+            s_ = -(float(n @ self._cam_t) + d) / denom
+        else:
+            s_ = -self._cam_t[2] / ray[2] if ray[2] < -1e-6 else -1.0
+        if s_ <= 0:
+            return None
+        p = self._cam_t + s_ * ray
+        return float(p[0]), float(p[1])
+
+    def _crossing_measurement(self, box, K, ground):
+        """A zebra crossing found by its stripes, as a measurement at its nearest edge (bottom of the box)."""
+        x1, y1, x2, y2 = box
+        near = self._ground_point(0.5 * (x1 + x2), y2, K, ground)
+        if near is None or not (0.3 < near[0] < 30.0):
+            return None
+        # The box must lie on the ground: the stripes' own depth points are at ground height (windows and
+        # house siding also form rows of bars)
+        if ground is not None and ground.fitted and ground.points is not None:
+            us, vs, hgt = ground.points[:3]
+            sel = (us >= x1) & (us <= x2) & (vs >= y1) & (vs <= y2)
+            if sel.sum() >= 5 and float(np.median(np.abs(hgt[sel]))) > 0.15:
+                return None
+        far = self._ground_point(0.5 * (x1 + x2), y1, K, ground)
+        dist = math.hypot(*near)
+        return {"box": tuple(int(v) for v in box), "conf": 0.6, "raw_label": "zebra crossing",
+                "label": "zebra crossing", "mask": None, "is_dynamic": False, "bx": near[0], "by": near[1],
+                "depth": dist, "sigma": 0.1 + 0.05 * dist, "source": "stripes",
+                "z": 0.0, "z_top": 0.0, "width_m": 3.0, "height_m": 0.02,
+                "length_m": (far[0] - near[0]) if far is not None else None}
+
+    def _outdoor_scan(self, msg, t_rx):
+        """Every LiDAR scan in outdoor mode: the wearer's motion, the occupancy grid, and the objects around
+        (360°). Times are when the scan arrived (monotonic), the same clock as the camera frames."""
+        self._refresh_extrinsics(t_rx)
+        xy = self._scan_xy_base(msg)
+        if xy is None:
+            return
+        ego = None
+        if self._odom_enabled:
+            t_scan = _stamp_to_sec(msg.header.stamp)
+            pose, vel, ok = self._odo.update(xy, t_scan)
+            # Healthy after a run of matched scans; lost after 2 s of failures (then everything falls back to
+            # the body frame until it recovers)
+            if ok:
+                self._odom_good_run += 1
+                self._odom_bad_since = None
+                if self._odom_good_run >= 5 and not self._odom_good:
+                    self._odom_good = True
+                    self.get_logger().info("🧭 LiDAR odometry locked: objects are tracked world-fixed")
+            else:
+                self._odom_good_run = 0
+                self._odom_bad_since = self._odom_bad_since or t_rx
+                if self._odom_good and t_rx - self._odom_bad_since > 2.0:
+                    self._odom_good = False
+                    self.get_logger().warn("🧭 LiDAR odometry lost (nothing to match): tracking relative to you")
+            self._ego_hist.append((t_rx, pose, vel))
+            o = Odometry()
+            o.header.stamp, o.header.frame_id, o.child_frame_id = msg.header.stamp, "odom", BASE_FRAME
+            o.pose.pose.position.x, o.pose.pose.position.y = float(pose[0]), float(pose[1])
+            o.pose.pose.orientation.z, o.pose.pose.orientation.w = math.sin(pose[2] / 2), math.cos(pose[2] / 2)
+            c, s_ = math.cos(pose[2]), math.sin(pose[2])
+            o.twist.twist.linear.x, o.twist.twist.linear.y = float(c * vel[0] + s_ * vel[1]), float(-s_ * vel[0] + c * vel[1])
+            o.twist.twist.angular.z = float(vel[2])
+            var = 0.0025 if ok else 0.25
+            o.pose.covariance[0] = o.pose.covariance[7] = var
+            o.pose.covariance[35] = 0.1 * var
+            self._odom_pub.publish(o)
+            if self._odom_good:
+                ego = pose
+        self._occ.add_scan(ego, xy, t_rx, sensor_xy=self._lidar_t[:2])
+        self._outdoor_tracker.update(oa.lidar_clusters(xy), t_rx, ego)
+
+    def _ego_at(self, t):
+        """(pose, velocity) of the wearer (odom) at monotonic time t, interpolated between scans; None when the
+        odometry is not healthy or has nothing near that time."""
+        if not self._odom_good or not self._ego_hist:
+            return None, None
+        hist = list(self._ego_hist)
+        if t >= hist[-1][0]:
+            return (hist[-1][1], hist[-1][2]) if t - hist[-1][0] < 0.3 else (None, None)
+        for (t0, p0, v0), (t1, p1, v1) in zip(hist[:-1], hist[1:]):
+            if t0 <= t <= t1:
+                a = (t - t0) / max(t1 - t0, 1e-6)
+                dyaw = (p1[2] - p0[2] + math.pi) % (2 * math.pi) - math.pi
+                pose = np.array([p0[0] + a * (p1[0] - p0[0]), p0[1] + a * (p1[1] - p0[1]), p0[2] + a * dyaw])
+                return pose, (1 - a) * v0 + a * v1
+        return None, None
+
+    def _process_outdoor(self, stamp, dets, frame, now, dmap, proj, K, t_meas):
+        """One camera frame in outdoor mode: measure, track (body frame), assess, speak, draw."""
+        h, w = frame.shape[:2]
+        meas = []
+        for det in dets:
+            m = self._measure_detection(det, K, h, proj, dmap)
+            if m["label"] in oa.SIGNALS:
+                m["signal"] = oa.signal_color(frame, m["box"], m.get("mask"))
+            meas.append(m)
+        dscale = self._depth_scale if self._depth_scale_valid else 1.0
+        ground = oa.analyze_ground(dmap, K, self._cam_R, self._cam_t, dscale,
+                                   exclude_boxes=[m["box"] for m in meas if m["label"] in oa.MOVERS]) \
+            if dmap is not None else None
+        # Zebra crossings: the detector rarely finds them; the white-stripe pattern does
+        horizon = self._horizon_row(K, h)
+        zebra = oa.find_zebra_crossing(frame, horizon)
+        if zebra is not None and not any(m["label"] in oa.CROSSINGS and _box_overlap(m["box"], zebra) > 0.3
+                                         for m in meas):
+            zm = self._crossing_measurement(zebra, K, ground)
+            if zm is not None:
+                meas.append(zm)
+            else:
+                zebra = None
+        lidar = None
+        xy = self._scan_xy_base(self._scan_for_stamp(stamp))
+        if xy is not None:
+            lidar = oa.lidar_corridor(xy)
+
+        ego, _ = self._ego_at(t_meas)
+        self._outdoor_tracker.update(meas, t_meas, ego)
+        ego_now, vel_now = self._ego_at(now)
+        if ego_now is None and self._odom_good and self._ego_hist:
+            ego_now, vel_now = self._ego_hist[-1][1], self._ego_hist[-1][2]
+        self._outdoor_tracker.set_view(ego_now, vel_now)
+        tracks = self._outdoor_tracker.confirmed()
+        # Depth's low obstacles and drops ahead go into the occupancy grid too
+        if ground is not None and ground.ok and ground.points is not None:
+            _, _, hgt, gx, gy = ground.points
+            near = (gx > 0.3) & (gx < oa.LOOK_AHEAD) & (np.abs(gy) < 4.0)
+            gxy = np.stack([gx, gy], 1)
+            self._occ.add_ground(ego, gxy[near & (hgt > oa.OBSTACLE_MIN_H) & (hgt < oa.HEAD_LOW)],
+                                 gxy[near & (hgt < -oa.DROP_MIN_H) & (gx < oa.DROP_MAX_RANGE)], t_meas)
+        alerts, lanes = oa.assess(tracks, lidar, ground)
+        self._publish_outdoor_markers(tracks, alerts, lanes, lidar, ground, now, vel_now)
+        if now - self._last_occ_pub >= 0.2:
+            self._last_occ_pub = now
+            self._publish_occupancy(ego_now)
+        alert = self._alert_policy.pick(alerts)
+        if alert is not None:
+            payload = alert.as_dict()
+            self._outdoor_alert_pub.publish(String(data=json.dumps(payload)))
+            tag = {oa.CRITICAL: "DANGER", oa.WARNING: "WARNING"}.get(alert.level, "INFO")
+            self._hazard_pub.publish(String(data=f"[{tag}] {alert.text}"))
+            self._last_alert = (alert.text, alert.level, now)
+            self.get_logger().info(f"🔊 [{tag}] {alert.text}")
+        if now - self._last_scene_pub >= 0.5:
+            self._last_scene_pub = now
+            sig = oa.signal_summary(tracks)
+            scene = {
+                "frame": BASE_FRAME,
+                "objects": [{"class": t.label, "id": t.id, "x": round(float(t.x[0]), 2), "y": round(float(t.x[1]), 2),
+                             "dist": round(t.dist, 2), "closing": round(t.closing_speed, 2),
+                             "ttc": None if math.isinf(t.ttc) else round(t.ttc, 1), "in_path": bool(t.in_path()),
+                             "color": t.color, "source": t.m.get("source"),
+                             "speed": None if t.world_speed is None else round(t.world_speed, 2)}
+                            for t in tracks if t.label is not None],
+                "path": {k: round(v, 2) for k, v in lanes.items()},
+                "lidar": lidar is not None, "ground": bool(ground is not None and ground.ok),
+                "odometry": self._odom_good,
+                "walking_speed": None if vel_now is None else round(float(np.hypot(vel_now[0], vel_now[1])), 2),
+                "signal": None if sig is None else {"kind": sig[0], "color": sig[1], "text": sig[2]},
+                "alerts": [a.as_dict() for a in alerts[:5]],
+                "summary": oa.scene_summary(tracks, lanes, ground),
+            }
+            self._outdoor_scene_pub.publish(String(data=json.dumps(scene)))
+
+        # ── HUD ──
+        hud = {}
+        for t in tracks:
+            m = t.m
+            if t.label is None or m.get("box") is None or t_meas - t.last_cam > 0.3:
+                continue  # beside / behind: LiDAR only, not in the camera picture
+            x1, y1, x2, y2 = m["box"]
+            name = f"{t.label.replace(' ', '_')}_{t.id}"
+            detail = f"{t.dist:.1f}m ({ {'lidar': 'LiDAR', 'depth': 'depth', 'stripes': 'stripes'}.get(m.get('source'), 'cam')}) | {oa.where(*t.x[:2])}"
+            if t.color:
+                detail += f" | {t.color.upper()}"
+            if t.world_speed is not None and t.label in oa.MOVERS and t.world_speed > 0.5:
+                detail += f" | moving {t.world_speed:.1f}m/s"
+            if t.label in oa.MOVERS and abs(t.closing_speed) > 0.5:
+                detail += f" | {'closing' if t.closing_speed > 0 else 'leaving'} {abs(t.closing_speed):.1f}m/s"
+                if not math.isinf(t.ttc):
+                    detail += f" TTC {t.ttc:.1f}s"
+            if t.label in oa.OVERHEAD or (t.label not in oa.OUTDOOR_GROUND and m.get("z", 0.0) > 0.3):
+                detail += f" | low edge {m.get('z', 0.0):.2f}m"
+            hud[name] = {
+                'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2, 'label': name, 'conf': m["conf"],
+                'is_dynamic': t.label in oa.MOVERS, 'depth': t.dist, 'cx': 0.5 * (x1 + x2), 'img_w': w,
+                'kw': m.get("width_m", 0.5), 'kh': m.get("height_m", 0.5), 'kz': m.get("z", 0.0),
+                'is_moving': t.closing_speed > 1.0, 'vel': t.closing_speed, 'rel_pos': oa.where(*t.x[:2]),
+                'last_seen': now, 'source': m.get("source"), 'detail': detail,
+            }
+        with self._hud_lock:
+            self._hud_tracks = hud
+        self._outdoor_hud = {"K": K, "lanes": lanes, "lidar": lidar, "zebra": zebra, "horizon": horizon,
+                             "ground": ground, "alerts": alerts[:3], "time": now, "odom": self._odom_good,
+                             "speed": None if vel_now is None else float(np.hypot(vel_now[0], vel_now[1]))}
+        self._record(frame, alert, now)
+
+    def _publish_outdoor_markers(self, tracks, alerts, lanes, lidar, ground, now, ego_vel=None):
+        """Live outdoor view for RViz, drawn like a self-driving car's display: base_footprint (the wearer at the
+        centre, facing +x), a model per object class at its place and heading, predicted paths of moving things,
+        and the wearer's own walking path up to where it is blocked.
+
+        Each array starts with DELETEALL, so RViz shows exactly the present: an object is drawn only while a
+        sensor sees it (the camera ahead, the LiDAR all around, OUTDOOR_SHOW_S), and nothing stays."""
+        if self._outdoor_marker_pub.get_subscription_count() == 0:
+            return
+        stamp = self.get_clock().now().to_msg()
+        life = Duration(seconds=OUTDOOR_MARKER_LIFETIME).to_msg()  # vanish if frames stop coming
+        markers = []
+        clear = Marker()
+        clear.action = Marker.DELETEALL
+        markers.append(clear)
+        ids = {}
+
+        def mk(ns, mtype, rgba, scale=(1.0, 1.0, 1.0), pos=(0.0, 0.0, 0.0), yaw=0.0):
+            m = Marker()
+            m.header.frame_id, m.header.stamp, m.lifetime = BASE_FRAME, stamp, life
+            ids[ns] = ids.get(ns, -1) + 1
+            m.ns, m.id, m.type, m.action = ns, ids[ns], mtype, Marker.ADD
+            m.pose.position.x, m.pose.position.y, m.pose.position.z = (float(v) for v in pos)
+            m.pose.orientation.z, m.pose.orientation.w = math.sin(yaw / 2), math.cos(yaw / 2)
+            m.scale.x, m.scale.y, m.scale.z = (float(v) for v in scale)
+            m.color = ColorRGBA(r=float(rgba[0]), g=float(rgba[1]), b=float(rgba[2]), a=float(rgba[3]))
+            markers.append(m)
+            return m
+
+        def local(x, y, yaw, dx, dy):
+            c, s_ = math.cos(yaw), math.sin(yaw)
+            return x + c * dx - s_ * dy, y + s_ * dx + c * dy
+
+        # ── The wearer: a person model and a heading chevron ──
+        me = (0.35, 0.65, 1.0, 1.0)
+        mk("wearer", Marker.CYLINDER, me, (0.42, 0.42, oa.USER_HEIGHT - 0.3), (0, 0, (oa.USER_HEIGHT - 0.3) / 2))
+        mk("wearer", Marker.SPHERE, me, (0.26, 0.26, 0.28), (0, 0, oa.USER_HEIGHT - 0.12))
+        arrow = mk("wearer", Marker.ARROW, me, (0.07, 0.18, 0.18))
+        arrow.points = [Point(x=0.35, y=0.0, z=0.03), Point(x=1.0, y=0.0, z=0.03)]
+        if ego_vel is not None and self._odom_good:
+            spd = float(np.hypot(ego_vel[0], ego_vel[1]))
+            txt = mk("wearer", Marker.TEXT_VIEW_FACING, (0.8, 0.9, 1.0, 1.0), (0, 0, 0.3), (0, 0, oa.USER_HEIGHT + 0.35))
+            txt.text = f"you {spd:.1f} m/s"
+
+        # ── Walking path (blue while clear) up to the nearest blockage, and the lanes either side ──
+        block = min(lanes.get("center", oa.LOOK_AHEAD), oa.LOOK_AHEAD)
+        col = (1.0, 0.15, 0.1) if block < oa.OBSTACLE_CRITICAL_M else (1.0, 0.55, 0.0) if block < oa.OBSTACLE_WARNING_M \
+            else (0.2, 0.55, 1.0)
+        start = 0.35
+        if block > start:
+            mk("path", Marker.CUBE, (*col, 0.35), (block - start, 2 * oa.CORRIDOR_HALF, 0.01), ((start + block) / 2, 0, 0.005))
+            for edge in (-oa.CORRIDOR_HALF, oa.CORRIDOR_HALF):
+                mk("path", Marker.CUBE, (*col, 0.8), (block - start, 0.03, 0.02), ((start + block) / 2, edge, 0.01))
+        if block < oa.LOOK_AHEAD:
+            mk("path", Marker.CUBE, (*col, 0.9), (0.05, 2 * oa.CORRIDOR_HALF + 0.2, 0.25), (block, 0.0, 0.125))
+            t_ = mk("path", Marker.TEXT_VIEW_FACING, (*col, 1.0), (0, 0, 0.35), (block, 0.0, 0.6))
+            t_.text = f"{block:.1f} m"
+        for name, y0 in (("left", oa.CORRIDOR_HALF + oa.LANE_WIDTH / 2), ("right", -oa.CORRIDOR_HALF - oa.LANE_WIDTH / 2)):
+            d = min(lanes.get(name, oa.LOOK_AHEAD), oa.LOOK_AHEAD)
+            if d > start:
+                lc = (0.2, 0.55, 1.0) if d >= oa.LOOK_AHEAD else (1.0, 0.55, 0.0)
+                mk("lanes", Marker.CUBE, (*lc, 0.08), (d - start, oa.LANE_WIDTH, 0.01), ((start + d) / 2, y0, 0.004))
+
+        # ── Objects: a model per class, where and how it stands, only while seen ──
+        level = {}
+        for a in alerts:
+            for pre in ("obj", "veh"):
+                if a.key.startswith(pre) and a.key[len(pre):].isdigit():
+                    level[int(a.key[len(pre):])] = max(level.get(int(a.key[len(pre):]), 0), a.level)
+        ego_yaw = self._ego_hist[-1][1][2] if (self._odom_good and self._ego_hist) else None
+        for t in tracks:
+            if t.label is None or now - t.last_seen > OUTDOOR_SHOW_S or t.label in OUTDOOR_STRUCTURE:
+                continue  # unnamed outlines and walls / fences are in the occupancy view; out of sight = gone
+            x, y = float(t.x[0]), float(t.x[1])
+            lbl, yaw = t.label, t.yaw_body
+            lvl = level.get(t.id, 0)
+            base = (1.0, 0.15, 0.1) if lvl >= oa.CRITICAL else (1.0, 0.55, 0.0) if lvl == oa.WARNING else None
+            grey = base or (0.82, 0.84, 0.88)
+            white = base or (0.96, 0.96, 0.96)
+            top = 1.0
+            if lbl in ("car", "van", "three-wheeler", "tractor"):
+                L, W, H = {"car": (4.4, 1.8, 1.45), "van": (4.8, 1.9, 1.9), "three-wheeler": (2.6, 1.3, 1.7),
+                           "tractor": (3.5, 2.0, 2.5)}[lbl]
+                mk("objects", Marker.CUBE, (*grey, 0.9), (L, W, 0.55 * H), (x, y, 0.2 + 0.275 * H), yaw)
+                cx, cy = local(x, y, yaw, -0.08 * L, 0.0)
+                mk("objects", Marker.CUBE, (*grey, 0.75), (0.55 * L, 0.92 * W, 0.4 * H), (cx, cy, 0.2 + 0.75 * H), yaw)
+                top = H + 0.2
+            elif lbl in ("bus", "truck", "train"):
+                L, W, H = {"bus": (11.0, 2.5, 3.2), "truck": (7.5, 2.4, 3.2), "train": (20.0, 3.0, 3.8)}[lbl]
+                mk("objects", Marker.CUBE, (*grey, 0.85), (L, W, H - 0.3), (x, y, 0.3 + (H - 0.3) / 2), yaw)
+                top = H
+            elif lbl in ("motorcycle", "bicycle"):
+                mk("objects", Marker.CUBE, (*grey, 0.9), (1.8 if lbl == "motorcycle" else 1.7, 0.35, 0.7), (x, y, 0.4), yaw)
+                if t.world_speed is not None and t.world_speed > 1.0:  # ridden
+                    mk("objects", Marker.CYLINDER, (*white, 0.9), (0.4, 0.4, 0.9), (x, y, 1.2))
+                    mk("objects", Marker.SPHERE, (*white, 0.9), (0.25, 0.25, 0.28), (x, y, 1.8))
+                top = 1.9
+            elif lbl in oa.PEOPLE:
+                h = 1.15 if lbl == "child" else 1.7
+                mk("objects", Marker.CYLINDER, (*white, 0.95), (0.45, 0.45, h - 0.25), (x, y, (h - 0.25) / 2))
+                mk("objects", Marker.SPHERE, (*white, 0.95), (0.25, 0.25, 0.28), (x, y, h - 0.1))
+                top = h
+            elif lbl in oa.ANIMALS:
+                L, H = {"cow": (2.0, 1.4), "goat": (1.0, 0.75), "dog": (0.9, 0.6), "cat": (0.5, 0.3)}[lbl]
+                mk("objects", Marker.CUBE, (*grey, 0.9), (L, 0.35 * L + 0.1, 0.45 * H), (x, y, 0.55 * H + 0.1), yaw)
+                hx, hy = local(x, y, yaw, 0.55 * L, 0.0)
+                mk("objects", Marker.SPHERE, (*grey, 0.9), (0.3 * H + 0.1,) * 3, (hx, hy, 0.95 * H))
+                top = H + 0.1
+            elif lbl == "tree":
+                mk("objects", Marker.CYLINDER, (0.55, 0.42, 0.3, 0.95) if base is None else (*base, 0.95),
+                   (0.35, 0.35, 2.6), (x, y, 1.3))
+                mk("objects", Marker.SPHERE, (0.35, 0.7, 0.4, 0.5) if base is None else (*base, 0.5), (3.0, 3.0, 2.4),
+                   (x, y, 3.6))
+                top = 4.8
+            elif lbl == "pole":
+                mk("objects", Marker.CYLINDER, (*grey, 0.95), (0.18, 0.18, 3.5), (x, y, 1.75))
+                top = 3.5
+            elif lbl == "traffic cone":
+                mk("objects", Marker.CYLINDER, (1.0, 0.45, 0.05, 0.95), (0.35, 0.35, 0.12), (x, y, 0.06))
+                mk("objects", Marker.CYLINDER, (1.0, 0.45, 0.05, 0.95), (0.22, 0.22, 0.6), (x, y, 0.35))
+                top = 0.7
+            elif lbl in oa.SIGNALS:
+                lamp = {"red": (1.0, 0.1, 0.1), "yellow": (1.0, 0.85, 0.0), "green": (0.1, 1.0, 0.3)}.get(t.color, (0.5, 0.5, 0.5))
+                mk("objects", Marker.CYLINDER, (0.3, 0.3, 0.3, 1.0), (0.12, 0.12, 2.6), (x, y, 1.3))
+                mk("objects", Marker.CUBE, (0.1, 0.1, 0.1, 1.0), (0.25, 0.35, 0.8), (x, y, 2.9))
+                mk("objects", Marker.SPHERE, (*lamp, 1.0), (0.3, 0.3, 0.3), (x, y, 3.05 if t.color == "red" else 2.75))
+                top = 3.4
+            elif lbl in oa.CROSSINGS:
+                length = max(1.0, min(t.m.get("length_m") or 3.0, 6.0))
+                for k in range(7):
+                    sy = -1.8 + k * 0.6
+                    px, py = local(x + length / 2, y, 0.0, 0.0, sy)
+                    mk("objects", Marker.CUBE, (1.0, 1.0, 1.0, 0.85), (length, 0.35, 0.02), (px, py, 0.01))
+                top = 0.1
+            elif lbl in oa.DROPS:
+                w_ = max(0.3, min(float(t.m.get("width_m", 0.6)), 3.0))
+                mk("objects", Marker.CYLINDER, (0.25, 0.0, 0.3, 0.9), (w_, w_, 0.03), (x, y, 0.015))
+                mk("objects", Marker.CYLINDER, (1.0, 0.0, 1.0, 0.7) if base is None else (*base, 0.8),
+                   (w_ + 0.12, w_ + 0.12, 0.01), (x, y, 0.005))
+                top = 0.2
+            elif lbl in oa.OVERHEAD:
+                z0 = float(t.m.get("z", 1.5))
+                mk("objects", Marker.CYLINDER, (0.55, 0.42, 0.3, 0.95) if base is None else (*base, 0.95),
+                   (0.12, 0.12, 1.6), (x, y, max(z0, 1.2)))
+                top = max(z0, 1.2) + 0.3
+                markers[-1].pose.orientation.x, markers[-1].pose.orientation.w = math.sin(math.pi / 4), math.cos(math.pi / 4)
+            else:
+                w_ = max(0.2, min(float(t.m.get("width_m", 0.5)), 4.0))
+                h_ = max(0.2, min(float(t.m.get("height_m") or 1.0), 3.0))
+                z0 = float(t.m.get("z", 0.0)) if lbl not in oa.OUTDOOR_GROUND else 0.0
+                mk("objects", Marker.CUBE, (*grey, 0.85), (w_, max(0.2, min(w_, 0.8)), h_), (x, y, z0 + h_ / 2), yaw)
+                top = z0 + h_
+            label = f"{oa.spoken_class(lbl)} {t.dist:.1f} m"
+            if t.color:
+                label += f" {t.color}"
+            if t.world_speed is not None and t.world_speed > 0.5 and lbl in oa.MOVERS:
+                label += f"  {t.world_speed:.1f} m/s"
+            txt = mk("labels", Marker.TEXT_VIEW_FACING, (*(base or (1.0, 1.0, 1.0)), 1.0), (0, 0, 0.35), (x, y, top + 0.4))
+            txt.text = label
+            # ── Predicted path of a moving thing (its own motion, 3 s) ──
+            if lbl in oa.MOVERS and t.world_speed is not None and ego_yaw is not None and t.world_speed > 0.5:
+                c, s_ = math.cos(ego_yaw), math.sin(ego_yaw)
+                vbx, vby = c * t.xw[2] + s_ * t.xw[3], -s_ * t.xw[2] + c * t.xw[3]
+                line = mk("paths", Marker.LINE_STRIP, (*(base or (0.6, 0.85, 1.0)), 0.9), (0.08, 0, 0))
+                line.points = [Point(x=x + vbx * k * 0.25, y=y + vby * k * 0.25, z=0.05) for k in range(13)]
+            elif lbl in oa.MOVERS and ego_yaw is None and abs(t.closing_speed) > 0.8:
+                line = mk("paths", Marker.LINE_STRIP, (*(base or (0.6, 0.85, 1.0)), 0.9), (0.08, 0, 0))
+                line.points = [Point(x=x + t.x[2] * k * 0.25, y=y + t.x[3] * k * 0.25, z=0.05) for k in range(13)]
+        self._outdoor_marker_pub.publish(MarkerArray(markers=markers))
+
+    def _publish_occupancy(self, ego):
+        """The live occupancy grid (/outdoor_occupancy, 5 Hz): grey columns where the LiDAR finds something
+        (anything, named or not), orange low obstacles and magenta drops from depth, and faint walkable ground
+        where the LiDAR sees through. The last few seconds only, fading; nothing is saved."""
+        if self._occ_pub.get_subscription_count() == 0:
+            return
+        stamp = self.get_clock().now().to_msg()
+        life = Duration(seconds=0.6).to_msg()
+        cells = self._occ.cells(ego)
+        markers = []
+        clear = Marker()
+        clear.action = Marker.DELETEALL
+        markers.append(clear)
+        style = {"occupied": ((0.62, 0.64, 0.7, 0.85), 1.3), "low": ((1.0, 0.55, 0.1, 0.9), 0.35),
+                 "drop": ((0.9, 0.0, 0.9, 0.9), 0.03), "free": ((0.25, 0.4, 0.7, 0.18), 0.01)}
+        for i, (name, ((r, g, b, a), hgt)) in enumerate(style.items()):
+            pts = cells.get(name)
+            if pts is None or len(pts) == 0:
+                continue
+            if name == "free":
+                pts = pts[::3]  # a hint of the walkable area is enough, and keeps RViz fast
+            m = Marker()
+            m.header.frame_id, m.header.stamp, m.lifetime = BASE_FRAME, stamp, life
+            m.ns, m.id, m.type, m.action = "occupancy", i, Marker.CUBE_LIST, Marker.ADD
+            m.pose.orientation.w = 1.0
+            m.scale.x = m.scale.y = oa.OCC_RES * (1.7 if name == "free" else 1.0)
+            m.scale.z = hgt
+            m.color = ColorRGBA(r=r, g=g, b=b, a=a)
+            m.points = [Point(x=float(px), y=float(py), z=hgt / 2) for px, py in pts]
+            markers.append(m)
+        self._occ_pub.publish(MarkerArray(markers=markers))
+
+    def _record(self, frame, alert, now):
+        """WEARABLE_RECORD_DIR: save the annotated frame of every spoken alert, and one every RECORD_PERIOD_S."""
+        if not self._record_dir or (alert is None and now - self._last_record < RECORD_PERIOD_S):
+            return
+        self._last_record = now
+        stamp = time.strftime("%H%M%S") + f"_{int(1000 * (time.time() % 1)):03d}"
+        img = frame.copy()
+        try:
+            self._draw_cached_boxes(img)
+            cv2.imwrite(os.path.join(self._record_dir, f"{stamp}{'_alert' if alert else ''}.jpg"), img,
+                        [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if alert is not None:
+                with open(os.path.join(self._record_dir, "alerts.jsonl"), "a") as f:
+                    f.write(json.dumps({"t": stamp, **alert.as_dict()}) + "\n")
+        except Exception as e:
+            self._warn_once("record", f"Recording failed: {e}")
+
+    def _draw_outdoor(self, frame):
+        """Outdoor HUD layer: the walking corridor on the ground (green clear / orange / red blocked, with the
+        blocking distance), the lanes either side, a crossing found by its stripes, and the current alerts."""
+        hud = self._outdoor_hud
+        if hud is None:
+            return
+        h, w = frame.shape[:2]
+        K, lanes = hud["K"], hud["lanes"]
+        if K[4] != w:
+            return
+        ground = hud["ground"]
+        # Ground heights: obstacles red, drops magenta, head-height orange (sampled pixels in the corridor)
+        if ground is not None and ground.ok and ground.points is not None:
+            us, vs, hgt, xs, ys = ground.points
+            half = oa.CORRIDOR_HALF
+            inpath = (np.abs(ys) <= half) & (xs < oa.LOOK_AHEAD)
+            for sel, col in (((hgt > oa.OBSTACLE_MIN_H) & (hgt < oa.HEAD_LOW) & inpath, (0, 0, 255)),
+                             ((hgt < -oa.DROP_MIN_H) & inpath & (xs < oa.DROP_MAX_RANGE), (255, 0, 255)),
+                             ((hgt >= oa.HEAD_LOW) & (hgt <= oa.HEAD_HIGH) & inpath, (0, 165, 255))):
+                for u, v in zip(us[sel], vs[sel]):
+                    cv2.circle(frame, (int(u), int(v)), 2, col, -1)
+        # Corridor on the ground, up to where it is blocked
+        block = lanes.get("center", oa.LOOK_AHEAD)
+        color = (0, 0, 255) if block < oa.OBSTACLE_CRITICAL_M else (0, 140, 255) if block < oa.OBSTACLE_WARNING_M \
+            else (0, 220, 120)
+        far = min(block, oa.LOOK_AHEAD)
+        for lo, hi, col, alpha in ((-oa.CORRIDOR_HALF, oa.CORRIDOR_HALF, color, 0.18),):
+            xs = np.linspace(0.8, far, 12)
+            left = np.stack([xs, np.full_like(xs, hi), np.zeros_like(xs)], axis=1)
+            right = np.stack([xs[::-1], np.full_like(xs, lo), np.zeros_like(xs)], axis=1)
+            u, v = self._project_base(np.vstack([left, right]), K)
+            ok = np.isfinite(u) & np.isfinite(v)
+            if ok.sum() >= 3:
+                poly = np.stack([u[ok], v[ok]], axis=1).astype(np.int32)
+                poly[:, 1] = np.clip(poly[:, 1], hud["horizon"], h - 1)
+                overlay = frame.copy()
+                cv2.fillPoly(overlay, [poly], col)
+                cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+                cv2.polylines(frame, [poly], True, col, 1, cv2.LINE_AA)
+        if block < oa.LOOK_AHEAD:
+            u, v = self._project_base(np.array([[block, oa.CORRIDOR_HALF, 0.0], [block, -oa.CORRIDOR_HALF, 0.0]]), K)
+            if np.all(np.isfinite(u)) and np.all(np.isfinite(v)):
+                p1, p2 = (int(u[0]), int(min(v[0], h - 2))), (int(u[1]), int(min(v[1], h - 2)))
+                cv2.line(frame, p1, p2, color, 3, cv2.LINE_AA)
+                cv2.putText(frame, f"{block:.1f}m", (p2[0] + 4, p2[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1,
+                            cv2.LINE_AA)
+        if hud["zebra"] is not None:
+            x1, y1, x2, y2 = hud["zebra"]
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(frame, "ZEBRA", (x1 + 3, y2 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1,
+                        cv2.LINE_AA)
+        # The alerts right now (most urgent first), above the mode bar
+        y = h - 30
+        for a in reversed(hud["alerts"]):
+            col = (0, 0, 255) if a.level == oa.CRITICAL else (0, 165, 255) if a.level == oa.WARNING else (255, 255, 0)
+            (tw, th), _ = cv2.getTextSize(a.text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(frame, (6, y - th - 6), (14 + tw, y + 4), (20, 20, 20), cv2.FILLED)
+            cv2.putText(frame, a.text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
+            y -= th + 12
 
     def _infer_tables(self, now: float):
         """SMART TABLE INFERENCE: desktop objects floating at desk height imply a table YOLO missed."""
@@ -3221,21 +3848,9 @@ class ObjectPerceptionNode(Node):
         static_count = 0
         dynamic_count = 0
 
-        # ── OUTDOOR: Draw collision corridor overlay ──
+        # ── OUTDOOR: walking corridor, ground hazards, crossing, alerts ──
         if self._mode == "outdoor":
-            corridor_x_center = w // 2
-            corridor_half_px = int(w * (self._collision_corridor_w / 2.0) / 3.0)  # approximate pixels
-            overlay = frame.copy()
-            cv2.rectangle(overlay,
-                          (corridor_x_center - corridor_half_px, h // 3),
-                          (corridor_x_center + corridor_half_px, h),
-                          (0, 255, 100), cv2.FILLED)
-            cv2.addWeighted(overlay, 0.08, frame, 0.92, 0, frame)
-            # Corridor edge lines
-            cv2.line(frame, (corridor_x_center - corridor_half_px, h // 3),
-                     (corridor_x_center - corridor_half_px, h), (0, 255, 100), 1, cv2.LINE_AA)
-            cv2.line(frame, (corridor_x_center + corridor_half_px, h // 3),
-                     (corridor_x_center + corridor_half_px, h), (0, 255, 100), 1, cv2.LINE_AA)
+            self._draw_outdoor(frame)
 
         labels = []  # (depth, box, lines, color) — laid out after all boxes are drawn
         for track_data in hud_tracks:
@@ -3295,14 +3910,16 @@ class ObjectPerceptionNode(Node):
             cv2.rectangle(frame, (x1, y2 + 2), (x1 + bar_w, y2 + 6), color, cv2.FILLED)
 
             # ── 5. ASSISTIVE LABEL: name / distance from the wearer / real height / direction ──
-            src_tag = {"lidar": "LiDAR", "depth": "depth"}.get(track_data.get('source'), "cam")
-            detail = f"{depth:.1f}m away ({src_tag}) | {kh:.2f}m tall"
-            if kz > 0.3:
-                cls = track_data['label'].rsplit('_', 1)[0].replace('_', ' ')
-                detail += f" | mounted at {kz:.2f}m" if cls in WALL_MOUNTED else f" | on {kz:.2f}m surface"
-            detail += f" | {rel_pos}"
-            if is_moving:
-                detail += f" | MOVING {vel:.1f}m/s"
+            detail = track_data.get('detail')
+            if detail is None:
+                src_tag = {"lidar": "LiDAR", "depth": "depth"}.get(track_data.get('source'), "cam")
+                detail = f"{depth:.1f}m away ({src_tag}) | {kh:.2f}m tall"
+                if kz > 0.3:
+                    cls = track_data['label'].rsplit('_', 1)[0].replace('_', ' ')
+                    detail += f" | mounted at {kz:.2f}m" if cls in WALL_MOUNTED else f" | on {kz:.2f}m surface"
+                detail += f" | {rel_pos}"
+                if is_moving:
+                    detail += f" | MOVING {vel:.1f}m/s"
             labels.append((depth, (x1, y1, x2, y2), [label, detail], color))
 
         # ── 6. LABEL LAYOUT: nearest objects first, never overlapping another label ──
@@ -3379,8 +3996,8 @@ class ObjectPerceptionNode(Node):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
 
         if danger_count > 0:
-            alert_text = f"!! DANGER: {danger_count} CLOSE !!"
-            cv2.putText(frame, alert_text, (w - 290, 22),
+            alert_text = f"!! {danger_count} CLOSE !!"  # short: "MOVING" sits left of it on a 640 px frame
+            cv2.putText(frame, alert_text, (w - 150, 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
         else:
             cv2.putText(frame, "PATH CLEAR", (w - 130, 22),
@@ -3393,7 +4010,16 @@ class ObjectPerceptionNode(Node):
             mode_text = f"MODE: INDOOR [MAPPING] | Map: {mem_count} objects"
             mode_color = (255, 200, 0)
         else:
-            mode_text = "MODE: OUTDOOR [NAV] | Collision Avoidance Active"
+            hud = self._outdoor_hud
+            lanes = hud["lanes"] if hud else {}
+            mode_text = "MODE: OUTDOOR | path " + (" ".join(
+                f"{k[0].upper()} {'clear' if v >= oa.LOOK_AHEAD else f'{v:.1f}m'}" for k, v in
+                (("left", lanes.get("left", oa.LOOK_AHEAD)), ("center", lanes.get("center", oa.LOOK_AHEAD)),
+                 ("right", lanes.get("right", oa.LOOK_AHEAD)))))
+            if hud:
+                mode_text += f" | LiDAR {'on' if hud['lidar'] is not None else 'off'}" \
+                             f" | ground {'fitted' if hud['ground'] is not None and hud['ground'].ok else '-'}" \
+                             f" | odom {'%.1fm/s' % hud['speed'] if hud['odom'] and hud['speed'] is not None else '-'}"
             mode_color = (0, 200, 255)
 
         cv2.putText(frame, mode_text, (10, h - 10),

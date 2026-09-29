@@ -5,7 +5,7 @@ VisionNav runs on two computers:
 * **Raspberry Pi 5** (on the chest rig): the five push buttons, the LiDAR and the camera. The button program
   starts by itself when the Pi boots; the **SENSORS** button turns the LiDAR and camera on.
 * **Laptop** (MSI Sword 15, RTX 2050): the AI, the map and the voice. The navigation assistant starts at login
-  (or with one command) and starts everything else — the map, the camera AI, the vision AI, GPS — as soon as the
+  (or with one command) and starts everything else — the map, the camera AI, the vision AI — as soon as the
   camera and LiDAR are on, and whenever the buttons ask for it.
 
 **No SSH is needed to use it.** The Pi and the laptop find each other by themselves over Wi-Fi through ROS 2
@@ -44,7 +44,7 @@ VisionNav runs on two computers:
 | **LOOK** | tap | If the vision AI is off: "Turning on the vision AI. This takes about half a minute." → starts Qwen3-VL → "Vision AI enabled." → describes the scene. If it is already on: "Looking." → the description |
 | | hold | Beep → ask a question while holding ("what colour is the door?") → release → the camera answers |
 | | double tap | Stops the vision AI and frees its ~2 GB of GPU memory: "Vision AI off." |
-| **MODE** | tap | While paused (sensors off): "Outdoor mode selected. It starts when the camera and LiDAR are on." Otherwise: "Switching to outdoor mode." → stops the indoor map programs, starts the GPS ones → "Outdoor mode activated." (and back: "Indoor mode activated."). Without a GPS receiver: "…No GPS receiver is plugged in, so I will only warn you about obstacles." |
+| **MODE** | tap | While paused (sensors off): "Outdoor mode selected. It starts when the camera and LiDAR are on." Otherwise: "Switching to outdoor mode." → closes the indoor map (Cartographer, Nav2, its RViz), opens the outdoor view (its own RViz) → "Outdoor mode activated." Tap again: the outdoor view closes and the indoor map opens → "Indoor mode activated." The camera window stays open throughout. |
 | | hold | Status: mode, vision AI on/off, missing sensors, map, how many objects, what is around you |
 | **HAND** | tap | Starts the camera AI if it is off → "Hand guidance enabled." → guides your hand to the object found last (or the nearest one ahead), walking you there first if it is more than 1 m away. Tap again: "Hand guidance disabled." |
 | **TALK** | tap | **STOP** everything (speech, walking guidance, hand guidance): "Stopped." |
@@ -63,13 +63,13 @@ The assistant starts and stops these itself (`system_manager.py`); the Pi's butt
 |---|---|
 | **SENSORS** (Pi) | `pi_sensors.launch.py`: RPLiDAR C1 (`sllidar_node`) + chest camera (`phone_camera_publisher`) |
 | **Indoor** (default, laptop) | `laptop_brain.launch.py` (sensor TFs, Cartographer SLAM, Nav2, walls, RViz) + `object_perception` (camera AI, camera window) |
-| **Outdoor** (laptop) | `nmea_navsat_driver` (only if a GPS receiver is on `/dev/ttyACM0`) + `gps_localization.launch.py` + `gps_voice_navigator` + `object_perception` (collision warnings) |
+| **Outdoor** (laptop) | `outdoor_sensors.launch.py` (camera and LiDAR mounts, live RViz view) + `object_perception` (hazard warnings, below) |
 | **LOOK** (laptop) | `scene_describer` (Qwen3-VL), started on the first press, stopped by a double tap |
 
 * A program already started by hand in a terminal is used as it is — never started twice, and never stopped by
   the buttons.
 * Everything the assistant started stops when it exits (Ctrl+C, closing its terminal, or saying "exit").
-* Each program's output: `~/.visionnav/logs/<part>.log` (`brain`, `perception`, `vision_ai`, `gps`,
+* Each program's output: `~/.visionnav/logs/<part>.log` (`brain`, `perception`, `vision_ai`, `outdoor_tf`,
   `pi_sensors` on the Pi).
 * Settings (set before starting the assistant): `WEARABLE_AUTOSTART` — `sensors` (default: start the mode when
   the camera and LiDAR come on, pause it when they go off), `now` (start at once), `off` (never, section 6);
@@ -77,6 +77,52 @@ The assistant starts and stops these itself (`system_manager.py`); the Pi's butt
   `WEARABLE_BRAIN_ARGS="camera_height:=1.32 camera_pitch_deg:=12 lidar_height:=1.18"` passes the rig's measured
   geometry to the map (section 5).
 * Switching from indoor to outdoor while *mapping* saves the map first.
+
+### Outdoor mode: hazard warnings
+
+Outdoors nothing is mapped: the camera AI watches what is in front of you right now and says only what matters,
+most urgent first, with the distance in feet and the direction. A danger ("Stop. …") cuts off whatever is being
+said; the same thing is not repeated unless it gets closer or more urgent.
+
+| What | Example of what you hear | How it is found |
+|---|---|---|
+| Something in your path (pole, tree, wall, parked car, bin, person standing) | "Pole ahead, 6 feet. Step right." — "Obstacle ahead, 3 feet. Step left or right." — "Path clear." once it is behind you | LiDAR at chest height (anything, named after the camera's detection there) + ground analysis from depth for low things (rocks, bollards, cones) |
+| Holes and drops (pothole, open drain, kerb, steps, stairs) | "Pothole ahead, 8 feet." — "Drop or hole ahead, 5 feet." | Detector + the ground plane fitted in the depth every frame |
+| Head height (low branch, sign) | "Low branch at head height, 5 feet ahead. Duck." | Detector + depth: something at head height with free space below it |
+| Vehicles | "Car approaching on your left, 40 feet." — "Stop. Three-wheeler coming ahead, 15 feet." | Tracked with their speed toward you: a warning under 6 s to reach you, "Stop" under 3 s |
+| People and animals in your way | "Person coming toward you, 8 feet." — "Dog on your right, 6 feet." | Tracked like vehicles |
+| Something coming from behind or the side (outside the camera) | "Something coming behind you, 7 feet." | LiDAR, all round, with your own motion subtracted |
+| Zebra crossing | "Zebra crossing ahead, 12 feet." | The white stripe pattern on the ground (the detector alone rarely finds one) |
+| Traffic and pedestrian lights | "Pedestrian signal is red. Wait." — "Pedestrian signal is green." (said when it changes) | The lit lamp's colour |
+
+* **How it sees, like a self-driving car** (all live, nothing saved):
+  * **Its own motion:** LiDAR odometry (scan matching against the last few metres of scans) knows how you walk
+    and turn, so a parked car is still and a car's or cyclist's speed is its own, not relative to your walking.
+    Also published on `/odom`. The log says `🧭 LiDAR odometry locked`; in a wide-open place with
+    nothing within ~12 m it falls back to tracking relative to you.
+  * **360° objects:** the LiDAR tracks what is around you all the way round; the camera names it ("person") and
+    the name stays while the LiDAR still sees it beside or behind you. Something moving toward you from behind
+    or the side is said: "Something coming behind you, 7 feet."
+  * **Occupancy:** a grid of the last ~2 seconds (fading) of what the LiDAR hits and what depth finds low or
+    dropping away ahead — anything, whether or not it has a name.
+* **RViz** (opens with outdoor mode, `rviz/visionnav_outdoor.rviz`): you (blue) at the centre facing up the
+  screen, your walking path (blue, orange / red where it is blocked, with the distance), grey columns for
+  occupied space and faint blue walkable ground, and a model for each object seen right now — cars (body and
+  cabin), buses, bikes, people, animals, trees, poles, cones, lights showing their colour, crossings as white
+  stripes, holes as magenta discs — with its distance, its own speed and its predicted path (3 s). Threats turn
+  orange / red. An object leaves the view as soon as no sensor sees it. Topics: `/outdoor_markers`,
+  `/outdoor_occupancy`. Without a screen: `use_rviz:=false` on `outdoor_sensors.launch.py`.
+* **Say** (hold TALK): "what is ahead" (also TALK double tap), "what colour is the light", "can I cross" (the
+  crossing, its signal and any vehicle coming — it never says it is safe; listen for traffic), "quiet warnings"
+  (two minutes; dangers are still said), "warnings on", "help".
+* **TALK tap** stops the speech and quiets the warnings for 6 s (dangers are still said).
+* **Settings**: `WEARABLE_USER_HEIGHT=1.75` (m, for head-height warnings), `WEARABLE_UNITS=metric` (metres instead
+  of feet), `WEARABLE_RECORD_DIR=~/walk1` (saves the camera view of every warning, and one frame every 2 s, with
+  `alerts.jsonl` — to review a walk afterwards).
+* The chest camera cannot see the ground closer than about 1.5–2.5 m (it depends on its tilt), so holes are
+  warned about while they are still ahead. It does not replace the cane.
+* The outdoor detector has its own engine (`yoloe-11s-seg-outdoor-*.engine`, built once on the first start, ~3–6
+  min) and the outdoor depth model (`models/depth_anything_v2_metric_outdoor_vits.pth`, section 1).
 
 ### Voice commands (hold TALK, or type them in the assistant's terminal)
 
@@ -116,9 +162,15 @@ colcon build --symlink-install --packages-select visionnav
 * **GPU driver.** The perception log must say `YOLO device: CUDA fp16 (TensorRT)`. `CPU` means the NVIDIA driver
   is not loaded (often after a kernel update): `sudo apt install linux-modules-nvidia-595-open-$(uname -r)` and
   reboot.
-* **Object detector.** YOLOE-11s-seg with the vocabulary in `VOCABULARY` (top of `visionnav/object_perception.py`).
-  The first start after the vocabulary changes builds a TensorRT engine (~2 min, one time); the camera window
-  opens when it is done. To detect something new, add its name to `VOCABULARY`.
+* **Object detector.** YOLOE-11s-seg with the vocabulary in `VOCABULARY` (top of `visionnav/object_perception.py`),
+  and outdoors `OUTDOOR_VOCABULARY` (top of `visionnav/outdoor_awareness.py`). The first start after a vocabulary
+  changes builds its TensorRT engine (~2–6 min, one time); the camera window opens when it is done. To detect
+  something new, add its name to the vocabulary.
+* **Outdoor depth model** (outdoor mode; without it outdoor mode uses the indoor one, which reads no farther than 20 m):
+  ```bash
+  curl -L -o ~/wearable_ws/src/visionnav/models/depth_anything_v2_metric_outdoor_vits.pth \
+    https://huggingface.co/depth-anything/Depth-Anything-V2-Metric-VKITTI-Small/resolve/main/depth_anything_v2_metric_vkitti_vits.pth
+  ```
 * **Vision AI.** `ollama pull qwen3-vl:2b-instruct` (the plain `qwen3-vl:2b` tag is a *thinking* model that
   gives empty answers).
 * **Hand tracking** (grasp mode). Install MediaPipe *without* its dependencies (a normal install pulls NumPy 2
@@ -299,10 +351,10 @@ LIBGL_ALWAYS_SOFTWARE=1 ros2 launch visionnav laptop_brain.launch.py
 WEARABLE_CAMERA_MODE=ros ros2 run visionnav object_perception
 # Laptop — vision AI (type questions in its terminal)
 ros2 run visionnav scene_describer
-# Laptop — outdoor GPS
-ros2 run nmea_navsat_driver nmea_serial_driver --ros-args -p port:=/dev/ttyACM0 -p baud:=9600
-ros2 launch visionnav gps_localization.launch.py
-ros2 run visionnav gps_voice_navigator
+# Laptop — outdoor camera AI (sensor mounts first; add the rig's geometry as for the brain)
+ros2 launch visionnav outdoor_sensors.launch.py
+WEARABLE_CAMERA_MODE=ros WEARABLE_MODE=outdoor ros2 run visionnav object_perception
+ros2 topic echo /outdoor_alert            # what would be said, as it is decided
 ```
 
 ---
