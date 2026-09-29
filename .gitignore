@@ -1,4 +1,7 @@
 .vscode/
+__pycache__/
 *.engine
 *.pt
 *.pth
+visionnav/models/mobileclip_blt.ts
+visionnav/models/hand_landmarker.task
