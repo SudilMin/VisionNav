@@ -18,6 +18,36 @@ if ! grep -qi "raspberry pi" /proc/device-tree/model 2>/dev/null; then
 fi
 PINS="SENSORS=24 LOOK=17 MODE=27 HAND=22 TALK=23"
 
+# I2C bus 1 (header pins 3 and 5) for the IMU: Python library, i2cdetect, the bus itself and its permission.
+# Sets REBOOT_FOR_I2C=1 when the bus only appears after a reboot.
+setup_i2c() {
+    if ! { python3 -c "import smbus2" 2>/dev/null || python3 -c "import smbus" 2>/dev/null; } \
+            || ! command -v i2cdetect > /dev/null; then
+        sudo apt-get update
+        sudo apt-get install -y python3-smbus i2c-tools
+    else
+        echo "smbus and i2c-tools already installed"
+    fi
+    # Ubuntu and Raspberry Pi OS: /boot/firmware/config.txt (older images: /boot/config.txt)
+    local cfg=/boot/firmware/config.txt
+    [ -f "$cfg" ] || cfg=/boot/config.txt
+    REBOOT_FOR_I2C=0
+    if [ -f "$cfg" ] && ! grep -qE "^dtparam=i2c_arm=on" "$cfg"; then
+        # Under [all]: the file may end inside a model section ([cm4], [pi4]) that the Pi 5 skips
+        printf '\n[all]\ndtparam=i2c_arm=on\n' | sudo tee -a "$cfg" > /dev/null
+        echo "I2C turned on in $cfg"
+        REBOOT_FOR_I2C=1
+    fi
+    echo i2c-dev | sudo tee /etc/modules-load.d/i2c-dev.conf > /dev/null
+    sudo modprobe i2c-dev || true
+    sudo groupadd -f i2c
+    sudo usermod -aG i2c "$USER"
+    echo 'KERNEL=="i2c-[0-9]*", GROUP="i2c", MODE="0660"' | sudo tee /etc/udev/rules.d/99-i2c.rules > /dev/null
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger
+    [ -e /dev/i2c-1 ] || REBOOT_FOR_I2C=1
+}
+
 if [ "$1" = "test" ]; then
     echo "Stopping the button service while testing (it is started again at the end)..."
     sudo systemctl stop visionnav-buttons 2>/dev/null || true
@@ -43,8 +73,21 @@ fi
 
 if [ "$1" = "imu" ]; then
     # Reads the chip next to a running IMU node without disturbing it (no reset)
+    setup_i2c
+    if [ "$REBOOT_FOR_I2C" = "1" ]; then
+        echo
+        echo "The I2C bus is not there yet: reboot the Pi (sudo reboot), then run this again:"
+        echo "    bash ~/wearable_ws/src/visionnav/scripts/setup_pi.sh imu"
+        exit 1
+    fi
+    if [ ! -r /dev/i2c-1 ] || [ ! -w /dev/i2c-1 ]; then
+        echo
+        echo "Your user was just given access to the I2C bus: reboot the Pi (sudo reboot), then run this again."
+        exit 1
+    fi
+    echo
     echo "I2C bus 1 (header pins 3 and 5) — the MPU-6050 shows as 68:"
-    i2cdetect -y 1 || echo "No /dev/i2c-1: run this script without 'imu' first (it turns I2C on), then reboot."
+    sudo i2cdetect -y 1
     source /opt/ros/jazzy/setup.bash
     source "$WS/install/setup.bash"
     exec ros2 run visionnav mpu6050_imu calibrate
@@ -64,31 +107,13 @@ else
 fi
 
 echo "== 3/6  I2C bus for the IMU (MPU-6050 on header pins 3 and 5)"
-if python3 -c "import smbus2" 2>/dev/null || python3 -c "import smbus" 2>/dev/null; then
-    echo "smbus already installed"
-else
-    sudo apt-get install -y python3-smbus i2c-tools
-fi
-# Ubuntu: /boot/firmware/config.txt; Raspberry Pi OS: the same (older images: /boot/config.txt)
-CONFIG_TXT=/boot/firmware/config.txt
-[ -f "$CONFIG_TXT" ] || CONFIG_TXT=/boot/config.txt
-REBOOT_FOR_I2C=0
-if [ -f "$CONFIG_TXT" ] && ! grep -qE "^dtparam=i2c_arm=on" "$CONFIG_TXT"; then
-    echo "dtparam=i2c_arm=on" | sudo tee -a "$CONFIG_TXT" > /dev/null
-    REBOOT_FOR_I2C=1
-fi
-echo i2c-dev | sudo tee /etc/modules-load.d/i2c-dev.conf > /dev/null
-sudo modprobe i2c-dev || true
-[ -e /dev/i2c-1 ] || REBOOT_FOR_I2C=1
+setup_i2c
 
-echo "== 4/6  Permissions: LiDAR serial port (dialout), GPIO pins (gpio), I2C bus (i2c)"
+echo "== 4/6  Permissions: LiDAR serial port (dialout) and GPIO pins (gpio); I2C (i2c) in step 3"
 sudo usermod -aG dialout "$USER"
 sudo groupadd -f gpio
 sudo usermod -aG gpio "$USER"
-sudo groupadd -f i2c
-sudo usermod -aG i2c "$USER"
 echo 'SUBSYSTEM=="gpio", KERNEL=="gpiochip*", GROUP="gpio", MODE="0660"' | sudo tee /etc/udev/rules.d/99-gpio.rules > /dev/null
-echo 'KERNEL=="i2c-[0-9]*", GROUP="i2c", MODE="0660"' | sudo tee /etc/udev/rules.d/99-i2c.rules > /dev/null
 sudo udevadm control --reload-rules
 sudo udevadm trigger
 

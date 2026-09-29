@@ -216,6 +216,10 @@ def calibrate_mount():
     imu = MPU6050()
     try:
         imu.open(reset=False)
+    except ImportError:
+        print("The I2C library is missing: sudo apt-get install python3-smbus i2c-tools "
+              "(or run setup_pi.sh, which installs it).")
+        return 1
     except (OSError, FileNotFoundError) as e:
         print(f"No IMU on /dev/i2c-{BUS} at 0x{ADDRESS:02x}: {e}\n"
               "Check: I2C enabled (setup_pi.sh), VCC to pin 1, GND to pin 9, SDA to pin 3, SCL to pin 5; "
@@ -296,6 +300,8 @@ def main(args=None):
                 self._imu.open()
             except (OSError, FileNotFoundError) as e:
                 return str(e)
+            except ImportError:
+                return "the I2C library is missing (sudo apt-get install python3-smbus, or run setup_pi.sh)"
             acc = np.mean([self._imu.read()[0] for _ in range(20)], axis=0)
             self.get_logger().info(
                 f"{KNOWN_CHIPS.get(self._imu.who, 'Unknown chip')} (WHO_AM_I 0x{self._imu.who:02x}) on "
