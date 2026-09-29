@@ -13,6 +13,8 @@ def generate_launch_description():
                               description='Also start the GPIO push-button panel (pi_button_panel)'),
         DeclareLaunchArgument('camera', default_value='true',
                               description='Start the chest camera stream (phone_camera_publisher)'),
+        DeclareLaunchArgument('imu', default_value='true',
+                              description='Start the chest MPU-6050 (mpu6050_imu; harmless when none is wired)'),
         # Chest camera -> /camera/image_raw/compressed (was a separate terminal; forgetting it left the camera AI
         # on "Waiting for camera feed")
         Node(
@@ -29,6 +31,15 @@ def generate_launch_description():
             name='pi_button_panel',
             output='screen',
             condition=IfCondition(LaunchConfiguration('buttons')),
+        ),
+        # MPU-6050 on I2C (header pins 1, 3, 5, 9) -> /imu/data, 100 Hz (see mpu6050_imu.py for wiring). Without
+        # a chip it only logs and retries: /imu/data is not advertised, so the laptop maps without it.
+        Node(
+            package='visionnav',
+            executable='mpu6050_imu',
+            name='mpu6050_imu',
+            output='screen',
+            condition=IfCondition(LaunchConfiguration('imu')),
         ),
         # Slamtec RPLiDAR C1 via sllidar_ros2
         Node(

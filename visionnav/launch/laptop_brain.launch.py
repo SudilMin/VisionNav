@@ -17,10 +17,12 @@ def _slam_and_map_manager(context, config_dir):
     """Cartographer in mapping mode, or localizing in a saved map, plus the map manager.
 
     localize:=auto (default) localizes when ~/.visionnav/maps/<map>.pbstream exists, else maps.
+    imu:=true adds the chest IMU (/imu/data): the *_imu.lua variants of both configurations.
     """
     name = LaunchConfiguration('map').perform(context)
     localize = LaunchConfiguration('localize').perform(context).lower()
     use_cartographer = LaunchConfiguration('slam').perform(context) == 'cartographer'
+    imu = '_imu' if LaunchConfiguration('imu').perform(context).lower() == 'true' else ''
     state_file = os.path.join(_maps_dir(), f'{name}.pbstream')
     localizing = use_cartographer and localize != 'false' and os.path.isfile(state_file)
     actions = []
@@ -29,12 +31,14 @@ def _slam_and_map_manager(context, config_dir):
     if use_cartographer:
         args = ['-configuration_directory', config_dir]
         if localizing:
-            args += ['-configuration_basename', 'cartographer_localization.lua',
+            args += ['-configuration_basename', f'cartographer_localization{imu}.lua',
                      '-load_state_filename', state_file]
             actions.append(LogInfo(msg=f'Localizing in saved map {state_file}'))
         else:
-            args += ['-configuration_basename', 'cartographer_config.lua']
+            args += ['-configuration_basename', f'cartographer_{"imu" if imu else "config"}.lua']
             actions.append(LogInfo(msg=f"Mapping a new area (say 'save map' to keep it as '{name}')"))
+        if imu:
+            actions.append(LogInfo(msg='Using the chest IMU (/imu/data)'))
         actions.append(Node(
             package='cartographer_ros',
             executable='cartographer_node',
@@ -42,7 +46,7 @@ def _slam_and_map_manager(context, config_dir):
             output='screen',
             parameters=[{'use_sim_time': False}],
             arguments=args,
-            remappings=[('scan', 'scan_filtered')],
+            remappings=[('scan', 'scan_filtered'), ('imu', '/imu/data')],
         ))
     actions.append(Node(
         package='visionnav',
@@ -79,6 +83,11 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'localize', default_value='auto',
             description="'auto': localize in the saved map if it exists, else map; 'false': map anew"),
+        # Cartographer waits for every sensor it is configured with: only true while the Pi publishes /imu/data
+        # (the assistant checks that when it starts the brain; WEARABLE_IMU=0 turns it off)
+        DeclareLaunchArgument(
+            'imu', default_value='false',
+            description='Use the chest IMU (/imu/data, mpu6050_imu on the Pi) in Cartographer'),
         # 1. Sensor extrinsics (odom->base_footprint, base_footprint->laser, base_footprint->camera_link).
         #    Mount arguments (camera_pitch_deg:=12, lidar_yaw_deg:=180, ...) pass straight through.
         IncludeLaunchDescription(

@@ -165,13 +165,20 @@ class SystemManager:
                 return True
             proc = self._procs.get(part)
             if proc is None or proc.poll() is not None:
+                cmd = list(spec["cmd"])
+                # The chest IMU, when the Pi publishes it (mpu6050_imu advertises /imu/data only once the chip
+                # answers): Cartographer waits for every sensor it is given, so never without that publisher
+                if (part == "brain" and os.environ.get("WEARABLE_IMU", "auto") != "0"
+                        and self._node.count_publishers("/imu/data") > 0):
+                    cmd.append("imu:=true")
                 env = dict(os.environ, PYTHONUNBUFFERED="1", **spec["env"])  # logs written as they happen
                 log = open(os.path.join(LOG_DIR, f"{part}.log"), "ab")
                 self._stopped.pop(part, None)
                 self._procs[part] = proc = subprocess.Popen(
-                    spec["cmd"], env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                    cmd, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                     start_new_session=True)  # own process group: stop() ends the whole launch
-                self._log(f"started {part} (pid {proc.pid}), log {LOG_DIR}/{part}.log")
+                self._log(f"started {part} (pid {proc.pid}){' with the IMU' if 'imu:=true' in cmd else ''}, "
+                          f"log {LOG_DIR}/{part}.log")
         if not wait:
             return False
         return self.wait_ready(part)

@@ -2,7 +2,7 @@
 
 VisionNav runs on two computers:
 
-* **Raspberry Pi 5** (on the chest rig): the five push buttons, the LiDAR and the camera. The button program
+* **Raspberry Pi 5** (on the chest rig): the five push buttons, the LiDAR, the camera and the IMU (MPU-6050). The button program
   starts by itself when the Pi boots; the **SENSORS** button turns the LiDAR and camera on.
 * **Laptop** (MSI Sword 15, RTX 2050): the AI, the map and the voice. The navigation assistant starts at login
   (or with one command) and starts everything else — the map, the camera AI, the vision AI — as soon as the
@@ -219,15 +219,16 @@ cd ~/wearable_ws/src && git pull                           # on the Pi
 bash ~/wearable_ws/src/visionnav/scripts/setup_pi.sh       # on the Pi
 ```
 
-The script builds the package, installs the GPIO library, gives your user access to the LiDAR port and the GPIO
-pins, installs the **visionnav-buttons** boot service and starts it. It ends with `OK: the buttons are ready`.
+The script builds the package, installs the GPIO and I2C libraries, turns on the I2C bus for the IMU, gives your
+user access to the LiDAR port, the GPIO pins and the I2C bus, installs the **visionnav-buttons** boot service and
+starts it. It ends with `OK: the buttons are ready` (and, the first time, asks for one reboot to turn on I2C).
 Run the same two Pi lines again after every update. Then `exit` — the Pi needs no terminal from now on.
 
 * **Watch the buttons:** `journalctl -u visionnav-buttons -f` shows `Buttons ready: SENSORS=GPIO24, …` and every
   press (`SENSORS tap`, `sensors: starting`, `sensors: on`). `systemctl status visionnav-buttons` shows whether
   it runs.
 * **Check the wiring:** `bash ~/wearable_ws/src/visionnav/scripts/setup_pi.sh test` prints the name of every
-  button pressed (Ctrl+C to stop).
+  button pressed (Ctrl+C to stop). `setup_pi.sh imu` checks the IMU (section 3b).
 * **LiDAR and camera on at every boot** (without pressing SENSORS):
   `sudo sed -i 's/pi_button_panel$/pi_button_panel --ros-args -p sensors_at_start:=true/' /etc/systemd/system/visionnav-buttons.service`
   then `sudo systemctl daemon-reload && sudo systemctl restart visionnav-buttons`.
@@ -271,15 +272,16 @@ With the USB ports pointing **up** (header on the left edge), count rows from th
  row 8  → pin 16  TALK           pin 15  HAND
  row 7  → pin 14  GND            pin 13  MODE
  row 6  → pin 12  (unused)       pin 11  LOOK
- row 5  → pin 10                 pin 9   (GND)
+ row 5  → pin 10                 pin 9   IMU GND
  row 4  → pin 8                  pin 7
- row 3  → pin 6   (GND)          pin 5
- row 2  → pin 4   5V  ✗          pin 3
- row 1  → pin 2   5V  ✗          pin 1   3.3V ✗    ← next to the mounting hole
+ row 3  → pin 6   (GND)          pin 5   IMU SCL
+ row 2  → pin 4   5V  ✗          pin 3   IMU SDA
+ row 1  → pin 2   5V  ✗          pin 1   IMU VCC (3.3V)  ← next to the mounting hole
 ```
 
 * 4-leg tactile buttons: the two legs on each **long** side are joined inside. Use two **diagonally opposite** legs.
 * Never connect a button to 5 V (pins 2, 4) or 3.3 V (pins 1, 17): a button to a power pin shorts it when pressed.
+  Pins 1, 3, 5 and 9 belong to the IMU (section 3b).
 * `pinout` on the Pi prints the header for your board.
 * Other pins: add e.g. `--ros-args -p look_pin:=5` to the `ExecStart` line in
   `/etc/systemd/system/visionnav-buttons.service`, then `sudo systemctl daemon-reload && sudo systemctl restart visionnav-buttons`.
@@ -288,6 +290,59 @@ With the USB ports pointing **up** (header on the left edge), count rows from th
 every button pressed and released (Ctrl+C to stop; the button service is paused meanwhile).
 With the service running: `ros2 topic echo /button_event` (on either computer, `ROS_DOMAIN_ID=42`) shows every
 press, e.g. `{"button": "look", "event": "tap"}`.
+
+---
+
+## 🧭 3b. IMU (MPU-6050): Wiring and Placement
+
+The IMU tells the system how fast you turn (100 times a second; the LiDAR scans 10 times) and where down is.
+Indoors the map uses it to follow fast turns and to level the scan when your chest leans; outdoors the motion
+tracking uses it for every turn. Everything works without it; with it, fast turns no longer lose your position.
+
+**Wiring** (Pi switched off; GY-521 board, 4 female–female jumper wires, as short as possible, max ~30 cm):
+
+| GY-521 pin | Pi 5 header pin | What |
+|------------|-----------------|------|
+| **VCC** | pin 1 | 3.3 V (not 5 V: the board works at either, but 3.3 V keeps SDA/SCL at the Pi's safe level) |
+| **GND** | pin 9 | Ground |
+| **SDA** | pin 3 (GPIO2) | I2C data |
+| **SCL** | pin 5 (GPIO3) | I2C clock |
+| XDA, XCL, AD0, INT | — | Not connected (AD0 open = address 0x68) |
+
+```
+   GY-521              Pi 5 header (pin 1 end)
+   VCC ──────────────── pin 1  3.3V
+   SDA ──────────────── pin 3  GPIO2
+   SCL ──────────────── pin 5  GPIO3
+   GND ──────────────── pin 9  GND
+```
+
+**Where to put it: on the chest plate, not on top of the LiDAR and not on the side.** It must move exactly like
+the LiDAR, so it goes on the same rigid part:
+
+* **Centre of the chest plate** (on the breastbone), on the same hard plate as the LiDAR, a few cm from it,
+  as close to it as fits (default height 1.15 m, just below a LiDAR at 1.2 m).
+* **Stand the board upright** against the plate: **chip side facing forward** (away from your chest), the
+  printed **Y arrow pointing up** (the X arrow then points to your left). This is the default mount; another
+  way round works too once measured (below).
+* **Fix it rigidly**: two M2.5/M3 screws through the board's holes with 3–5 mm spacers, or hard double-sided tape.
+  Not foam, Velcro or a loose pocket: the board must not wobble or it measures its own wobble.
+* **Not on top of the LiDAR**: its spinning motor shakes the gyro, and anything above it can block the 360° scan.
+* **Not on the side pods, shoulder straps or backpack**: straps and pods bend and swing with your arms and
+  breathing; the backpack moves differently from your chest.
+* **Not on the Pi or next to its fan**: the fan shakes it, and the Pi's heat makes the gyro drift.
+
+**Check it** (Pi, after `setup_pi.sh` and one reboot): `bash ~/wearable_ws/src/visionnav/scripts/setup_pi.sh imu`
+shows `68` in the I2C table, the chip's readings, which arrow points up, then asks you to stand straight and to
+lean forward, and prints the mount, e.g. `imu_roll_deg:=90 imu_pitch_deg:=0 imu_yaw_deg:=90` (the default). If it
+prints other numbers, add them to `WEARABLE_BRAIN_ARGS` (section 5): with a wrong mount the map is levelled the
+wrong way. Board flat on a shelf, chip up, X arrow forward: `imu_roll_deg:=0 imu_pitch_deg:=0 imu_yaw_deg:=0`.
+
+**Using it** needs nothing more: SENSORS starts the IMU with the LiDAR and camera (`/imu/data`, 100 Hz), and the
+assistant gives the map the IMU whenever the Pi publishes it (`~/.visionnav/logs/brain.log`: `Using the chest IMU`).
+Keep still for a second after turning the sensors on (it measures the gyro's drift then, and again whenever you
+stand still). `WEARABLE_IMU=0` on the laptop maps without it. If the IMU fails *while* mapping (a wire comes
+loose), the map stops following you: press SENSORS twice (off and on) to restart without it, then fix the wire.
 
 ---
 
@@ -326,6 +381,8 @@ TF (`sensor_tf.launch.py`), so there is one place to fix it.
    starting the assistant:
    `export WEARABLE_BRAIN_ARGS="camera_height:=1.32 camera_pitch_deg:=12 lidar_height:=1.18 lidar_yaw_deg:=188"`.
    A camera tilted 10° but configured as 0° puts a floor object 3 m away about 2.5 m too far.
+   With the IMU, add its height and the mount `setup_pi.sh imu` printed (section 3b), e.g.
+   `imu_height:=1.15 imu_roll_deg:=90 imu_pitch_deg:=0 imu_yaw_deg:=90`.
 3. **Check the LiDAR overlay:** press **`l`** in the camera window. The dots are the LiDAR returns drawn where TF
    says they are (red = near, blue = far). They should sit on walls, door frames and people's torsos at chest
    height. Mirrored: `lidar_roll_deg:=180`. Rotated or shifted sideways: repeat step 1. Too high or low: fix
@@ -364,6 +421,8 @@ ros2 topic echo /outdoor_alert            # what would be said, as it is decided
 | Problem | Cause | Fix |
 |---------|-------|-----|
 | "Waiting for the Pi…" / "The Pi is not answering" | Pi off, not booted yet, on another Wi-Fi, or another `ROS_DOMAIN_ID` | Switch it on and wait ~30 s; put both on the same network (section 1, hotspot); the button service sets `ROS_DOMAIN_ID=42` |
+| `setup_pi.sh imu`: no `68` in the table / `IMU not found` in the button log | I2C off (reboot after `setup_pi.sh`), SDA/SCL swapped, VCC not on pin 1, or a loose wire | Section 3b wiring; `ls /dev/i2c-1` must exist; `i2cdetect -y 1` |
+| The map turns the wrong way or smears only with the IMU | IMU mount in TF does not match the board | `setup_pi.sh imu`, put the printed `imu_*_deg` in `WEARABLE_BRAIN_ARGS`; `WEARABLE_IMU=0` meanwhile |
 | No button does anything | Button service not running, wrong pin, or no GPIO permission | Pi: `systemctl status visionnav-buttons`, `journalctl -u visionnav-buttons -f` (must say `Buttons ready`); test the wiring (section 3) |
 | Presses show in `ros2 topic echo /button_event` but nothing is said | The assistant is not running, or in another `ROS_DOMAIN_ID` | Start the assistant with `ROS_DOMAIN_ID=42` |
 | Camera window shows "Waiting for camera feed…" / "The camera is not running" | LiDAR and camera not switched on | Press **SENSORS**; if it says they could not start, check the USB cables and `~/.visionnav/logs/pi_sensors.log` on the Pi |

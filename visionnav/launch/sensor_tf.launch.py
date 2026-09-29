@@ -11,6 +11,8 @@ Frames:
   odom -> base_footprint        identity (no wheel odometry on a wearable; SLAM moves map->odom)
   base_footprint -> laser       LiDAR mount
   base_footprint -> camera_mount -> camera_link (optical: z forward, x right, y down)
+  base_footprint -> imu_link    MPU-6050 mount (the chip's printed axes); Cartographer tracks this frame
+                                when the IMU is used (laptop_brain.launch.py imu:=true)
 """
 import math
 
@@ -30,6 +32,14 @@ ARGS = {
     'camera_height': ('1.3', 'Camera lens height above the floor (m)'),
     'camera_pitch_deg': ('0.0', 'Camera downward tilt, positive = looking down (deg)'),
     'camera_yaw_deg': ('0.0', 'Camera yaw relative to the body, positive = left (deg)'),
+    # MPU-6050 on the chest plate. Default = the recommended mount: board upright on the plate, chip facing
+    # forward, printed Y arrow up (X arrow to the wearer's left). Flat, chip up, X arrow forward = 0 0 0.
+    # Any other mount: `ros2 run visionnav mpu6050_imu calibrate` on the Pi prints these three.
+    'imu_height': ('1.15', 'IMU height above the floor (m)'),
+    'imu_x': ('0.0', 'IMU forward of the LiDAR axis (m)'),
+    'imu_roll_deg': ('90.0', 'IMU mount roll (deg), from mpu6050_imu calibrate'),
+    'imu_pitch_deg': ('0.0', 'IMU mount pitch (deg), from mpu6050_imu calibrate'),
+    'imu_yaw_deg': ('90.0', 'IMU mount yaw (deg), from mpu6050_imu calibrate'),
 }
 # Not numbers: outdoor mode (outdoor_sensors.launch.py) runs these TFs without the SLAM brain, under its own
 # node names (so the brain's nodes lingering in the network's node list after a mode switch are not mistaken
@@ -67,6 +77,11 @@ def _launch_setup(context):
         # Body frame (x forward) -> optical frame (z forward, x right, y down)
         _static_tf(pre + 'camera_optical', 'camera_mount', 'camera_link',
                    roll=-math.pi / 2.0, yaw=-math.pi / 2.0),
+        _static_tf(pre + 'imu_mount', 'base_footprint', 'imu_link',
+                   x=val['imu_x'], z=val['imu_height'],
+                   roll=math.radians(val['imu_roll_deg']),
+                   pitch=math.radians(val['imu_pitch_deg']),
+                   yaw=math.radians(val['imu_yaw_deg'])),
     ]
 
 

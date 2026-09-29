@@ -3,6 +3,7 @@
 #
 #   bash ~/wearable_ws/src/visionnav/scripts/setup_pi.sh          # build + GPIO + permissions + boot service
 #   bash ~/wearable_ws/src/visionnav/scripts/setup_pi.sh test     # print every button press (wiring check)
+#   bash ~/wearable_ws/src/visionnav/scripts/setup_pi.sh imu      # IMU wiring check + its mount on the rig
 #
 # The boot service (visionnav-buttons) starts the button program at every boot; its SENSORS button starts
 # the LiDAR and camera. Nothing else has to be typed on the Pi afterwards.
@@ -40,12 +41,21 @@ PY
     exit 0
 fi
 
-echo "== 1/5  Build the visionnav package"
+if [ "$1" = "imu" ]; then
+    # Reads the chip next to a running IMU node without disturbing it (no reset)
+    echo "I2C bus 1 (header pins 3 and 5) — the MPU-6050 shows as 68:"
+    i2cdetect -y 1 || echo "No /dev/i2c-1: run this script without 'imu' first (it turns I2C on), then reboot."
+    source /opt/ros/jazzy/setup.bash
+    source "$WS/install/setup.bash"
+    exec ros2 run visionnav mpu6050_imu calibrate
+fi
+
+echo "== 1/6  Build the visionnav package"
 source /opt/ros/jazzy/setup.bash
 cd "$WS"
 colcon build --symlink-install --packages-select visionnav
 
-echo "== 2/5  GPIO library for the buttons"
+echo "== 2/6  GPIO library for the buttons"
 if python3 -c "import gpiozero, lgpio" 2>/dev/null; then
     echo "gpiozero + lgpio already installed"
 else
@@ -53,15 +63,36 @@ else
     sudo apt-get install -y python3-gpiozero python3-lgpio
 fi
 
-echo "== 3/5  Permissions: LiDAR serial port (dialout) and GPIO pins (gpio)"
+echo "== 3/6  I2C bus for the IMU (MPU-6050 on header pins 3 and 5)"
+if python3 -c "import smbus2" 2>/dev/null || python3 -c "import smbus" 2>/dev/null; then
+    echo "smbus already installed"
+else
+    sudo apt-get install -y python3-smbus i2c-tools
+fi
+# Ubuntu: /boot/firmware/config.txt; Raspberry Pi OS: the same (older images: /boot/config.txt)
+CONFIG_TXT=/boot/firmware/config.txt
+[ -f "$CONFIG_TXT" ] || CONFIG_TXT=/boot/config.txt
+REBOOT_FOR_I2C=0
+if [ -f "$CONFIG_TXT" ] && ! grep -qE "^dtparam=i2c_arm=on" "$CONFIG_TXT"; then
+    echo "dtparam=i2c_arm=on" | sudo tee -a "$CONFIG_TXT" > /dev/null
+    REBOOT_FOR_I2C=1
+fi
+echo i2c-dev | sudo tee /etc/modules-load.d/i2c-dev.conf > /dev/null
+sudo modprobe i2c-dev || true
+[ -e /dev/i2c-1 ] || REBOOT_FOR_I2C=1
+
+echo "== 4/6  Permissions: LiDAR serial port (dialout), GPIO pins (gpio), I2C bus (i2c)"
 sudo usermod -aG dialout "$USER"
 sudo groupadd -f gpio
 sudo usermod -aG gpio "$USER"
+sudo groupadd -f i2c
+sudo usermod -aG i2c "$USER"
 echo 'SUBSYSTEM=="gpio", KERNEL=="gpiochip*", GROUP="gpio", MODE="0660"' | sudo tee /etc/udev/rules.d/99-gpio.rules > /dev/null
+echo 'KERNEL=="i2c-[0-9]*", GROUP="i2c", MODE="0660"' | sudo tee /etc/udev/rules.d/99-i2c.rules > /dev/null
 sudo udevadm control --reload-rules
 sudo udevadm trigger
 
-echo "== 4/5  Boot service visionnav-buttons"
+echo "== 5/6  Boot service visionnav-buttons"
 sudo tee /etc/systemd/system/visionnav-buttons.service > /dev/null <<EOF
 [Unit]
 Description=VisionNav push buttons (and the LiDAR and camera they switch on)
@@ -88,7 +119,7 @@ sudo systemctl enable visionnav-buttons
 START="$(date '+%Y-%m-%d %H:%M:%S')"
 sudo systemctl restart visionnav-buttons
 
-echo "== 5/5  Check"
+echo "== 6/6  Check"
 sleep 8
 systemctl --no-pager status visionnav-buttons | head -4
 echo "--- log since this start:"
@@ -102,4 +133,9 @@ elif echo "$LOG" | grep -q "Buttons ready: SENSORS"; then
     echo "OK: the buttons are ready. Press SENSORS and watch:  journalctl -u visionnav-buttons -f"
 else
     echo "The button program is not ready yet — see the log above, or run:  journalctl -u visionnav-buttons -f"
+fi
+if [ "$REBOOT_FOR_I2C" = "1" ]; then
+    echo
+    echo "I2C for the IMU was just turned on: reboot the Pi once (sudo reboot), then check the IMU with:"
+    echo "    bash ~/wearable_ws/src/visionnav/scripts/setup_pi.sh imu"
 fi

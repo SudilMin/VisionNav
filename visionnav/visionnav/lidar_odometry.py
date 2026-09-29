@@ -7,6 +7,10 @@ knowing its own motion, it lets outdoor perception tell a parked car (still) fro
 give people and vehicles their true speed instead of a speed relative to the walking wearer, and keep a
 short-lived occupancy grid around the wearer steady while they walk and turn.
 
+With the chest IMU (mpu6050_imu.py, /imu/data) the gyro's turn between two scans is the match's rotation guess
+(GyroYaw) instead of the last turn rate: a torso turn starting between two scans no longer sends ICP searching
+from the wrong heading, and the heading keeps following the gyro while no scan can be matched.
+
 Each scan is matched against a small local submap of the last few keyframe scans (point-to-line ICP with a
 robust Huber loss): a scan is matched to where the walls, trunks and poles were a moment ago. Keyframes older
 than the last KEYFRAMES are forgotten, so nothing accumulates. In a direction the scene does not constrain
@@ -21,6 +25,7 @@ on its own (ros2 run visionnav lidar_odometry), never together with outdoor mode
 """
 
 import math
+import threading
 from collections import deque
 
 import numpy as np
@@ -47,6 +52,8 @@ MIN_MATCHES = 40          # correspondences for a trusted match
 MAX_SPEED = 3.0           # m/s: a match implying faster walking than this is rejected
 MAX_YAW_RATE = math.radians(240.0)
 VEL_ALPHA = 0.5           # smoothing of the reported velocity
+GYRO_KEEP_S = 2.0         # s of gyro samples kept
+GYRO_MAX_GAP = 0.1        # s: a longer gap in the gyro stream (Wi-Fi) and the scan falls back to constant velocity
 
 
 def _rot(a):
@@ -81,8 +88,53 @@ class Submap:
         self.linear = evals[:, 0] < LINEARITY * np.maximum(evals[:, 1], 1e-9)
 
 
+class GyroYaw:
+    """Turn rate about the vertical from sensor_msgs/Imu, integrated between two scan times.
+
+    The turn about the vertical is the gyro vector projected on the up direction (from the IMU's orientation,
+    which knows roll and pitch from gravity), so it needs no mount transform: the board may sit at any angle."""
+
+    def __init__(self):
+        self._s = deque()  # (t, yaw rate)
+        self._lock = threading.Lock()
+
+    def add_msg(self, msg):
+        q, w = msg.orientation, msg.angular_velocity
+        up = np.array([2 * (q.x * q.z - q.w * q.y), 2 * (q.w * q.x + q.y * q.z),
+                       q.w * q.w - q.x * q.x - q.y * q.y + q.z * q.z])
+        self.add(msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9, float(up @ [w.x, w.y, w.z]))
+
+    def add(self, t, yaw_rate):
+        with self._lock:
+            if self._s and t <= self._s[-1][0]:
+                if t < self._s[-1][0] - 1.0:
+                    self._s.clear()  # the IMU restarted (clock went back)
+                else:
+                    return
+            self._s.append((t, yaw_rate))
+            while self._s[0][0] < t - GYRO_KEEP_S:
+                self._s.popleft()
+
+    def delta(self, t0, t1):
+        """Turn (rad, left positive) from t0 to t1, or None when the gyro does not cover that time."""
+        with self._lock:
+            s = np.array(self._s) if len(self._s) >= 2 else None
+        if s is None or s[0, 0] > t0 or s[-1, 0] < t1 - GYRO_MAX_GAP:
+            return None
+        ts, w = s[:, 0], s[:, 1]
+        i0, i1 = np.searchsorted(ts, t0), np.searchsorted(ts, t1)
+        if np.diff(ts[max(i0 - 1, 0):i1 + 1]).max(initial=0.0) > GYRO_MAX_GAP:
+            return None
+        area = np.concatenate([[0.0], np.cumsum(0.5 * (w[1:] + w[:-1]) * np.diff(ts))])
+
+        def integral(t):  # past the last sample (it is still on its way): the last rate held
+            return float(np.interp(t, ts, area)) + (w[-1] * (t - ts[-1]) if t > ts[-1] else 0.0)
+        return integral(t1) - integral(t0)
+
+
 class ScanOdometry:
-    """2-D LiDAR odometry. update(points_in_base_footprint, t) -> (pose (x, y, yaw), velocity, ok)."""
+    """2-D LiDAR odometry. update(points_in_base_footprint, t, gyro=None) -> (pose (x, y, yaw), velocity, ok).
+    gyro: a GyroYaw (same clock as the scan stamps), for the rotation guess."""
 
     def __init__(self):
         self.pose = np.zeros(3)
@@ -104,7 +156,7 @@ class ScanOdometry:
         self.kf_pose = self.pose.copy()
         self.submap = Submap(np.vstack(list(self.keyframes)))
 
-    def update(self, pts_base: np.ndarray, t: float):
+    def update(self, pts_base: np.ndarray, t: float, gyro: "GyroYaw | None" = None):
         pts = pts_base[np.hypot(pts_base[:, 0], pts_base[:, 1]) > MIN_RANGE]
         pts = voxel_downsample(pts[np.hypot(pts[:, 0], pts[:, 1]) < MAX_RANGE])
         if self.t is None or self.submap is None:
@@ -119,6 +171,9 @@ class ScanOdometry:
             self.vel[:] = 0.0
             return self.pose.copy(), self.vel.copy(), False
         guess = self.pose + self.vel * dt
+        dyaw = gyro.delta(self.t, t) if gyro is not None else None
+        if dyaw is not None:
+            guess[2] = self.pose[2] + dyaw
         guess[2] = _wrap(guess[2])
         est, ok = self._icp(pts, guess) if len(pts) >= MIN_MATCHES else (guess, False)
         step = est - self.pose
@@ -204,7 +259,7 @@ def main(args=None):
     from rclpy.qos import qos_profile_sensor_data
     from rclpy.time import Time
     from nav_msgs.msg import Odometry
-    from sensor_msgs.msg import LaserScan
+    from sensor_msgs.msg import Imu, LaserScan
 
     class LidarOdometryNode(Node):
         def __init__(self):
@@ -215,6 +270,8 @@ def main(args=None):
             self._mount = None  # (R 2x2, t 2) laser -> base_footprint in the scan plane
             self._pub = self.create_publisher(Odometry, '/odom', 10)
             self.create_subscription(LaserScan, '/scan', self._scan_cb, qos_profile_sensor_data)
+            self._gyro = GyroYaw()
+            self.create_subscription(Imu, '/imu/data', self._gyro.add_msg, qos_profile_sensor_data)
             self._n = 0
             self._bad = 0
             self.get_logger().info("LiDAR odometry started (publishes /odom; no map is kept).")
@@ -243,7 +300,7 @@ def main(args=None):
             ok = np.isfinite(r) & (r > msg.range_min) & (r < msg.range_max)
             pts = np.stack([r[ok] * np.cos(a[ok]), r[ok] * np.sin(a[ok])], axis=1) @ mount[0].T + mount[1]
             t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-            pose, vel, good = self._odo.update(pts, t)
+            pose, vel, good = self._odo.update(pts, t, self._gyro)
             self._n += 1
             self._bad += 0 if good else 1
             if self._n % 300 == 0:

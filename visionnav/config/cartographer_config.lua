@@ -1,7 +1,7 @@
 include "map_builder.lua"
 include "trajectory_builder.lua"
 
--- Chest-worn RPLIDAR C1, no wheel odometry, no IMU.
+-- Chest-worn RPLIDAR C1, no wheel odometry, no IMU (cartographer_imu.lua adds the chest MPU-6050).
 -- Cartographer does scan-to-submap matching on its own, so it is the right backend for a
 -- wearable: it publishes map -> odom and the static odom -> base_footprint does the rest.
 options = {

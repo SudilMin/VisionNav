@@ -49,13 +49,13 @@ from rclpy.node import Node
 
 from visionnav.grasp_tracker import GraspTracker
 from visionnav import outdoor_awareness as oa
-from visionnav.lidar_odometry import ScanOdometry
+from visionnav.lidar_odometry import GyroYaw, ScanOdometry
 from nav_msgs.msg import Odometry
 from visionnav.model_paths import model_path
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 from rclpy.duration import Duration
-from sensor_msgs.msg import Image, LaserScan, CompressedImage
+from sensor_msgs.msg import Image, Imu, LaserScan, CompressedImage
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import ColorRGBA, String
 from geometry_msgs.msg import Point
@@ -1066,6 +1066,9 @@ class ObjectPerceptionNode(Node):
         # (a parked car is still, a car's speed is its own), LiDAR objects tracked 360° and named by the camera,
         # and a live occupancy grid of the last few seconds (/outdoor_occupancy). Nothing is saved.
         self._odo = ScanOdometry()
+        # Chest IMU (mpu6050_imu.py on the Pi), when fitted: its gyro gives the odometry's rotation guess
+        self._gyro = GyroYaw()
+        self.create_subscription(Imu, "/imu/data", self._gyro.add_msg, qos_profile_sensor_data)
         self._odom_enabled = os.environ.get("WEARABLE_OUTDOOR_ODOM", "1") == "1"
         self._ego_hist = deque(maxlen=60)   # (receive time, pose, velocity) per scan
         self._odom_good_run, self._odom_bad_since, self._odom_good = 0, None, False
@@ -3052,7 +3055,7 @@ class ObjectPerceptionNode(Node):
         ego = None
         if self._odom_enabled:
             t_scan = _stamp_to_sec(msg.header.stamp)
-            pose, vel, ok = self._odo.update(xy, t_scan)
+            pose, vel, ok = self._odo.update(xy, t_scan, self._gyro)
             # Healthy after a run of matched scans; lost after 2 s of failures (then everything falls back to
             # the body frame until it recovers)
             if ok:
