@@ -73,7 +73,13 @@ NAME_TARGET_RANGE = 2.5   # m: without a just-found object, "this" is the neares
 DESCRIBE_PROMPT = "Describe what is in front of me."
 HAND_REACH_M = 1.0        # m: an object this close is within reach, hand guidance starts at once
 HAND_SEARCH_RANGE = 2.5   # m: without a found object, HAND picks the nearest object ahead within this range
-LOOK_DOUBLE_WAIT_S = 0.45 # a LOOK tap waits this long: a second tap makes it "turn the vision AI off" instead
+LOOK_REPEAT_S = 1.5       # a second LOOK tap this soon after the first is the same press: one description
+# Questions for the camera that are not commands: sent to the vision AI ("how many people are here")
+QUESTION_STARTS = ("how ", "is ", "are ", "does ", "can ", "who ", "which ", "why ", "tell me ")
+STATUS_COMMANDS = ("status", "system status", "what is the status", "what s the status", "whats the status")
+# The vision AI's off switch: said with a LOOK hold (or a TALK hold in indoor mode)
+VISION_OFF_COMMANDS = ("vision off", "vision ai off", "turn off the vision ai", "turn off vision", "stop the vision ai",
+                       "close the vision ai", "close vision", "turn the vision ai off", "turn vision off")
 # When to start the current mode's parts (SLAM brain, camera AI, ...): "sensors" (default) as soon as the Pi's
 # camera and LiDAR are on (SENSORS button), "now" when the assistant starts, "off" never (start them by hand).
 # The wearer only needs this one program on the laptop; parts already started in a terminal are used, never doubled.
@@ -82,16 +88,22 @@ AUTOSTART = {"1": "now", "true": "now", "0": "off", "false": "off"}.get(
 PI_NODE = "pi_button_panel"   # the Pi's button program: seen on the network = the Pi is connected
 WATCH_S = 2.0                 # how often the Pi connection and sensors are checked
 HELP_TEXT = ("Five buttons. Sensor button: press to turn the camera and LiDAR on; hold it to turn them off. Look: describe what is in front; "
-             "hold it to ask a question. Mode: indoor or outdoor; hold it for the status. Hand: guide your hand to "
-             "an object. Talk: tap to stop; hold it to speak a command; tap twice for what is around you. "
+             "hold it to ask the camera a question or say a command. Mode: indoor or outdoor; hold it to close the map "
+             "and the camera and forget this place. Hand: guide your hand to an object; hold it to stop. Talk, in "
+             "indoor mode: hold it and say where to go, for example chair; tap twice to end the navigation. "
+             "Tap talk to stop talking. "
              "You can say: find the table with the cup, go to the chair, what is around me, call this my chair, "
-             "save map.")
+             "status, vision off.")
 HELP_TEXT_OUTDOOR = ("Outdoor mode warns you about obstacles, holes, low branches and vehicles, with their distance. "
                      "Talk: tap to stop and quiet the warnings for a few seconds; tap twice for what is ahead. "
-                     "You can say: what is ahead, what colour is the light, can I cross, quiet warnings, "
+                     "Hold look and say: what is ahead, what colour is the light, can I cross, quiet warnings, "
                      "warnings on.")
+OUTDOOR_QUIET = ("quiet", "quiet warnings", "mute", "mute warnings", "be quiet", "silence")
+OUTDOOR_LOUD = ("warnings on", "unmute", "unmute warnings", "talk to me", "resume warnings")
+HELP_COMMANDS = ("help", "what can i do", "what can i say", "how does it work")
+STOP_COMMANDS = ("stop", "stop navigation", "cancel", "stop it")
 # Outdoor mode (object_perception + outdoor_awareness.py): spoken hazard alerts on /outdoor_alert
-ALERT_MAX_AGE_S = 2.0     # an alert not yet spoken after this long is out of date (the wearer has moved on)
+ALERT_MAX_AGE_S = 2.0     # an alert whose turn to be spoken comes after this long is out of date (the wearer has moved on)
 ALERT_MUTE_TAP_S = 6.0    # a TALK tap quiets non-critical alerts this long (critical ones are always spoken)
 ALERT_MUTE_SAID_S = 120.0 # "quiet warnings": non-critical alerts off this long (or until "warnings on")
 SCENE_MAX_AGE_S = 3.0
@@ -102,7 +114,7 @@ SENSORS = {"/camera/image_raw/compressed": "camera", "/scan": "LiDAR"}
 # Colours are not spoken unless asked for (someone blind from birth may not know them); set 1 for low vision
 SPEAK_COLORS = os.environ.get("WEARABLE_SPEAK_COLORS", "0") == "1"
 
-# Push-to-talk (TALK and LOOK buttons, pi_button_panel.py): the laptop microphone records while a button is
+# Push-to-talk (TALK button, pi_button_panel.py): the laptop microphone records while the button is
 # held; Whisper (offline, cached tiny.en by default) turns it into text
 WHISPER_MODEL = os.environ.get("WEARABLE_WHISPER_MODEL", "tiny.en")
 PTT_RATE = 16000
@@ -233,6 +245,9 @@ class FindObjectNode(Node):
         self._speech_lock = threading.Lock()
         self._speech_gen = 0
         self._speech_proc = None
+        self._speaking_rank = 0  # urgency of the sentence being spoken (0: not a warning): what may cut it off
+        self._voice = None       # Piper, kept loaded (see _load_voice)
+        threading.Thread(target=self._load_voice, daemon=True).start()
         self._marker_sub = self.create_subscription(MarkerArray, '/semantic_markers', self._marker_callback, 10)
         
         map_qos = QoSProfile(
@@ -263,8 +278,18 @@ class FindObjectNode(Node):
         self._ptt = PushToTalk()
         self._sys = SystemManager(self, log=lambda m: print(f"⚙️  {m}"))
         self._switching = False     # a mode switch (starting/stopping parts) is under way
-        self._look_timer = None     # a LOOK tap waiting to see whether it is a double tap
+        self._off = False           # all modes turned off with a MODE hold while the sensors stay on: they stay
+                                    # off until a MODE tap
+        self._turning_off = False   # a MODE hold is under way: it says what is off, once
+        self._look_last = -math.inf  # when LOOK was last tapped
         self._vision_queue = []     # questions waiting for the vision AI to start
+        self._vision_gen = 0        # +1 at every "vision off": questions waiting for a start that was cancelled
+        self._hand_busy = False     # a HAND press is starting the camera AI
+        self._talk_refused = False  # the TALK hold under way was refused (not in indoor mode): no recording
+        self._nav_gen = 0           # +1 at every navigation start: an older guidance loop ends without a word
+        self._grasp_on_arrival = False  # guide the hand after arriving (HAND button), not after a TALK navigation
+        # The vision AI's answers are said here, in turn with everything else
+        self.create_subscription(String, '/scene_description', self._description_callback, 10)
         self.create_subscription(String, '/button_event', self._button_callback, 10)
         self._active = False  # the current mode's parts are running
         if AUTOSTART == "now":
@@ -334,25 +359,55 @@ class FindObjectNode(Node):
         self.thread.daemon = True
         self.thread.start()
 
-    def speak(self, text):
+    def _load_voice(self):
+        """Keep the Piper voice loaded. Starting the `piper` program for every sentence loaded the model each
+        time: 1.2 s of silence before each one (measured on the laptop), against 0.1 s with it loaded — a second
+        sooner for every warning."""
+        try:
+            from piper import PiperVoice
+            self._voice = PiperVoice.load(TTS_MODEL)
+        except Exception as e:
+            print(f"Piper voice not kept loaded ({e}): each sentence starts the piper program instead")
+
+    def _synthesize(self, text, wav_path):
+        voice = self._voice
+        if voice is not None:
+            try:
+                import wave
+                with wave.open(wav_path, "wb") as f:
+                    voice.synthesize_wav(text, f)
+                return
+            except Exception as e:
+                print(f"Piper voice failed ({e}): using the piper program")
+                self._voice = None
+        # The text goes to Piper on stdin: through `echo '...'` in a shell, any apostrophe ("12 o'clock")
+        # broke the quoting and nothing was said
+        subprocess.run(["piper", "--model", TTS_MODEL, "--output_file", wav_path], input=text.encode(),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def speak(self, text, expires=None, rank=0):
         """Speak text aloud (Piper TTS). One sentence at a time, in order; stop_speech() cuts it off.
 
-        The text goes to Piper on stdin: through `echo '...'` in a shell, any apostrophe ("12 o'clock")
-        broke the quoting and nothing was said.
-        """
+        `expires` (monotonic time): a warning still waiting for its turn by then is dropped, not said late.
+        `rank`: how urgent it is, for what may cut it off (_outdoor_alert_callback)."""
         print(f"🔊 Speaking: '{text}'")
         gen = self._speech_gen
         with self._speech_lock:
             if gen != self._speech_gen:  # STOP was pressed while this was waiting its turn
                 return
-            wav_path = os.path.join(TMP_DIR, "visionnav_voice.wav")
-            subprocess.run(["piper", "--model", TTS_MODEL, "--output_file", wav_path], input=text.encode(),
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if gen != self._speech_gen:
+            if expires is not None and time.monotonic() > expires:
                 return
-            self._speech_proc = subprocess.Popen(["aplay", "-q", wav_path], stderr=subprocess.DEVNULL)
-            self._speech_proc.wait()
-            self._speech_proc = None
+            self._speaking_rank = rank
+            try:
+                wav_path = os.path.join(TMP_DIR, "visionnav_voice.wav")
+                self._synthesize(text, wav_path)
+                if gen != self._speech_gen:
+                    return
+                self._speech_proc = subprocess.Popen(["aplay", "-q", wav_path], stderr=subprocess.DEVNULL)
+                self._speech_proc.wait()
+                self._speech_proc = None
+            finally:
+                self._speaking_rank = 0
 
     def stop_speech(self):
         """Cut off what is being said and drop what is waiting to be said."""
@@ -378,11 +433,15 @@ class FindObjectNode(Node):
         if a["level"] < 3 and (now < self._alerts_muted_until or self._listening):
             return
         a["t"] = now
+        a["rank"] = int(a.get("rank", a["level"]))
+        # "Stop. Car coming..." must not wait for the end of another sentence. But a danger does not cut off a
+        # danger just as urgent: with several things in the path each one cut off the one before and no
+        # sentence was heard to its end (only a vehicle coming outranks another danger)
+        if a["level"] >= 3 and a["rank"] > self._speaking_rank:
+            self.stop_speech()
         with self._alert_lock:
-            if self._alert_pending is None or a["level"] >= self._alert_pending["level"]:
+            if self._alert_pending is None or a["rank"] >= self._alert_pending["rank"]:
                 self._alert_pending = a
-        if a["level"] >= 3:
-            self.stop_speech()  # "Stop. Car coming..." must not wait for the end of another sentence
         self._alert_event.set()
 
     def _alert_loop(self):
@@ -395,7 +454,8 @@ class FindObjectNode(Node):
                 continue
             if a["level"] >= 3:
                 self._haptic_pub.publish(String(data="danger"))
-            self.speak(a["text"])
+            # Its age is checked again when its turn comes: behind a long sentence it would be said too late
+            self.speak(a["text"], expires=a["t"] + ALERT_MAX_AGE_S, rank=a["rank"])
 
     def _outdoor_scene_callback(self, msg: String):
         try:
@@ -410,12 +470,12 @@ class FindObjectNode(Node):
 
     def _outdoor_command(self, target) -> bool:
         """Outdoor questions, answered from what the camera AI sees now. True when handled."""
-        if target in ("help", "what can i do", "what can i say", "how does it work"):
+        if target in HELP_COMMANDS:
             self.speak(HELP_TEXT_OUTDOOR)
-        elif target in ("quiet", "quiet warnings", "mute", "mute warnings", "be quiet", "silence"):
+        elif target in OUTDOOR_QUIET:
             self._alerts_muted_until = time.monotonic() + ALERT_MUTE_SAID_S
             self.speak("Warnings quiet for two minutes. I will still warn you of immediate danger.")
-        elif target in ("warnings on", "unmute", "unmute warnings", "talk to me", "resume warnings"):
+        elif target in OUTDOOR_LOUD:
             self._alerts_muted_until = 0.0
             self.speak("Warnings on.")
         elif target in AROUND_COMMANDS or target in OUTDOOR_AHEAD:
@@ -489,26 +549,35 @@ class FindObjectNode(Node):
         except (ValueError, KeyError, TypeError):
             return
         print(f"🔘 {button.upper()} {event}")
-        if event == "tap":
-            # A click at once: the press was heard, whatever the action then says (a blind user cannot see it)
+        if event == "tap" or (event == "hold_start" and button in ("mode", "sensors", "hand")):
+            # A click at once: the press was heard (a hold: long enough, let go), whatever the action then says
+            # (a blind user cannot see it)
             subprocess.Popen(["aplay", "-q", _click_wav()], stderr=subprocess.DEVNULL)
         if button == "look" and event == "tap":
-            self._look_timer = threading.Timer(LOOK_DOUBLE_WAIT_S, self._ask_vision, args=(DESCRIBE_PROMPT, "Looking."))
-            self._look_timer.start()
+            # Describe (at once: no double tap to wait for)
+            if time.monotonic() - self._look_last >= LOOK_REPEAT_S:
+                self._look_last = time.monotonic()
+                threading.Thread(target=self._ask_vision, args=(DESCRIBE_PROMPT, "Looking."), daemon=True).start()
             return
-        if button == "look" and event == "double":
-            if self._look_timer is not None:
-                self._look_timer.cancel()
-            threading.Thread(target=self._vision_off, daemon=True).start()
+        if button == "talk" and event == "hold_start" and not (self._active and self._mode == "indoor"):
+            # TALK is the navigation button: only in indoor mode (the map is indoor mode's)
+            self._talk_refused = True
+            threading.Thread(target=self._no_navigation, daemon=True).start()
+            return
+        if button == "talk" and event == "hold_end" and self._talk_refused:
+            self._talk_refused = False
             return
         if button in ("talk", "look") and event == "hold_start":
-            # Push-to-talk: silence the speaker (it would be recorded), beep, record while held
+            # Push-to-talk: silence the speaker (it would be recorded), beep, record while held. TALK: where to go
+            # (or a command); LOOK: a question for the camera ("what colour is the door") or a command
             self.stop_speech()
             self._listening = True
             subprocess.Popen(["aplay", "-q", _beep_wav()], stderr=subprocess.DEVNULL)
             self._ptt.start()
         elif button in ("talk", "look") and event == "hold_end":
             threading.Thread(target=self._ptt_finish, args=(button,), daemon=True).start()
+        elif button == "look":
+            return  # a double tap: its taps were each answered
         else:
             threading.Thread(target=self._on_button, args=(button, event), daemon=True).start()
 
@@ -519,34 +588,106 @@ class FindObjectNode(Node):
             self.speak("I did not catch that.")
             return
         print(f"🎤 Heard: '{text}'")
-        if button == "look":
-            self._ask_vision(text)  # a question for the camera (Qwen3-VL)
+        target = " ".join(re.sub(r"[^a-z0-9_ ]", " ", text.lower()).split())
+        if button == "look" and not self._outdoor_words(target) and self._camera_question(target):
+            self._ask_vision(text)  # LOOK is the camera's button: "is there a chair" asks the camera, not the map
+        elif self._is_command(target):
+            self.command_queue.put(text)  # "status", "vision off", "find the cup", "go to the table", ...
+        elif button == "look":
+            self._ask_vision(text)  # a question for the camera (Qwen3-VL), started first if it is off
         else:
-            self.command_queue.put(text)
+            # TALK: just the destination ("chair", "the table with the cup", "my chair"): go there
+            self.command_queue.put(f"go to {target}")
+
+    def _outdoor_words(self, t) -> bool:
+        """An outdoor question or setting (answered from the hazard view, _outdoor_command)."""
+        return self._mode == "outdoor" and (t in OUTDOOR_QUIET or t in OUTDOOR_LOUD or t in OUTDOOR_AHEAD
+                                            or " cross" in f" {t}" or "zebra" in t
+                                            or (("light" in t or "signal" in t) and not t.startswith("describe")))
+
+    @staticmethod
+    def _camera_question(t) -> bool:
+        """A question about what the camera sees ("what colour is the door", "is there a chair"), not one the map
+        or the system answers ("what is around me", "what is on the table", "status")."""
+        return (t.startswith(QUESTION_STARTS + ("what ", "read ")) or t == "describe" or t.startswith("describe ")) \
+            and t not in AROUND_COMMANDS and t not in STATUS_COMMANDS and t not in HELP_COMMANDS \
+            and not t.startswith(("what is on ", "what s on ", "whats on "))
+
+    def _is_command(self, t) -> bool:
+        """A sentence main_logic_loop knows as a command (as it tests them), rather than a destination or a
+        question for the camera."""
+        return bool(
+            self._outdoor_words(t) or t in ("exit", "shut down", "shutdown") or t in STOP_COMMANDS or t in STATUS_COMMANDS
+            or t in VISION_OFF_COMMANDS or t in HELP_COMMANDS or t in AROUND_COMMANDS or t in GO_THERE
+            or t in ("save map", "save the map", "where am i") or t == "describe"
+            or t.startswith(("describe ", "what ", "read ", "forget ")) or t.startswith(GRASP_COMMANDS)
+            or t.startswith(PLACE_COMMANDS) or t.startswith(NAME_COMMANDS) or t.startswith(FIND_COMMANDS)
+            or t.startswith(GO_COMMANDS) or t.startswith(QUESTION_STARTS)
+            or (self._pending and (lang.is_next(t) or t in LIST_WORDS or lang.is_selection(t))))
+
+    def _no_navigation(self):
+        """TALK hold outside indoor mode."""
+        if self._switching and self._mode == "indoor":
+            self.speak("Indoor mode is still starting. Please wait.")
+        else:
+            self.speak("You can't use navigation now. It works only in indoor mode.")
+
+    def _end_navigation(self):
+        """TALK double press while being guided: the navigation ends."""
+        self._stop_nav()
+        cancel_path = Path()
+        cancel_path.header.frame_id = "map"
+        self._path_pub.publish(cancel_path)
+        self.stop_speech()
+        self.speak("Navigation stopped.")
+
+    def _description_callback(self, msg: String):
+        """The vision AI's answer (scene_describer). Said here: speaking by itself, it talked over the warnings
+        and the STOP button could not cut it off."""
+        threading.Thread(target=self.speak, args=(msg.data,), daemon=True).start()
 
     def _on_button(self, button, event):
         if button == "mode" and event == "tap":
             new = "outdoor" if self._mode == "indoor" else "indoor"
             if self._switching:
                 self.speak("Still switching modes. Please wait.")
+            elif self._off:
+                # Turned off with a MODE hold: a tap starts the same mode again (at once, or with the sensors)
+                self._off = False
+                if AUTOSTART == "sensors" and self._missing_sensors():
+                    self._say_selected(self._mode)
+                else:
+                    self._switch_mode(self._mode, True)
             elif not self._active and AUTOSTART == "sensors":
-                # Paused (sensors off): just choose the mode; it starts with the camera and LiDAR. Name the one
-                # that is missing: the Pi says "on" when the LiDAR started even if the camera publisher exited
+                # Paused (sensors off): just choose the mode; it starts with the camera and LiDAR
                 self._mode = new
-                missing = self._missing_sensors() or [name for name in SENSORS.values()]
-                self.speak(f"{new.capitalize()} mode selected. It starts when the "
-                           f"{' and the '.join(missing)} {'is' if len(missing) == 1 else 'are'} on. "
-                           + self._sensor_sentence(self._missing_sensors()))
+                self._say_selected(new)
             else:
                 self._switch_mode(new)
         elif button == "mode" and event == "hold_start":
-            self._status()
+            self._all_off()
         elif button == "hand" and event == "tap":
             self._hand_button()
+        elif button == "hand" and event == "hold_start":
+            self._hand_off()
         elif button == "talk" and event == "tap":
-            self._stop_all()
+            if self.navigating:
+                self.stop_speech()  # quiet now; the navigation goes on (a double press ends it)
+            else:
+                self._stop_all()
         elif button == "talk" and event == "double":
-            self._around()
+            if self.navigating:
+                self._end_navigation()
+            else:
+                self._around()
+
+    def _say_selected(self, mode):
+        """The mode is chosen but waits for the sensors. Names the one that is missing: the Pi says "on" when the
+        LiDAR started even if the camera publisher exited."""
+        missing = self._missing_sensors() or [name for name in SENSORS.values()]
+        self.speak(f"{mode.capitalize()} mode selected. It starts when the "
+                   f"{' and the '.join(missing)} {'is' if len(missing) == 1 else 'are'} on. "
+                   + self._sensor_sentence(self._missing_sensors()))
 
     def _stop_all(self, say="Stopped."):
         """TALK tap: stop talking, navigating and hand guidance at once (outdoors: and quiet the warnings for a
@@ -562,7 +703,52 @@ class FindObjectNode(Node):
             cancel_path = Path()
             cancel_path.header.frame_id = "map"
             self._path_pub.publish(cancel_path)
-        self.speak(say)
+        if say:
+            self.speak(say)
+
+    def _all_off(self):
+        """MODE hold: close the map and the camera feed — the programs of both modes (the map with its window, the
+        camera AI with the camera window, the outdoor view) — and stop any guidance. The session ends: its map, its
+        objects and the places and names given in it are forgotten (nothing is kept for another day). The camera
+        and LiDAR stay on (the SENSORS button's job); the modes stay off until MODE is tapped. The vision AI has its
+        own off switch (say "vision off")."""
+        if self._switching:
+            self.speak("Still switching modes. Please wait.")
+            return
+        parts = list(dict.fromkeys(p for mode_parts in MODE_PARTS.values() for p in mode_parts))
+        self._switching = self._turning_off = True
+        try:
+            self._stop_all(say=None)
+            if not self._active and not any(self._sys.owned(p) for p in parts):
+                by_hand = any(self._sys.running(p) for p in parts)
+                self.speak("The modes were started in a terminal. Close them there." if by_hand and not self._off
+                           else "All modes are already off.")
+                return
+            for part in parts:
+                self._sys.stop(part)
+            self._active = False
+            self._off = self._pi_sensors not in ("stopping", "off")  # sensors off: they start it all again
+            self._forget_session()
+            msg = "Map and camera closed. Press mode to start again."
+            by_hand = [self._sys.name(p) for p in parts if self._sys.running(p)]
+            if by_hand:  # started in a terminal, not by the assistant: left alone
+                msg += (f" {' and '.join(by_hand).capitalize()} {'was' if len(by_hand) == 1 else 'were'} started in "
+                        f"a terminal. Close {'it' if len(by_hand) == 1 else 'them'} there.")
+            self.speak(msg)
+        finally:
+            self._switching = self._turning_off = False
+
+    def _forget_session(self):
+        """The session's map is gone (MODE hold, the sensors off, indoor mode left): forget what was learned in it
+        here too — the objects, the found one, the wearer's names and places. They were positions in that map."""
+        self.saved_objects.clear()
+        self._marker_names.clear()
+        self.objects = []
+        self._pending = None
+        self.last_found_object = None
+        self._names, self._names_file = {}, None
+        self.named_places = {}
+        self._map_info = None
 
     # ── PARTS OF THE SYSTEM (system_manager.py): started and stopped by the buttons ──
     def _switch_mode(self, mode, startup=False):
@@ -570,15 +756,16 @@ class FindObjectNode(Node):
         Indoor: SLAM brain (map, Nav2, walls) + camera AI. Outdoor: sensor mounts and the live RViz view + camera AI
         (hazard warnings). The camera AI switches mode without a restart."""
         self._switching = True
+        self._off = False
         try:
-            self.speak(f"Starting {mode} mode." if startup else f"Switching to {mode} mode.")
+            # Said once, when it is ready ("Starting indoor mode." and then "Indoor mode activated." was the same
+            # thing twice): the button's click says the press was heard
+            print(f"⚙️  {'starting' if startup else 'switching to'} {mode} mode")
             leaving = [p for m, parts in MODE_PARTS.items() if m != mode for p in parts if p not in MODE_PARTS[mode]]
             for part in leaving:
-                if part == "brain" and self._sys.owned("brain") and (self._map_info or {}).get("mode") == "mapping":
-                    self.speak("Saving the indoor map first.")
-                    self._map_cmd_pub.publish(String(data="save"))
-                    time.sleep(3.0)
                 self._sys.stop(part)
+            if "brain" in leaving:
+                self._forget_session()  # the indoor map is gone: the next indoor mode maps the place it is in
             wanted = list(MODE_PARTS[mode])
             for part in wanted:
                 self._sys.start(part, wait=False)  # all at once; then wait for each
@@ -589,6 +776,8 @@ class FindObjectNode(Node):
             msg = f"{mode.capitalize()} mode activated."
             if failed:
                 msg += " " + " ".join(f"{self._sys.name(p).capitalize()} did not start." for p in failed)
+            if getattr(self._sys, "imu_note", "") and "brain" in wanted:
+                msg += " " + self._sys.imu_note
             missing = self._missing_sensors()
             if missing:
                 msg += " " + self._sensor_sentence(missing)
@@ -628,29 +817,35 @@ class FindObjectNode(Node):
         self._pi_sensors = state
         if first and state in ("off", "on"):
             return  # the latched state at start-up, not a change
-        said = {"starting": "Turning on the camera and LiDAR.", "on": "Camera and LiDAR on.",
-                "stopping": "Turning off the camera and LiDAR.", "off": "Camera and LiDAR off.",
+        if state in ("stopping", "off"):
+            self._off = False  # a fresh start: the next SENSORS press starts the mode as usual
+        # Said once, when it is done ("starting" and "stopping" are not announced: the button clicked)
+        said = {"on": "Camera and LiDAR on.", "off": "Camera and LiDAR off.",
                 "failed": "The camera and LiDAR could not start. Check their cables."}.get(state)
+        if state == "off":
+            if self._turning_off:
+                return  # a MODE hold: _all_off says it
+            if AUTOSTART == "sensors":
+                threading.Thread(target=self._pause, daemon=True).start()  # says it, with the mode
+                return
         if said:
             threading.Thread(target=self.speak, args=(said,), daemon=True).start()
-        if state == "off" and not first and AUTOSTART == "sensors":
-            threading.Thread(target=self._pause, daemon=True).start()
 
     def _pause(self):
-        """Sensors switched off with the SENSORS button: stop the mode's programs (map saved first while mapping);
-        they start again with the sensors."""
+        """Sensors switched off with the SENSORS button: say so, once, and stop the mode's programs (the session's
+        map and objects are forgotten); they start again, with a new map, with the sensors."""
         if not self._active or self._switching:
+            if not self._turning_off:
+                self.speak("Camera and LiDAR off.")
             return
         self._switching = True
         try:
-            if self._sys.owned("brain") and (self._map_info or {}).get("mode") == "mapping":
-                self.speak("Saving the map.")
-                self._map_cmd_pub.publish(String(data="save"))
-                time.sleep(3.0)
             for part in MODE_PARTS[self._mode]:
                 self._sys.stop(part)
             self._active = False
-            self.speak(f"{self._mode.capitalize()} mode paused. Press the sensor button to continue.")
+            self._forget_session()
+            self.speak(f"Camera and LiDAR off. {self._mode.capitalize()} mode paused. "
+                       f"Press the sensor button to start again.")
         finally:
             self._switching = False
 
@@ -669,7 +864,7 @@ class FindObjectNode(Node):
                 if all_on:
                     self.speak("VisionNav is on.")
                 elif pi:
-                    self.speak("VisionNav is on. Press the sensor button to start. Hold talk and say help for help.")
+                    self.speak("VisionNav is on. Press the sensor button to start. Hold look and say help for help.")
                 else:
                     self.speak("VisionNav is on. Waiting for the Pi. Check that it is switched on "
                                "and on the same Wi-Fi.")
@@ -687,7 +882,7 @@ class FindObjectNode(Node):
                     elif was is False and ok and not first:
                         self.speak(f"The {name} is on.")
                     self._sensor_ok[name] = ok
-            if AUTOSTART == "sensors" and all_on and not self._active and not self._switching:
+            if AUTOSTART == "sensors" and all_on and not self._active and not self._switching and not self._off:
                 threading.Thread(target=self._switch_mode, args=(self._mode, True), daemon=True).start()
                 self._switching = True  # until the thread takes over
             pi_was, first = pi, False
@@ -705,20 +900,27 @@ class FindObjectNode(Node):
         if self._sys.starting("vision_ai") or len(self._vision_queue) > 1:
             self.speak("The vision AI is still starting. I will answer when it is ready.")
             return
-        self.speak("Turning on the vision AI. This takes about half a minute.")
+        gen = self._vision_gen
+        self.speak("Turning on the vision AI.")
+        if gen != self._vision_gen:
+            return  # "vision off" while this was being said: not started at all
         ok = self._sys.start("vision_ai")
+        if gen != self._vision_gen:
+            return  # turned off ("vision off") while it was starting: nothing to answer, nothing failed
         questions, self._vision_queue = self._vision_queue, []
         if not ok:
             self.speak("The vision AI could not start. Check that Ollama is running.")
             return
-        self.speak("Vision AI enabled.")
-        time.sleep(1.5)  # its first camera frame
+        time.sleep(1.5)  # its first camera frame (the answer itself says that it is on)
         for q in questions:
             self._describe_cmd_pub.publish(String(data=q))
 
     def _vision_off(self):
-        """LOOK double tap: stop the vision AI and free the GPU memory Qwen3-VL uses."""
-        if self._sys.stop("vision_ai"):
+        """"vision off" (said with LOOK held): stop the vision AI and free the GPU memory Qwen3-VL uses. Questions waiting for it to start
+        are dropped: they left the next question stuck on "still starting" for good."""
+        self._vision_gen += 1
+        pending, self._vision_queue = bool(self._vision_queue), []
+        if self._sys.stop("vision_ai") or pending:
             try:
                 from visionnav.scene_describer import VLM_MODEL
                 subprocess.run(["ollama", "stop", VLM_MODEL], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -732,12 +934,15 @@ class FindObjectNode(Node):
             self.speak("The vision AI is already off.")
 
     def _status(self):
-        """MODE hold: where the system stands, then what is around."""
-        parts = [f"{self._mode.capitalize()} mode."]
+        """ "status": where the system stands, then what is around."""
+        parts = ["All modes are off." if self._off else f"{self._mode.capitalize()} mode."]
         parts.append("Vision AI on." if self._sys.running("vision_ai") else "Vision AI off.")
         missing = self._missing_sensors()
         if missing:
             parts.append(self._sensor_sentence(missing))
+        if self._off:
+            self.speak(" ".join(parts) + f" Press mode to start {self._mode} mode.")
+            return
         if not self._sys.running("perception"):
             parts.append("The camera AI is not running.")
         if self._mode == "outdoor":
@@ -761,19 +966,42 @@ class FindObjectNode(Node):
         if n:
             self._around()
 
+    def _hand_off(self):
+        """HAND hold: hand guidance off, and the camera AI with its camera window closed when no mode is using it
+        (the HAND button opened it). In indoor or outdoor mode the camera stays: the mode needs it (MODE hold
+        closes it)."""
+        guiding = self.grasping or self.navigating
+        if guiding:
+            self._stop_all(say=None)
+        camera = not self._active and not self._switching and self._sys.owned("perception")
+        if camera:
+            self._sys.stop("perception")
+        if guiding or camera:
+            self.speak("Hand guidance off." + (" Camera closed." if camera else ""))
+        else:
+            self.speak("Hand guidance is already off.")
+
     def _hand_button(self):
         """HAND tap: guide the hand to the object found last, or the nearest one ahead; walk there first if it
-        is out of reach (arrival starts the hand guidance). Tap again to stop."""
+        is out of reach (arrival starts the hand guidance). Tap again to stop. Said once: what it will do."""
+        if self._hand_busy:
+            return  # a second tap while the camera AI is starting (both were answered twice)
         if self.grasping or self.navigating:
             self._stop_all("Hand guidance disabled.")
             return
-        if not self._sys.running("perception"):
-            self.speak("Turning on the camera AI.")
-            if not self._sys.start("perception"):
-                self.speak("The camera AI could not start.")
-                return
-            time.sleep(2.0)  # first detections
-        self.speak("Hand guidance enabled.")
+        self._hand_busy = True
+        try:
+            if not self._sys.running("perception"):
+                self.speak("Turning on the camera AI.")
+                if not self._sys.start("perception"):
+                    self.speak("The camera AI could not start.")
+                    return
+                time.sleep(2.0)  # first detections
+            self._hand_target()
+        finally:
+            self._hand_busy = False
+
+    def _hand_target(self):
         objects, pose = self._static_objects(), self.get_robot_pose()
         obj = next((o for o in objects if o["name"] == self.last_found_object and not o.get("dynamic")), None)
         if obj is None and pose is not None:
@@ -792,7 +1020,7 @@ class FindObjectNode(Node):
             name = lang.spoken_name(obj, objects, **self._say_opts())
             self.speak(f"{name[0].upper()}{name[1:]} is {lang.where(obj, pose)}. "
                        f"Taking you there, then I will guide your hand.")
-            self._start_nav(obj, objects)
+            self._start_nav(obj, objects, grasp=True)
 
     # ── SPOKEN OBJECT REQUESTS ──
     def _static_objects(self):
@@ -807,6 +1035,7 @@ class FindObjectNode(Node):
         try:
             info = json.loads(msg.data)
             self._map_info = info
+            self._names = {}  # a new map: names given in another one do not apply
             self._names_file = os.path.join(info["dir"], f"{info['name']}_names.json")
             with open(self._names_file) as f:
                 self._names = json.load(f)
@@ -918,7 +1147,10 @@ class FindObjectNode(Node):
             self._semantic_goal_pub.publish(String(data="stop"))
         time.sleep(0.3)
 
-    def _start_nav(self, obj, objects):
+    def _start_nav(self, obj, objects, grasp=False):
+        if self.navigating:
+            self._stop_nav()  # a new destination replaces the old one
+        self._grasp_on_arrival = grasp
         name = lang.spoken_name(obj, objects, **self._say_opts())
         spoken = name[4:] if name.startswith("the ") else name
         threading.Thread(target=self.navigate_to, args=(obj["name"],), kwargs={"spoken": spoken},
@@ -1232,7 +1464,7 @@ class FindObjectNode(Node):
         print("              e.g. 'find the table with the red cup', 'go to the chair next to the door',")
         print("              'what is on the table', 'what is around me', then 'go there' / 'another one'")
         print("              'call this my chair' (then 'go to my chair'), 'forget name my chair'")
-        print("              'save map', 'save this place as [name]', 'where am i', 'forget place [name]'")
+        print("              'save this place as [name]', 'where am i', 'forget place [name]' (until MODE hold)")
         print("              'grasp [object]' (hand guidance; also starts on arrival at an object)")
         print("=" * 50 + "\n")
         
@@ -1254,7 +1486,7 @@ class FindObjectNode(Node):
                 rclpy.shutdown()
                 break
 
-            elif target in ('stop', 'stop navigation', 'cancel', 'stop it'):
+            elif target in STOP_COMMANDS:
                 # Spoken with push-to-talk as often as the STOP button is pressed: it never shuts the assistant down
                 if self.grasping:
                     self.grasping = False
@@ -1271,10 +1503,16 @@ class FindObjectNode(Node):
                 else:
                     self._stop_all()
                 
+            elif target in STATUS_COMMANDS:
+                self._status()
+
+            elif target in VISION_OFF_COMMANDS:
+                threading.Thread(target=self._vision_off, daemon=True).start()
+
             elif self._mode == "outdoor" and self._outdoor_command(target):
                 pass  # answered from what the camera sees now (outdoor_awareness.py)
 
-            elif target in ("help", "what can i do", "what can i say", "how does it work"):
+            elif target in HELP_COMMANDS:
                 self.speak(HELP_TEXT)
 
             elif target in AROUND_COMMANDS:
@@ -1283,15 +1521,12 @@ class FindObjectNode(Node):
             elif target.startswith(("what is on ", "what s on ", "whats on ")) and self._whats_on(target):
                 pass  # answered from the object map; otherwise the camera VLM below is asked
 
-            elif target == "describe" or target.startswith("describe ") or target.startswith("what ") or target.startswith("read "):
-                self.speak("Asking the vision AI...")
-                msg = String()
-                if target == "describe":
-                    msg.data = "Describe what you see in this image in one sentence."
-                else:
-                    msg.data = target
-                self._describe_cmd_pub.publish(msg)
-                
+            elif target == "describe" or target.startswith(("describe ", "what ", "read ")):
+                # In a thread: it starts the vision AI first when it is off (half a minute)
+                question = "Describe what you see in this image in one sentence." if target == "describe" else target
+                threading.Thread(target=self._ask_vision, args=(question,),
+                                 daemon=True).start()
+
             elif target.startswith(GRASP_COMMANDS):
                 prefix = next(p for p in GRASP_COMMANDS if target.startswith(p))
                 obj = target[len(prefix):].strip()
@@ -1300,7 +1535,8 @@ class FindObjectNode(Node):
                     self.start_grasp(obj)
 
             elif target in ("save map", "save the map"):
-                self._map_cmd_pub.publish(String(data="save"))
+                # Maps are not kept for another day (the wearer's choice): one lives as long as its session
+                self.speak("The map is kept until you hold the mode button. It is not saved for another day.")
 
             elif target.startswith(PLACE_COMMANDS):
                 prefix = next(p for p in PLACE_COMMANDS if target.startswith(p))
@@ -1359,9 +1595,14 @@ class FindObjectNode(Node):
                 elif not self._object_request("go", dest_term):
                     self.speak(f"I don't know where {dest_term} is.")
 
+            elif target.startswith(QUESTION_STARTS):
+                # Any other question is for the camera ("how many people are here")
+                threading.Thread(target=self._ask_vision, args=(target,),
+                                 daemon=True).start()
+
             else:
                 print("❓ Use: find <object>, go to <object or place>, what is around me, what is on the <object>, "
-                      "save map, save this place as <name>, where am i")
+                      "save this place as <name>, where am i, status")
 
     # =============================================
     # CONTINUOUS TURN-BY-TURN NAVIGATION (like Google Maps)
@@ -1372,6 +1613,8 @@ class FindObjectNode(Node):
         if self._nav2_available():
             self._navigate_nav2(target_name, place, spoken)
             return
+        self._nav_gen += 1
+        gen = self._nav_gen
         self.navigating = True
         friendly_name = spoken or (target_name if place else
                                    ''.join(c for c in target_name if not c.isdigit()).replace("_", " ").strip())
@@ -1402,7 +1645,7 @@ class FindObjectNode(Node):
         print("   Type 'stop' to cancel navigation")
         print("=" * 50)
         
-        while rclpy.ok() and self.navigating:
+        while rclpy.ok() and self.navigating and gen == self._nav_gen:
             pose = self.get_robot_pose()
             if pose is None:
                 time.sleep(0.1)
@@ -1477,21 +1720,23 @@ class FindObjectNode(Node):
                 print(f"  📍 {instruction}")
             
             time.sleep(0.1)
-        
-        self.navigating = False
+
+        if gen == self._nav_gen:  # not replaced by a newer navigation
+            self.navigating = False
         print("\n✅ Navigation ended.\n")
 
     def _arrive(self, friendly_name, is_place=False, obj_class=None):
-        """Arrival cue: haptic 'last inch' event, voice, and clear the drawn path. At an object,
-        grasp mode then guides the hand to it."""
+        """Arrival cue: haptic 'last inch' event, voice, and clear the drawn path; the navigation ends. Hand
+        guidance follows only when the HAND button asked for it."""
         self._haptic_pub.publish(String(data="arrived"))
         self.speak(f"You have arrived at the {friendly_name}." if is_place else
                    f"You have arrived at the {friendly_name}. It is within reach.")
         empty_path = Path()
         empty_path.header.frame_id = 'map'
         self._path_pub.publish(empty_path)
-        if not is_place and obj_class:
+        if not is_place and obj_class and self._grasp_on_arrival:
             self.start_grasp(obj_class)
+        self._grasp_on_arrival = False
 
     @staticmethod
     def _instruction(rel_angle, clock_hr, dist_ft):
@@ -1525,6 +1770,8 @@ class FindObjectNode(Node):
                 return
             # Lock the goal in the map frame: Nav2 routes to this fixed point, not the live detection
             tx, ty = target_pos.x, target_pos.y
+        self._nav_gen += 1
+        gen = self._nav_gen
         self.navigating, self._using_nav2 = True, True
         self._nav2_status, self._nav2_path = None, []
         goal = {"name": target_name.replace(" ", "_"), "x": tx, "y": ty}
@@ -1533,7 +1780,7 @@ class FindObjectNode(Node):
         self._semantic_goal_pub.publish(String(data=json.dumps(goal)))
         print(f"\n🧭 NAVIGATING (Nav2) TO: {friendly_name}   — type 'stop' to cancel")
         last_instruction, last_speech_time, last_problem = "", 0.0, None
-        while rclpy.ok() and self.navigating:
+        while rclpy.ok() and self.navigating and gen == self._nav_gen:
             status = self._nav2_status or {}
             state = status.get("state")
             if state == "arrived":
@@ -1577,8 +1824,9 @@ class FindObjectNode(Node):
                 print(f"  📍 {instruction}")
                 last_instruction, last_speech_time = kind, now
             time.sleep(0.1)
-        self._semantic_goal_pub.publish(String(data="stop"))
-        self.navigating, self._using_nav2 = False, False
+        if gen == self._nav_gen:  # not replaced by a newer navigation
+            self._semantic_goal_pub.publish(String(data="stop"))
+            self.navigating, self._using_nav2 = False, False
         print("\n✅ Navigation ended.\n")
 
     def smooth_path_chaikin(self, path, iterations=3):
@@ -1817,6 +2065,9 @@ def main(args=None):
     except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
     finally:
+        # A second Ctrl+C while the parts stop broke off the clean-up and left them running on their own
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        print("Stopping the programs it started (a few seconds)...")
         node._sys.stop_all()  # the parts it started (brain, camera AI, vision AI, outdoor view)
         node.destroy_node()
         if rclpy.ok():

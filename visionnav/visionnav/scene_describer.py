@@ -8,7 +8,8 @@ Uses Qwen3-VL 2B *instruct* running 100% locally on the GPU via Ollama. When the
 question ("what colour is the door?", "is there a light switch?"), the node:
   1. Grabs the latest camera frame (un-mirrored, so left/right match the wearer)
   2. Asks the VLM, with instructions to answer briefly and only from what is visible
-  3. Speaks the answer aloud via Piper TTS
+  3. Publishes the answer on /scene_description: voice_navigation_assistant speaks it (without the assistant,
+     this node speaks it itself via Piper TTS)
 
 This is the system's only VLM. The instruct variant answers directly; the plain `qwen3-vl:2b` tag is
 the *thinking* variant, which spent its token budget on hidden reasoning and gave empty answers.
@@ -75,6 +76,7 @@ KEEP_ALIVE = "30m"   # keep the model in VRAM between questions
 # "left" in the answer is the wearer's left. Override with WEARABLE_CAMERA_FLIP=0/1.
 FLIP_INPUT = os.environ.get("WEARABLE_CAMERA_FLIP", "1") == "1"
 DEFAULT_QUESTION = "Describe what is in front of me."
+ASSISTANT_NODE = "voice_navigation_assistant"  # it subscribes to /scene_description and speaks the answers
 
 
 class OfflineVLM:
@@ -163,7 +165,9 @@ class SceneDescriberNode(Node):
         """Handle commands from other nodes (e.g., voice_navigation_assistant.py)."""
         if self.latest_frame is not None:
             self._process_question(msg.data)
-            
+        else:
+            self._answer("I have no camera picture yet. Check that the camera is on.")  # not silence
+
     def _process_question(self, question):
         """Process a question about the current camera frame."""
         print("🔄 Analyzing image...")
@@ -174,14 +178,19 @@ class SceneDescriberNode(Node):
         
         print(f"⏱️  Response time: {elapsed:.1f}s")
         print(f"📝 Answer: {answer}")
-        
+        self._answer(answer)
+
+    def _answer(self, answer):
         # Publish to ROS topic
         msg = String()
         msg.data = answer
         self._desc_pub.publish(msg)
-        
-        # Speak the answer
-        speak(answer)
+
+        # The assistant says the answer when it is running (one voice, in turn with its warnings, and its STOP
+        # button cuts it off); alone, this node speaks it
+        if not any(info.node_name == ASSISTANT_NODE
+                   for info in self.get_subscriptions_info_by_topic("/scene_description")):
+            speak(answer)
 
 
 def main_ros():

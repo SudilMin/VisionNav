@@ -42,6 +42,7 @@ import zlib
 import glob
 import hashlib
 import shutil
+import subprocess
 from collections import deque
 import rclpy
 from cv_bridge import CvBridge
@@ -142,6 +143,7 @@ PROMPT_SYNONYMS = {
     "wire": "cable on floor", "wash basin": "sink", "elevator door": "door",
 }
 _VOCAB_HASH = hashlib.sha1("|".join(VOCABULARY).encode()).hexdigest()[:8]
+GPU_MARGIN_BYTES = 500e6  # free GPU memory perception keeps after warm-up (else the vision AI is unloaded)
 ENGINE_PATH = model_path(f"yoloe-11s-seg-indoor-{_VOCAB_HASH}.engine")
 # Outdoor mode has its own vocabulary (outdoor_awareness.py) and engine: one engine for both would make outdoor
 # prompts compete with indoor ones for every box (a filtered-out class still wins the box it takes).
@@ -963,7 +965,9 @@ class ObjectPerceptionNode(Node):
         self._lidar_debug_last_log = {}
 
         self.get_logger().info(f"Loading YOLO model: {MODEL_PATH}")
+        self._last_gpu_free = self._last_yolo_error = -math.inf
         self._load_model()
+        self._warm_up()
         self.get_logger().info("Model loaded. Ready for detections.")
         # Opened only now: during a first-start engine build (minutes) the window would sit frozen
         if self._show_window:
@@ -1063,8 +1067,8 @@ class ObjectPerceptionNode(Node):
         # from RViz on the next frame.
         self._outdoor_marker_pub = self.create_publisher(MarkerArray, "/outdoor_markers", 10)
         # Like a car: its own motion (LiDAR odometry, also on /odom), everything tracked world-fixed
-        # (a parked car is still, a car's speed is its own), LiDAR objects tracked 360° and named by the camera,
-        # and a live occupancy grid of the last few seconds (/outdoor_occupancy). Nothing is saved.
+        # (a parked car is still, a car's speed is its own), LiDAR objects ahead and beside tracked and named by
+        # the camera, and a live occupancy grid of the last few seconds (/outdoor_occupancy). Nothing is saved.
         self._odo = ScanOdometry()
         # Chest IMU (mpu6050_imu.py on the Pi), when fitted: its gyro gives the odometry's rotation guess
         self._gyro = GyroYaw()
@@ -1910,6 +1914,57 @@ class ObjectPerceptionNode(Node):
             self._depth_models = {}
             self.get_logger().warn(f"Metric depth disabled: {e}")
 
+    def _warm_up(self):
+        """Run every model once on a blank frame. Ultralytics puts a TensorRT engine on the GPU only at its first
+        predict: the outdoor engine was first loaded at the MODE switch, when the vision AI (Qwen3-VL, ~3 GB of the
+        RTX 2050's 4 GB) had taken the memory, and every outdoor frame then failed. Now it is taken at start."""
+        import torch
+        blank = np.zeros((480, 640, 3), np.uint8)
+        for attempt in (1, 2):
+            try:
+                t0 = time.monotonic()
+                for model, _, class_ids, precision in self._detectors.values():
+                    model.predict(blank, classes=class_ids, verbose=False, **precision)
+                for model in {id(m): m for m in self._depth_models.values() if m is not None}.values():
+                    self._infer_depth(blank, model)
+                free = torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else math.inf
+                # A blank frame fits where real ones (and the tracker, the grasp view) may not: keep a margin
+                if attempt == 1 and free < GPU_MARGIN_BYTES and self._free_vision_ai():
+                    free = torch.cuda.mem_get_info()[0]
+                self.get_logger().info(f"Models warmed up on the GPU ({time.monotonic() - t0:.1f} s, "
+                                       f"{free / 1e6:.0f} MB free)")
+                return
+            except Exception as e:
+                if attempt == 1 and self._gpu_full(e) and self._free_vision_ai():
+                    continue
+                self.get_logger().error(f"Model warm-up failed: {e}")
+                return
+
+    @staticmethod
+    def _gpu_full(e) -> bool:
+        # A TensorRT engine that could not get its memory surfaces as a None engine in Ultralytics
+        text = str(e).lower()
+        return "out of memory" in text or "create_execution_context" in text
+
+    def _free_vision_ai(self) -> bool:
+        """GPU full: unload the vision AI (Qwen3-VL in Ollama). The obstacle warnings come first; Ollama loads it
+        again, into the memory that is left, at the next LOOK."""
+        self._last_gpu_free = time.monotonic()
+        try:
+            from visionnav.scene_describer import VLM_MODEL
+            done = subprocess.run(["ollama", "stop", VLM_MODEL], capture_output=True, timeout=15).returncode == 0
+        except Exception:
+            done = False
+        if done:
+            self.get_logger().warn("GPU memory full: unloaded the vision AI (it loads again at the next LOOK).")
+            import torch
+            torch.cuda.empty_cache()
+            # Ollama frees the memory a moment after `ollama stop` returns (a retry at once still found 4 MB free)
+            t0 = time.monotonic()
+            while torch.cuda.mem_get_info()[0] < 1.0e9 and time.monotonic() - t0 < 10.0:
+                time.sleep(0.2)
+        return done
+
     def _infer_depth(self, bgr, model=None):
         """Per-pixel metric depth (m, along the optical axis) for the processed frame."""
         model = model or self._depth_model
@@ -1959,7 +2014,12 @@ class ObjectPerceptionNode(Node):
                     classes=class_ids, verbose=False, **precision,
                 )[0]
             except Exception as e:
-                self.get_logger().error(f"YOLO inference failed: {e}")
+                now = time.monotonic()
+                if self._gpu_full(e) and now - self._last_gpu_free > 30.0:
+                    self._free_vision_ai()
+                if now - self._last_yolo_error > 5.0:  # not once per frame
+                    self._last_yolo_error = now
+                    self.get_logger().error(f"YOLO inference failed: {e}")
                 with self._inference_lock:
                     self._inference_busy = False
                 continue
@@ -2003,6 +2063,8 @@ class ObjectPerceptionNode(Node):
                 try:
                     dmap = self._infer_depth(frame, depth_model)
                 except Exception as e:
+                    if self._gpu_full(e) and time.monotonic() - self._last_gpu_free > 30.0:
+                        self._free_vision_ai()
                     self._warn_once("depth_fail", f"Metric depth inference failed: {e}")
 
             # ── CROSS-CLASS SUPPRESSION: same object reported as two classes ──
@@ -3046,8 +3108,9 @@ class ObjectPerceptionNode(Node):
                 "length_m": (far[0] - near[0]) if far is not None else None}
 
     def _outdoor_scan(self, msg, t_rx):
-        """Every LiDAR scan in outdoor mode: the wearer's motion, the occupancy grid, and the objects around
-        (360°). Times are when the scan arrived (monotonic), the same clock as the camera frames."""
+        """Every LiDAR scan in outdoor mode: the wearer's motion, the occupancy grid (360°), and the objects ahead
+        of and beside them (nothing behind is tracked). Times are when the scan arrived (monotonic), the same clock
+        as the camera frames."""
         self._refresh_extrinsics(t_rx)
         xy = self._scan_xy_base(msg)
         if xy is None:
@@ -3184,7 +3247,7 @@ class ObjectPerceptionNode(Node):
         for t in tracks:
             m = t.m
             if t.label is None or m.get("box") is None or t_meas - t.last_cam > 0.3:
-                continue  # beside / behind: LiDAR only, not in the camera picture
+                continue  # beside the wearer: LiDAR only, not in the camera picture
             x1, y1, x2, y2 = m["box"]
             name = f"{t.label.replace(' ', '_')}_{t.id}"
             detail = f"{t.dist:.1f}m ({ {'lidar': 'LiDAR', 'depth': 'depth', 'stripes': 'stripes'}.get(m.get('source'), 'cam')}) | {oa.where(*t.x[:2])}"
@@ -3218,7 +3281,7 @@ class ObjectPerceptionNode(Node):
         and the wearer's own walking path up to where it is blocked.
 
         Each array starts with DELETEALL, so RViz shows exactly the present: an object is drawn only while a
-        sensor sees it (the camera ahead, the LiDAR all around, OUTDOOR_SHOW_S), and nothing stays."""
+        sensor sees it (the camera ahead, the LiDAR ahead and beside, OUTDOOR_SHOW_S), and nothing stays."""
         if self._outdoor_marker_pub.get_subscription_count() == 0:
             return
         stamp = self.get_clock().now().to_msg()

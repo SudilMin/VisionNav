@@ -101,6 +101,9 @@ fi
 echo "== 1/6  Build the visionnav package"
 source /opt/ros/jazzy/setup.bash
 cd "$WS"
+# Links to files since deleted from the repository (a removed launch file) make the build fail:
+# "can't copy .../build/visionnav/launch/<name>.launch.py: doesn't exist or not a regular file"
+find "$WS/build/visionnav" -xtype l -delete 2>/dev/null || true
 colcon build --symlink-install --packages-select visionnav
 
 echo "== 2/6  GPIO library for the buttons"

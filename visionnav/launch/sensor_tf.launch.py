@@ -32,14 +32,15 @@ ARGS = {
     'camera_height': ('1.3', 'Camera lens height above the floor (m)'),
     'camera_pitch_deg': ('0.0', 'Camera downward tilt, positive = looking down (deg)'),
     'camera_yaw_deg': ('0.0', 'Camera yaw relative to the body, positive = left (deg)'),
-    # MPU-6050 on the chest plate. Default = the recommended mount: board upright on the plate, chip facing
-    # forward, printed Y arrow up (X arrow to the wearer's left). Flat, chip up, X arrow forward = 0 0 0.
-    # Any other mount: `ros2 run visionnav mpu6050_imu calibrate` on the Pi prints these three.
+    # MPU-6050 mount MEASURED on the rig with `setup_pi.sh imu` (2026-09-30): board flat, chip up, X arrow
+    # forward, ~6 deg nose-up on the plate. The earlier default (upright board: roll 90, yaw 90) turned gravity
+    # 89 deg off vertical on this rig and Cartographer levelled every scan wrong. Re-run it whenever the board is
+    # re-mounted (system_manager refuses the IMU when these do not put its gravity upward).
     'imu_height': ('1.15', 'IMU height above the floor (m)'),
     'imu_x': ('0.0', 'IMU forward of the LiDAR axis (m)'),
-    'imu_roll_deg': ('90.0', 'IMU mount roll (deg), from mpu6050_imu calibrate'),
-    'imu_pitch_deg': ('0.0', 'IMU mount pitch (deg), from mpu6050_imu calibrate'),
-    'imu_yaw_deg': ('90.0', 'IMU mount yaw (deg), from mpu6050_imu calibrate'),
+    'imu_roll_deg': ('-1.0', 'IMU mount roll (deg), from mpu6050_imu calibrate'),
+    'imu_pitch_deg': ('6.0', 'IMU mount pitch (deg), from mpu6050_imu calibrate'),
+    'imu_yaw_deg': ('1.0', 'IMU mount yaw (deg), from mpu6050_imu calibrate'),
 }
 # Not numbers: outdoor mode (outdoor_sensors.launch.py) runs these TFs without the SLAM brain, under its own
 # node names (so the brain's nodes lingering in the network's node list after a mode switch are not mistaken

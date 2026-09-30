@@ -3,7 +3,8 @@
 VisionNav runs on two computers:
 
 * **Raspberry Pi 5** (on the chest rig): the five push buttons, the LiDAR, the camera and the IMU (MPU-6050). The button program
-  starts by itself when the Pi boots; the **SENSORS** button turns the LiDAR and camera on.
+  starts by itself when the Pi boots; the **SENSORS** button turns the LiDAR and camera on and off, with or
+  without the laptop.
 * **Laptop** (MSI Sword 15, RTX 2050): the AI, the map and the voice. The navigation assistant starts at login
   (or with one command) and starts everything else — the map, the camera AI, the vision AI — as soon as the
   camera and LiDAR are on, and whenever the buttons ask for it.
@@ -28,30 +29,34 @@ VisionNav runs on two computers:
    source install/setup.bash
    ros2 run visionnav voice_navigation_assistant
    ```
-2. **Press SENSORS.** "Turning on the camera and LiDAR." → "Camera and LiDAR on." → the laptop starts indoor
-   mode by itself: "Starting indoor mode." → **"Indoor mode activated."**
+2. **Press SENSORS.** Click → "Camera and LiDAR on." → the laptop starts indoor mode by itself (the map window
+   and the camera window open) → **"Indoor mode activated."** Each thing is said once, when it is done.
 3. Use the buttons (below), or type commands in the assistant's terminal. Every tap clicks, so you know it was
-   heard. Hold TALK and say **"help"** to hear what the buttons do.
-4. **Hold SENSORS** when you are done: "Camera and LiDAR off." → "Indoor mode paused." (the map is saved
-   first while mapping). The next SENSORS press continues where you left off.
+   heard. Hold LOOK and say **"help"** to hear what the buttons do.
+4. **Hold MODE** when you are done with a place: "Map and camera closed." — the map and what it learned are
+   forgotten; the camera and LiDAR stay on. **Hold SENSORS** to turn the camera and LiDAR off too: "Camera and
+   LiDAR off. Indoor mode paused." The next start maps the place you are in afresh (section 4).
 
 ### What each button does, and what you hear
 
 | Button | Press | What happens and what you hear |
 |---|---|---|
-| **SENSORS** | tap | Turns the LiDAR, camera and IMU on — "Turning on the camera and LiDAR." → "Camera and LiDAR on." → the current mode starts ("Indoor mode activated."). Already on: "Camera and LiDAR on." again. One of them stopped (e.g. the camera was unplugged): all are started again. If they fail: "The camera and LiDAR could not start. Check their cables." |
-| | hold | Turns them off: "Turning off the camera and LiDAR." → "Camera and LiDAR off." → "Indoor mode paused." |
-| **LOOK** | tap | If the vision AI is off: "Turning on the vision AI. This takes about half a minute." → starts Qwen3-VL → "Vision AI enabled." → describes the scene. If it is already on: "Looking." → the description |
-| | hold | Beep → ask a question while holding ("what colour is the door?") → release → the camera answers |
-| | double tap | Stops the vision AI and frees its ~2 GB of GPU memory: "Vision AI off." |
-| **MODE** | tap | While paused (sensors off): "Outdoor mode selected. It starts when the camera and LiDAR are on." Otherwise: "Switching to outdoor mode." → closes the indoor map (Cartographer, Nav2, its RViz), opens the outdoor view (its own RViz) → "Outdoor mode activated." Tap again: the outdoor view closes and the indoor map opens → "Indoor mode activated." The camera window stays open throughout. |
-| | hold | Status: mode, vision AI on/off, missing sensors, map, how many objects, what is around you |
+| **SENSORS** | tap | Turns the LiDAR, camera and IMU on — click → "Camera and LiDAR on." → the current mode starts → "Indoor mode activated." Already on: "Camera and LiDAR on." again. One of them stopped (e.g. the camera was unplugged): all are started again. If they fail: "The camera and LiDAR could not start. Check their cables." A very short press counts. |
+| | hold | Turns them off as soon as the button has been down 0.6 s, while it is still down (the LiDAR stops; no need to let go first), and the laptop closes the mode's programs: click → "Camera and LiDAR off. Indoor mode paused. Press the sensor button to continue." The Pi does this by itself: it works with the laptop off. Letting go afterwards does not turn them on again. |
+| **LOOK** | tap | If the vision AI is off: "Turning on the vision AI." → starts Qwen3-VL (about half a minute) → describes the scene. If it is already on: "Looking." → the description |
+| | hold | Beep → ask the camera a question while holding ("what colour is the door?") → let go → the answer (the vision AI starts first if it is off). A command said here is carried out instead ("help", "status", "vision off", "find the cup", "what is ahead", "can I cross"…). To turn the vision AI off and free its ~2 GB of GPU memory: hold LOOK, say **"vision off"** → "Vision AI off." |
+| **MODE** | tap | While paused (sensors off): "Outdoor mode selected. It starts when the camera and LiDAR are on." Otherwise: click → closes the indoor map (Cartographer, Nav2, its RViz), opens the outdoor view (its own RViz) → "Outdoor mode activated." Tap again: the outdoor view closes and the indoor map opens → "Indoor mode activated." The camera window stays open throughout. |
+| | hold | **Close the map and the camera feed; the session ends.** Stops the map (Cartographer, Nav2, the map window), the camera AI with its camera window and the outdoor view, and any guidance → click → "Map and camera closed. Press mode to start again." The map, the objects, the places and the names of this session are forgotten (nothing is kept for another day). The camera and LiDAR stay on (SENSORS is their button); tap MODE to start again, with a new map. The vision AI stays on: say "vision off" to stop it. The status is a voice command: hold LOOK, say "status". |
 | **HAND** | tap | Starts the camera AI if it is off → "Hand guidance enabled." → guides your hand to the object found last (or the nearest one ahead), walking you there first if it is more than 1 m away. Tap again: "Hand guidance disabled." |
-| **TALK** | tap | **STOP** everything (speech, walking guidance, hand guidance): "Stopped." |
-| | hold | Beep → speak a command while holding (see the list below) → release |
-| | double tap | What is around you |
+| | hold | Click → stops hand guidance (and the walk to the object), and closes the camera AI and its camera window if the HAND button opened it (no mode running): "Hand guidance off. Camera closed." In indoor or outdoor mode the camera stays (the mode needs it; MODE hold closes it): "Hand guidance off." Nothing running: "Hand guidance is already off." |
+| **TALK** | tap | Stops what is being said. When not navigating, also stops hand guidance → "Stopped." |
+| | hold | **Navigation (indoor mode only).** Beep → say where to go while holding ("chair", "the table with the cup", "my chair", "kitchen") → let go → "Taking you to the chair…" → turn-by-turn guidance → "You have arrived at the chair." and the navigation ends (no hand guidance; the HAND button does that). A command also works here ("status", "save this place as kitchen", "call this my chair"). Not in indoor mode: "You can't use navigation now. It works only in indoor mode." |
+| | double tap | While navigating: **ends the navigation** → "Navigation stopped." Otherwise: what is around you |
 
-A hold is 0.6 s; a double tap is two taps within 0.4 s. Every tap clicks. If the camera or LiDAR stream stops
+A hold is 0.6 s and acts at that moment, with the button still down; a double tap is two taps within 0.4 s. The
+Pi reads the buttons 200 times a second, so a very short press counts and a poor contact does not split one press
+into several. Every tap clicks, and so does a SENSORS, LOOK or MODE
+hold once it is long enough (let go). What a button did is said once, when it is done. If the camera or LiDAR stream stops
 you hear "The camera signal is lost." ("The camera is on." when it returns), and if the Pi drops off the
 network, "The Pi is not answering. Check that it is switched on and on the same Wi-Fi."
 
@@ -62,27 +67,36 @@ The assistant starts and stops these itself (`system_manager.py`); the Pi's butt
 | Mode / button | Programs |
 |---|---|
 | **SENSORS** (Pi) | `pi_sensors.launch.py`: RPLiDAR C1 (`sllidar_node`) + chest camera (`phone_camera_publisher`) |
-| **Indoor** (default, laptop) | `laptop_brain.launch.py` (sensor TFs, Cartographer SLAM, Nav2, walls, RViz) + `object_perception` (camera AI, camera window) |
+| **Indoor** (default, laptop) | `laptop_brain.launch.py use_rviz:=false` (sensor TFs, Cartographer SLAM, Nav2, walls) + the map window (RViz, `rviz/visionnav.rviz`; opened again at every mode start if it was closed) + `object_perception` (camera AI, camera window) |
 | **Outdoor** (laptop) | `outdoor_sensors.launch.py` (camera and LiDAR mounts, live RViz view) + `object_perception` (hazard warnings, below) |
-| **LOOK** (laptop) | `scene_describer` (Qwen3-VL), started on the first press, stopped by a double tap |
+| **LOOK** (laptop) | `scene_describer` (Qwen3-VL), started on the first press, stopped by saying "vision off" |
+| **MODE** hold (laptop) | Stops both modes' programs (everything above except the sensors and the vision AI) and forgets the session |
 
 * A program already started by hand in a terminal is used as it is — never started twice, and never stopped by
   the buttons.
 * Everything the assistant started stops when it exits (Ctrl+C, closing its terminal, or saying "exit").
-* Each program's output: `~/.visionnav/logs/<part>.log` (`brain`, `perception`, `vision_ai`, `outdoor_tf`,
+* Each program's output: `~/.visionnav/logs/<part>.log` (`brain`, `map_view`, `perception`, `vision_ai`, `outdoor_tf`,
   `pi_sensors` on the Pi).
 * Settings (set before starting the assistant): `WEARABLE_AUTOSTART` — `sensors` (default: start the mode when
   the camera and LiDAR come on, pause it when they go off), `now` (start at once), `off` (never, section 6);
   `WEARABLE_MODE=outdoor` starts in outdoor mode;
   `WEARABLE_BRAIN_ARGS="camera_height:=1.32 camera_pitch_deg:=12 lidar_height:=1.18"` passes the rig's measured
   geometry to the map (section 5).
-* Switching from indoor to outdoor while *mapping* saves the map first.
+* Switching from indoor to outdoor ends the indoor session: its map and objects are forgotten (section 4).
 
 ### Outdoor mode: hazard warnings
 
 Outdoors nothing is mapped: the camera AI watches what is in front of you right now and says only what matters,
-most urgent first, with the distance in feet and the direction. A danger ("Stop. …") cuts off whatever is being
-said; the same thing is not repeated unless it gets closer or more urgent.
+with the distance in feet and the direction — **one sentence at a time, about the most urgent thing only**:
+
+* However many things are in your path, only the nearest / most urgent one is spoken about ("Chair ahead, 1 foot.
+  Step right."); the next one is announced once that one is out of the way.
+* It is said again only when it gets much closer, becomes a danger, or after a while (4 s for a danger, 8 s for a
+  warning, twice as long each time while nothing changes — standing in front of a table is not repeated forever).
+* A sentence is never cut off by another one of the same urgency. Only a greater danger cuts in: a danger over a
+  warning or over anything else being said, and "Stop. Car coming…" over any other danger.
+* A warning that could not be said within 2 s (the voice was busy) is dropped instead of being said late.
+* Nothing behind you is tracked or said.
 
 | What | Example of what you hear | How it is found |
 |---|---|---|
@@ -91,7 +105,7 @@ said; the same thing is not repeated unless it gets closer or more urgent.
 | Head height (low branch, sign) | "Low branch at head height, 5 feet ahead. Duck." | Detector + depth: something at head height with free space below it |
 | Vehicles | "Car approaching on your left, 40 feet." — "Stop. Three-wheeler coming ahead, 15 feet." | Tracked with their speed toward you: a warning under 6 s to reach you, "Stop" under 3 s |
 | People and animals in your way | "Person coming toward you, 8 feet." — "Dog on your right, 6 feet." | Tracked like vehicles |
-| Something coming from behind or the side (outside the camera) | "Something coming behind you, 7 feet." | LiDAR, all round, with your own motion subtracted |
+| Something coming from the side (outside the camera) | "Something coming on your left, 7 feet." | LiDAR, ahead and beside you, with your own motion subtracted |
 | Zebra crossing | "Zebra crossing ahead, 12 feet." | The white stripe pattern on the ground (the detector alone rarely finds one) |
 | Traffic and pedestrian lights | "Pedestrian signal is red. Wait." — "Pedestrian signal is green." (said when it changes) | The lit lamp's colour |
 
@@ -100,9 +114,10 @@ said; the same thing is not repeated unless it gets closer or more urgent.
     and turn, so a parked car is still and a car's or cyclist's speed is its own, not relative to your walking.
     Also published on `/odom`. The log says `🧭 LiDAR odometry locked`; in a wide-open place with
     nothing within ~12 m it falls back to tracking relative to you.
-  * **360° objects:** the LiDAR tracks what is around you all the way round; the camera names it ("person") and
-    the name stays while the LiDAR still sees it beside or behind you. Something moving toward you from behind
-    or the side is said: "Something coming behind you, 7 feet."
+  * **Objects ahead and beside you:** the LiDAR tracks them; the camera names them ("person") and the name stays
+    while the LiDAR still sees it beside you. Something moving toward you from the side is said: "Something
+    coming on your left, 7 feet." What is behind you (more than 100° round from straight ahead) is not tracked,
+    drawn or said; the occupancy grid below still shows the whole scan.
   * **Occupancy:** a grid of the last ~2 seconds (fading) of what the LiDAR hits and what depth finds low or
     dropping away ahead — anything, whether or not it has a name.
 * **RViz** (opens with outdoor mode, `rviz/visionnav_outdoor.rviz`): you (blue) at the centre facing up the
@@ -112,7 +127,7 @@ said; the same thing is not repeated unless it gets closer or more urgent.
   stripes, holes as magenta discs — with its distance, its own speed and its predicted path (3 s). Threats turn
   orange / red. An object leaves the view as soon as no sensor sees it. Topics: `/outdoor_markers`,
   `/outdoor_occupancy`. Without a screen: `use_rviz:=false` on `outdoor_sensors.launch.py`.
-* **Say** (hold TALK): "what is ahead" (also TALK double tap), "what colour is the light", "can I cross" (the
+* **Say** (hold LOOK): "what is ahead" (also TALK double tap), "what colour is the light", "can I cross" (the
   crossing, its signal and any vehicle coming — it never says it is safe; listen for traffic), "quiet warnings"
   (two minutes; dangers are still said), "warnings on", "help".
 * **TALK tap** stops the speech and quiets the warnings for 6 s (dangers are still said).
@@ -124,7 +139,7 @@ said; the same thing is not repeated unless it gets closer or more urgent.
 * The outdoor detector has its own engine (`yoloe-11s-seg-outdoor-*.engine`, built once on the first start, ~3–6
   min) and the outdoor depth model (`models/depth_anything_v2_metric_outdoor_vits.pth`, section 1).
 
-### Voice commands (hold TALK, or type them in the assistant's terminal)
+### Voice commands (hold LOOK — or TALK in indoor mode — or type them in the assistant's terminal)
 
 Objects are described the way you know them: IDs such as `table_2` and colours are never needed or spoken, and
 distances are in feet ("The table, with the cup on it, 7 feet away, at 1 o'clock").
@@ -137,9 +152,11 @@ distances are in feet ("The table, with the cup on it, 7 feet away, at 1 o'clock
 | "what is on the table", "what is around me" | Answered from the map |
 | "call this my chair" → later "go to my chair"; "forget name my chair" | Your own names for objects (saved per map) |
 | "save this place as kitchen" (or "mark kitchen"), "go to kitchen", "where am i", "forget place kitchen" | Named places |
-| "save map" | Saves the map, the objects and the places (section 4) |
+| "save map" | Nothing is saved for another day: "The map is kept until you hold the mode button. It is not saved for another day." |
 | "grasp the cup" ("grab", "pick up", "reach for") | Hand guidance: "Right 4 inches", "Lower 2 inches", "Forward 6 inches"… "Stop. The cup is at your hand." (also starts on arrival at an object) |
-| "what colour is the door?", "describe …", "read …" | Sent to the vision AI |
+| "what colour is the door?", "describe …", "read …", "how many people are here?" | Sent to the vision AI (it starts first if it is off) |
+| "vision off" | Stops the vision AI and frees its GPU memory |
+| "status" | Mode (or "All modes are off."), vision AI on/off, missing sensors, map, how many objects, what is around you |
 | "help" | What the buttons do and what you can say |
 | "stop" / "exit" | Stop everything / shut the assistant down |
 
@@ -225,7 +242,7 @@ starts it. It ends with `OK: the buttons are ready` (and, the first time, asks f
 Run the same two Pi lines again after every update. Then `exit` — the Pi needs no terminal from now on.
 
 * **Watch the buttons:** `journalctl -u visionnav-buttons -f` shows `Buttons ready: SENSORS=GPIO24, …` and every
-  press (`SENSORS tap`, `sensors: starting`, `sensors: on`). `systemctl status visionnav-buttons` shows whether
+  press (`SENSORS tap`, `sensors: starting`, `sensors: on`; `SENSORS hold_start`, `sensors: stopping`, `sensors: off`). `systemctl status visionnav-buttons` shows whether
   it runs.
 * **Check the wiring:** `bash ~/wearable_ws/src/visionnav/scripts/setup_pi.sh test` prints the name of every
   button pressed (Ctrl+C to stop). `setup_pi.sh imu` checks the IMU (section 3b).
@@ -240,10 +257,10 @@ Run the same two Pi lines again after every update. Then `exit` — the Pi needs
 | Button | GPIO (BCM) | Header pin | Main job |
 |--------|-----------|------------|----------|
 | **SENSORS** | GPIO24 | pin 18 | LiDAR + camera + IMU: tap on, hold off |
-| **LOOK** | GPIO17 | pin 11 | Vision AI: describe / ask / off |
-| **MODE** | GPIO27 | pin 13 | Indoor ↔ outdoor, status |
-| **HAND** | GPIO22 | pin 15 | Hand guidance to an object |
-| **TALK** | GPIO23 | pin 16 | STOP / voice command / what is around me |
+| **LOOK** | GPIO17 | pin 11 | Vision AI: tap describe, hold ask a question |
+| **MODE** | GPIO27 | pin 13 | Tap indoor ↔ outdoor, hold everything off |
+| **HAND** | GPIO22 | pin 15 | Tap hand guidance to an object, hold off |
+| **TALK** | GPIO23 | pin 16 | Indoor navigation: hold say where to go, double tap end; tap quiet |
 | GND (shared) | — | pin 14 (also 9, 20, 25) | Second leg of every button |
 
 **Parts:** 5 momentary, normally-open push buttons (12 mm tactile or 16–19 mm panel buttons; give each a
@@ -334,8 +351,8 @@ the LiDAR, so it goes on the same rigid part:
 
 **Check it** (Pi, after `setup_pi.sh` and one reboot): `bash ~/wearable_ws/src/visionnav/scripts/setup_pi.sh imu`
 shows `68` in the I2C table, the chip's readings, which arrow points up, then asks you to stand straight and to
-lean forward, and prints the mount, e.g. `imu_roll_deg:=90 imu_pitch_deg:=0 imu_yaw_deg:=90` (the default). If it
-prints other numbers, add them to `WEARABLE_BRAIN_ARGS` (section 5): with a wrong mount the map is levelled the
+lean forward, and prints the mount, e.g. `imu_roll_deg:=-1 imu_pitch_deg:=6 imu_yaw_deg:=1` (the default: this rig's
+board, flat, chip up, X arrow forward). If it prints other numbers, add them to `WEARABLE_BRAIN_ARGS` (section 5): with a wrong mount the map is levelled the
 wrong way. Board flat on a shelf, chip up, X arrow forward: `imu_roll_deg:=0 imu_pitch_deg:=0 imu_yaw_deg:=0`.
 
 **Using it** needs nothing more: SENSORS starts the IMU with the LiDAR and camera (`/imu/data`, 100 Hz), and the
@@ -346,17 +363,19 @@ loose), the map stops following you: hold SENSORS (off), then tap it (on) to res
 
 ---
 
-## 🗺️ 4. Saved Maps (remembering the home)
+## 🗺️ 4. The Indoor Map: One Session at a Time
 
-* **First time: mapping.** With no saved map, indoor mode *maps*. Walk through every room, finish somewhere you
-  have already been, then say **"save map"**. That saves the map, the objects seen reliably, your places and
-  your names in `~/.visionnav/maps/` (`home.pbstream`, `home_objects.json`, `home_places.json`,
-  `home_names.json`). The last minute of a mapping walk is not yet usable for finding you, which is why the walk
-  should end somewhere already covered.
-* **From then on: localization.** Indoor mode loads the saved map and finds you in it (walk a few metres after
-  starting). Remembered objects are on the map at once ("go to light switch" works before the camera has seen it
-  again), and the map no longer grows or drifts.
-* **Another building / map again:** `WEARABLE_BRAIN_ARGS="map:=office"`, or `"localize:=false"` to map from scratch.
+* **Every indoor session maps the place it is in, from scratch** — your home, a neighbour's house, an office.
+  Walk around: the map (RViz) grows with what the LiDAR sees, the objects the camera finds are placed on it, and
+  coming back to a place you have already walked through finds you on the same map again (loop closure), with the
+  objects where they were.
+* **The session ends** with a MODE hold (or when the camera and LiDAR are switched off, or when you switch to
+  outdoor mode): the map, the objects, your named places ("save this place as kitchen") and your names for
+  objects ("call this my chair") are all forgotten. Nothing is saved for another day and no old map is loaded:
+  an old map put you in the wrong place anywhere else.
+* Behind the scenes: the map runs with `localize:=false`; this session's places and names live in a temporary
+  folder (`/tmp/visionnav_session_*`) that is deleted when the map stops. Maps saved earlier in
+  `~/.visionnav/maps/` are left as they are, but no longer used by the assistant.
 
 **What the object map does:** an object seen reliably stays on the map, drawn translucent while out of view,
 and keeps its name and ID when seen again from another side — it is not forgotten because the back of a chair
@@ -382,7 +401,8 @@ TF (`sensor_tf.launch.py`), so there is one place to fix it.
    `export WEARABLE_BRAIN_ARGS="camera_height:=1.32 camera_pitch_deg:=12 lidar_height:=1.18 lidar_yaw_deg:=188"`.
    A camera tilted 10° but configured as 0° puts a floor object 3 m away about 2.5 m too far.
    With the IMU, add its height and the mount `setup_pi.sh imu` printed (section 3b), e.g.
-   `imu_height:=1.15 imu_roll_deg:=90 imu_pitch_deg:=0 imu_yaw_deg:=90`.
+   `imu_height:=1.15 imu_roll_deg:=-1 imu_pitch_deg:=6 imu_yaw_deg:=1`. If they do not put the IMU's gravity
+   upward, the assistant starts the map without the IMU and says so.
 3. **Check the LiDAR overlay:** press **`l`** in the camera window. The dots are the LiDAR returns drawn where TF
    says they are (red = near, blue = far). They should sit on walls, door frames and people's torsos at chest
    height. Mirrored: `lidar_roll_deg:=180`. Rotated or shifted sideways: repeat step 1. Too high or low: fix
@@ -423,6 +443,7 @@ ros2 topic echo /outdoor_alert            # what would be said, as it is decided
 | "Waiting for the Pi…" / "The Pi is not answering" | Pi off, not booted yet, on another Wi-Fi, or another `ROS_DOMAIN_ID` | Switch it on and wait ~30 s; put both on the same network (section 1, hotspot); the button service sets `ROS_DOMAIN_ID=42` |
 | `setup_pi.sh imu`: no `68` in the table / `IMU not found` in the button log | I2C off (reboot after `setup_pi.sh`), SDA/SCL swapped, VCC not on pin 1, or a loose wire | Section 3b wiring; `ls /dev/i2c-1` must exist; `i2cdetect -y 1` |
 | The map turns the wrong way or smears only with the IMU | IMU mount in TF does not match the board | `setup_pi.sh imu`, put the printed `imu_*_deg` in `WEARABLE_BRAIN_ARGS`; `WEARABLE_IMU=0` meanwhile |
+| The LiDAR keeps spinning although the sensors are off, and SENSORS / MODE did not stop it | Its driver was ended without a clean exit (the button service restarted or stopped with the sensors on, a crash): only a clean exit stops the motor | The button program now stops the motor itself whenever it turns the sensors off and when it starts (`LiDAR motor stopped` in `journalctl -u visionnav-buttons`). If it still spins: tap SENSORS (on), wait 10 s, hold SENSORS (off) |
 | No button does anything | Button service not running, wrong pin, or no GPIO permission | Pi: `systemctl status visionnav-buttons`, `journalctl -u visionnav-buttons -f` (must say `Buttons ready`); test the wiring (section 3) |
 | Presses show in `ros2 topic echo /button_event` but nothing is said | The assistant is not running, or in another `ROS_DOMAIN_ID` | Start the assistant with `ROS_DOMAIN_ID=42` |
 | Camera window shows "Waiting for camera feed…" / "The camera is not running" | LiDAR and camera not switched on | Press **SENSORS**; if it says they could not start, check the USB cables and `~/.visionnav/logs/pi_sensors.log` on the Pi |

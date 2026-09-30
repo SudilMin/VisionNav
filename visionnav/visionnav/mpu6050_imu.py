@@ -318,8 +318,8 @@ def calibrate_mount():
     print(f"\nMount: imu_roll_deg:={roll} imu_pitch_deg:={pitch} imu_yaw_deg:={yaw}")
     print("Add these to WEARABLE_BRAIN_ARGS on the laptop (next to the lidar_/camera_ values), e.g.\n"
           f'  export WEARABLE_BRAIN_ARGS="... imu_roll_deg:={roll} imu_pitch_deg:={pitch} imu_yaw_deg:={yaw}"')
-    print("The recommended mount (upright on the chest plate, chip facing forward, Y arrow up) is "
-          "imu_roll_deg:=90 imu_pitch_deg:=0 imu_yaw_deg:=90, the default.")
+    print("The default (sensor_tf.launch.py) is this rig's measured mount, board flat, chip up, X arrow forward: "
+          "imu_roll_deg:=-1 imu_pitch_deg:=6 imu_yaw_deg:=1. Within a few degrees of it, nothing needs adding.")
     imu.close()
     return 0
 
