@@ -8,8 +8,9 @@ boot by the visionnav-buttons systemd service (see STARTUP_INSTRUCTIONS.md), so 
 Each button is wired between a GPIO pin and GND (no resistors: the Pi's internal pull-ups are used, so the
 pin reads 1 when released and 0 when pressed). Default pins (BCM numbering / physical header pin):
 
-  SENSORS GPIO24 / pin 18  tap: turn the LiDAR and camera on / off (this node starts pi_sensors.launch.py)
-                           hold: restart them (a camera that stopped sending)
+  SENSORS GPIO24 / pin 18  tap: turn the LiDAR, camera and IMU on (this node starts pi_sensors.launch.py);
+                                already on: said again; one of them stopped (camera unplugged): all restarted
+                           hold: turn them off
   LOOK    GPIO17 / pin 11  tap: describe what is in front (Qwen3-VL)   hold: ask the camera a question (speak)
   MODE    GPIO27 / pin 13  tap: switch indoor <-> outdoor              hold: status (mode, map, what is around)
   HAND    GPIO22 / pin 15  tap: guide the hand to the object found last (walks there first if it is far);
@@ -103,7 +104,7 @@ class ButtonPanel(Node):
         self._held[name] = True
         self._emit(name, "hold_start")
         if name == "sensors":
-            threading.Thread(target=self._sensors_restart, daemon=True).start()
+            threading.Thread(target=self._sensors_off, daemon=True).start()
 
     def _on_released(self, name):
         if self._held[name]:
@@ -112,7 +113,7 @@ class ButtonPanel(Node):
             return
         self._emit(name, "tap")
         if name == "sensors":
-            threading.Thread(target=self._sensors_toggle, daemon=True).start()
+            threading.Thread(target=self._sensors_on, daemon=True).start()
         now = time.monotonic()
         if now - self._last_tap[name] <= self._double_s:
             self._emit(name, "double")
@@ -126,20 +127,21 @@ class ButtonPanel(Node):
         self.get_logger().info(f"sensors: {state}")
         self._state_pub.publish(String(data=state))
 
-    def _sensors_toggle(self):
+    def _sensors_on(self):
+        """SENSORS tap (and sensors_at_start). Already on: the state is published again, so the laptop says so."""
         if self._sensor_state in ("starting", "stopping"):
             return  # busy; the laptop already said what is happening
-        if self._sys.owned("pi_sensors") or self._sys.running("pi_sensors"):
-            self._sensors_off()
-        else:
-            self._sensors_on()
-
-    def _sensors_on(self):
+        if self._sys.running("pi_sensors"):
+            self._set_state("on")
+            return
         with self._sensor_lock:
             self._set_state("starting")
+            # Started earlier but one sensor has stopped (the camera exits when it finds no camera): start all again
+            self._sys.stop("pi_sensors")
             self._set_state("on" if self._sys.start("pi_sensors") else "failed")
 
     def _sensors_off(self):
+        """SENSORS hold. While they are starting, waits for that to finish, then turns them off."""
         with self._sensor_lock:
             self._set_state("stopping")
             if not self._sys.stop("pi_sensors") and self._sys.running("pi_sensors"):
@@ -148,11 +150,6 @@ class ButtonPanel(Node):
                 self._set_state("on")
                 return
             self._set_state("off")
-
-    def _sensors_restart(self):
-        if self._sys.owned("pi_sensors"):
-            self._sensors_off()
-        self._sensors_on()
 
     def destroy_node(self):
         for btn in self._buttons.values():

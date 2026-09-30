@@ -32,15 +32,15 @@ VisionNav runs on two computers:
    mode by itself: "Starting indoor mode." → **"Indoor mode activated."**
 3. Use the buttons (below), or type commands in the assistant's terminal. Every tap clicks, so you know it was
    heard. Hold TALK and say **"help"** to hear what the buttons do.
-4. **Press SENSORS again** when you are done: "Camera and LiDAR off." → "Indoor mode paused." (the map is saved
+4. **Hold SENSORS** when you are done: "Camera and LiDAR off." → "Indoor mode paused." (the map is saved
    first while mapping). The next SENSORS press continues where you left off.
 
 ### What each button does, and what you hear
 
 | Button | Press | What happens and what you hear |
 |---|---|---|
-| **SENSORS** | tap | Turns the LiDAR and camera on — "Turning on the camera and LiDAR." → "Camera and LiDAR on." → the current mode starts ("Indoor mode activated.") — or off: "Camera and LiDAR off." → "Indoor mode paused." If they fail: "The camera and LiDAR could not start. Check their cables." |
-| | hold | Restarts them (for a camera that stopped sending) |
+| **SENSORS** | tap | Turns the LiDAR, camera and IMU on — "Turning on the camera and LiDAR." → "Camera and LiDAR on." → the current mode starts ("Indoor mode activated."). Already on: "Camera and LiDAR on." again. One of them stopped (e.g. the camera was unplugged): all are started again. If they fail: "The camera and LiDAR could not start. Check their cables." |
+| | hold | Turns them off: "Turning off the camera and LiDAR." → "Camera and LiDAR off." → "Indoor mode paused." |
 | **LOOK** | tap | If the vision AI is off: "Turning on the vision AI. This takes about half a minute." → starts Qwen3-VL → "Vision AI enabled." → describes the scene. If it is already on: "Looking." → the description |
 | | hold | Beep → ask a question while holding ("what colour is the door?") → release → the camera answers |
 | | double tap | Stops the vision AI and frees its ~2 GB of GPU memory: "Vision AI off." |
@@ -239,7 +239,7 @@ Run the same two Pi lines again after every update. Then `exit` — the Pi needs
 
 | Button | GPIO (BCM) | Header pin | Main job |
 |--------|-----------|------------|----------|
-| **SENSORS** | GPIO24 | pin 18 | LiDAR + camera on / off / restart |
+| **SENSORS** | GPIO24 | pin 18 | LiDAR + camera + IMU: tap on, hold off |
 | **LOOK** | GPIO17 | pin 11 | Vision AI: describe / ask / off |
 | **MODE** | GPIO27 | pin 13 | Indoor ↔ outdoor, status |
 | **HAND** | GPIO22 | pin 15 | Hand guidance to an object |
@@ -342,7 +342,7 @@ wrong way. Board flat on a shelf, chip up, X arrow forward: `imu_roll_deg:=0 imu
 assistant gives the map the IMU whenever the Pi publishes it (`~/.visionnav/logs/brain.log`: `Using the chest IMU`).
 Keep still for a second after turning the sensors on (it measures the gyro's drift then, and again whenever you
 stand still). `WEARABLE_IMU=0` on the laptop maps without it. If the IMU fails *while* mapping (a wire comes
-loose), the map stops following you: press SENSORS twice (off and on) to restart without it, then fix the wire.
+loose), the map stops following you: hold SENSORS (off), then tap it (on) to restart without it, then fix the wire.
 
 ---
 

@@ -81,7 +81,7 @@ AUTOSTART = {"1": "now", "true": "now", "0": "off", "false": "off"}.get(
     os.environ.get("WEARABLE_AUTOSTART", "sensors").lower(), os.environ.get("WEARABLE_AUTOSTART", "sensors").lower())
 PI_NODE = "pi_button_panel"   # the Pi's button program: seen on the network = the Pi is connected
 WATCH_S = 2.0                 # how often the Pi connection and sensors are checked
-HELP_TEXT = ("Five buttons. Sensor button: turn the camera and LiDAR on or off. Look: describe what is in front; "
+HELP_TEXT = ("Five buttons. Sensor button: press to turn the camera and LiDAR on; hold it to turn them off. Look: describe what is in front; "
              "hold it to ask a question. Mode: indoor or outdoor; hold it for the status. Hand: guide your hand to "
              "an object. Talk: tap to stop; hold it to speak a command; tap twice for what is around you. "
              "You can say: find the table with the cup, go to the chair, what is around me, call this my chair, "
@@ -530,9 +530,13 @@ class FindObjectNode(Node):
             if self._switching:
                 self.speak("Still switching modes. Please wait.")
             elif not self._active and AUTOSTART == "sensors":
-                # Paused (sensors off): just choose the mode; it starts with the camera and LiDAR
+                # Paused (sensors off): just choose the mode; it starts with the camera and LiDAR. Name the one
+                # that is missing: the Pi says "on" when the LiDAR started even if the camera publisher exited
                 self._mode = new
-                self.speak(f"{new.capitalize()} mode selected. It starts when the camera and LiDAR are on.")
+                missing = self._missing_sensors() or [name for name in SENSORS.values()]
+                self.speak(f"{new.capitalize()} mode selected. It starts when the "
+                           f"{' and the '.join(missing)} {'is' if len(missing) == 1 else 'are'} on. "
+                           + self._sensor_sentence(self._missing_sensors()))
             else:
                 self._switch_mode(new)
         elif button == "mode" and event == "hold_start":
@@ -603,6 +607,9 @@ class FindObjectNode(Node):
         if not missing:
             return ""
         what = " and the ".join(missing)
+        if self._pi_sensors == "on":  # the Pi started them but one exited (camera not plugged in): a tap restarts
+            return (f"The {what} {'is' if len(missing) == 1 else 'are'} not running. "
+                    f"Check {'its' if len(missing) == 1 else 'their'} cable, then press the sensor button.")
         return (f"The {what} {'is' if len(missing) == 1 else 'are'} not running. "
                 f"Press the sensor button on the Pi to turn them on.")
 
