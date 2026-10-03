@@ -17,14 +17,14 @@ The system is designed to be entirely hands-free and operates in a continuous, i
 2. Environmental Scanning: As the user walks, the front-facing camera and distance sensors quietly observe the environment. The system identifies furniture, structural obstacles, and open pathways, gradually building a mental map of the room in its memory.
 3. Voice Command Activation: When the user needs to locate something, they press a tactile button located on the chest rig and issue a verbal command, such as "Find a chair."
 4. Natural Language Guidance: Once the target object is located, the system does not simply point in a straight line. It calculates the safest walking route to avoid any hazards. It then speaks directly into the user's ear using an intuitive clock-face directional system. For example, it will clearly instruct the user: "Turn right to your 2 o'clock direction, then walk 15 feet."
-5. Active Safety and Haptic Feedback: While the user is walking, the system continuously monitors the area directly in front of them. If they deviate from the path and get too close to a wall or obstacle, vibration motors embedded in the chest straps will trigger, providing an immediate physical warning to stop.
+5. Active Safety: While the user is walking, the system continuously monitors the area directly in front of them. If something is in the way (an obstacle, a hole, a low branch, an approaching vehicle), it speaks a short warning with its distance and direction, and tells the user which way to step.
 
 ## Hardware and Software Composition
 This project bridges the gap between physical embedded hardware and advanced Artificial Intelligence. The complete architecture relies on several interconnected systems:
 
 * The Core Processing Unit: A small, high-performance computer housed in a lightweight backpack. This acts as the brain of the device, running all the artificial intelligence models and performing the heavy mathematical calculations required for navigation.
-* Environmental Sensors: The "eyes" of the system. This includes a high-definition RGB camera used exclusively to identify objects, paired with a laser-based distance sensor that continuously measures the exact distance in feet between the user and surrounding walls.
-* Peripheral Microcontroller: A small electronic chip that acts as the physical bridge between the user and the core computer. It manages the physical push-buttons, handles the audio stream to the Bluetooth earpiece, and regulates the vibration motors.
+* Environmental Sensors: The "eyes" of the system. This includes an RGB camera used to identify objects and estimate depth, a laser-based distance sensor (LiDAR) that continuously measures the distance to surrounding walls and obstacles, and a motion sensor (IMU) that follows how the user turns.
+* Chest Controller: A Raspberry Pi on the chest rig acts as the physical bridge between the user and the core computer. It reads five tactile push-buttons and streams the sensor data to the core computer over Wi-Fi.
 * Artificial Intelligence Engine: The software layer of the project features advanced object-recognition programming trained to instantly recognize dozens of common household items, paired with navigation software that calculates safe walking routes.
 
 ## Key Project Objectives
@@ -32,3 +32,7 @@ This project bridges the gap between physical embedded hardware and advanced Art
 2. Prioritize Physical Safety: To build a system that actively steers users away from structural hazards and provides immediate physical warnings before collisions occur.
 3. Implement Natural Human Interaction: To avoid complicated technological interfaces by utilizing natural, human-like voice instructions (such as feet and clock-directions) that can be understood instantly without a steep learning curve.
 4. Ensure Comfort and Discretion: To design a wearable hardware system that is lightweight, ergonomically sound, and visually discreet enough to be worn comfortably in public spaces.
+
+## Documentation
+* [visionnav/ARCHITECTURE.md](visionnav/ARCHITECTURE.md): how the system is built (computers, nodes, modes, topics)
+* [visionnav/STARTUP_INSTRUCTIONS.md](visionnav/STARTUP_INSTRUCTIONS.md): setup, wiring, daily use and troubleshooting

@@ -5,9 +5,8 @@ outdoor_awareness.py
 Outdoor mode for object_perception.py: live hazard awareness from the chest camera, metric depth and the
 LiDAR. Nothing is mapped or remembered; every warning comes from what is in front of the wearer right now.
 
-The open-vocabulary detector alone misses much of what matters outdoors (measured on street photos with
-YOLOE-11s: zebra crossings, trees on a footpath and most potholes were not found at all, and a water-filled
-pothole was called a "person"). So each hazard has a detector that does not depend on the class name:
+The open-vocabulary detector alone misses much of what matters outdoors (zebra crossings, trees on a footpath,
+most potholes), so each hazard also has a detector that does not depend on the class name:
 
   what                                how
   ─────────────────────────────────── ──────────────────────────────────────────────────────────────────────
@@ -51,7 +50,7 @@ OUTDOOR_VOCABULARY = [
     # traffic control
     "traffic light", "pedestrian traffic light", "stop sign", "road sign", "traffic cone", "road barrier",
     "barricade", "bollard", "zebra crossing", "crosswalk", "pedestrian crossing", "belisha beacon", "speed bump",
-    # street furniture (plastic chairs and tables outside shops: without "chair" a chair was called a "cat")
+    # street furniture (plastic chairs and tables outside shops)
     "chair", "plastic chair", "table", "stool", "box", "bag",
     "pole", "lamp post", "electric pole", "sign post", "fire hydrant", "bench", "trash can", "fence", "wall",
     "gate", "railing", "parking meter", "mailbox", "bus stop",
@@ -61,9 +60,8 @@ OUTDOOR_VOCABULARY = [
     "pothole", "hole in the ground", "open drain", "manhole", "curb", "stairs", "step", "ramp",
     "construction site", "debris",
 ]
-# Things that look like an object to an open-vocabulary detector but are not one; they win the box and are
-# never reported (the same trick as the indoor NEGATIVE_PROMPTS). Measured: a raised flower bed was a
-# "hole in the ground" (0.66) without "planter".
+# Things that look like an object to an open-vocabulary detector but are not one; they win the box and are never
+# reported (as the indoor NEGATIVE_PROMPTS; without "planter" a raised flower bed reads as a "hole in the ground").
 OUTDOOR_NEGATIVE_PROMPTS = ["sky", "building", "shadow", "road marking", "road", "sidewalk", "grass", "planter",
                             "shop sign", "window"]
 OUTDOOR_VOCABULARY = OUTDOOR_VOCABULARY + OUTDOOR_NEGATIVE_PROMPTS
@@ -156,9 +154,7 @@ DROP_MAX_RANGE = 5.0         # m: holes are only trusted this close (depth error
 TRACK_ACCEL = {"vehicle": 8.0, "mover": 3.0, "static": 1.5}  # m^2/s^3 white-noise acceleration
 TRACK_MAX_GAP_S = 0.8        # s a track survives unseen
 TRACK_CONFIRM_HITS = 3       # camera sightings before it is reported (kills one- and two-frame hallucinations)
-# What the camera named is kept only while the camera keeps seeing it. The LiDAR returns near it used to keep it
-# alive for good: a "bus stop" the camera saw twice on a wall, and a "person" in a doorway, stayed on the view and in
-# the warnings while the camera looked straight at the wall and saw neither.
+# What the camera named is kept only while the camera keeps seeing it (nearby LiDAR returns alone do not keep it)
 CAM_KEEP_IN_VIEW_S = 1.0     # s a named object in the camera's view lasts without the camera seeing it
 CAM_KEEP_BESIDE_S = 4.0      # s once out of the camera's view (beside the wearer; the LiDAR still warns, unnamed)
 DROP_CONFIRM_HITS = 3        # ground hazards are noisier (texture): one more sighting
@@ -183,7 +179,7 @@ OVERHEAD_WARNING_M = 3.5
 PERSON_WARNING_M = 2.0       # a person in the path this close (and not walking away)
 CAMERA_HALF_FOV_DEG = 26.0   # beyond this bearing only the LiDAR sees an object (camera: 52 deg wide)
 FRONT_LIMIT_DEG = 100.0      # farther round than this from straight ahead is behind the wearer: not tracked, drawn
-                             # or said (someone walking behind was "Something coming behind you" again and again)
+                             # or said
 SIDE_MIN_SPEED = 1.2         # m/s of its own: something coming from the side (needs odometry)
 SIDE_TTC = 4.0               # s
 SIDE_RANGE = 10.0            # m
@@ -191,15 +187,14 @@ SIDE_MIN_HITS = 8            # LiDAR sightings, and...
 SIDE_MIN_AGE_S = 1.0         # ...seconds tracked, before something unseen by the camera is said to be coming
 ANIMAL_WARNING_M = 3.0
 STOP_ADVICE_M = 1.5          # m: "Stop." (no free side to step to) is only said this close
-# Speaking. Measured on the rig's log with a chair, a person and a table within 2 feet: 3 dangers in 0.25 s, each
-# cutting off the one before (the voice broke up), and the same things again every 1.5 s.
+# Speaking: one sentence at a time about the most urgent thing, without cutting itself off or repeating itself
 REPEAT_S = {CRITICAL: 4.0, WARNING: 8.0, INFO: 20.0}  # s before the same thing is said again at the same level,
 REPEAT_MAX_S = 30.0          # ...doubling each time while nothing has changed (standing in front of a table)
 CLOSER_REPEAT = 0.5          # ...or sooner, once it is this fraction of the distance it was announced at
 FARTHER_M = 1.0              # m: what is in the path is this much farther than what was announced = another thing
 CHANGE_S = 2.5               # s before another thing in the same place is announced
 STICK_M = 0.5                # m: of several things in the path, the one announced stays the one spoken about
-                             # until another is this much nearer (a chair and a person took turns)
+                             # until another is this much nearer
 PAUSE_S = {WARNING: 0.6, INFO: 1.5}  # s of silence after a sentence before the next warning / information
 PATH_CLEAR_AFTER_S = 2.5     # s the path must stay clear before "Path clear" (after a blocking warning)
 GENERIC = "obstacle"         # what the LiDAR / depth found but the camera did not name
@@ -384,9 +379,8 @@ def find_zebra_crossing(bgr: np.ndarray, horizon_v: int):
     for i in range(len(bars)):
         groups.setdefault(root(i), []).append(i)
     best = max(groups.values(), key=len)
-    # A crossing near enough to matter spans much of the view: measured on street photos, real ones were 6-7
-    # bars adding up to 1.2-1.6 image widths; sunlit paving slabs, house siding and a kerb's paint 3-4 bars
-    # adding up to under 0.3
+    # A crossing near enough to matter spans much of the view (real ones: 6-7 bars over 1.2-1.6 image widths;
+    # paving slabs, siding and kerb paint: 3-4 bars under 0.3)
     if len(best) < ZEBRA_MIN_BARS + 1 or sum(bars[i][2] for i in best) < ZEBRA_MIN_TOTAL_LEN * W:
         return None
     pts = np.vstack([bars[i][4].reshape(-1, 2) for i in best])
@@ -473,8 +467,8 @@ def analyze_ground(dmap: np.ndarray, K, cam_R: np.ndarray, cam_t: np.ndarray, sc
     plane = fit_ground(P[cand]) if cand.sum() >= 30 else None
     res.fitted = plane is not None
     if plane is None:
-        # No ground in view (looking at a wall or a car side, or a pitch far from TF): heights against the
-        # nominal floor were mostly noise on street photos, so nothing is reported from depth this frame
+        # No ground in view (a wall or a car side, or a pitch far from TF): heights against the nominal floor are
+        # mostly noise, so nothing is reported from depth this frame
         return res
     n, d = plane
     res.plane = plane
@@ -603,7 +597,7 @@ def lidar_clusters(xy: np.ndarray):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ── LIVE OCCUPANCY (like a car's occupancy network, but from LiDAR + depth) ──
+# ── LIVE OCCUPANCY (LiDAR + depth, the last few seconds) ──
 # ══════════════════════════════════════════════════════════════════════
 OCC_RES = 0.10               # m per cell
 OCC_CELLS = 300              # 30 x 30 m around the wearer
@@ -616,10 +610,10 @@ OCC_FREE_SHOW = -0.8         # ...below which it is walkable free space
 
 
 class LocalOccupancy:
-    """What is occupied and what is free around the wearer, from the last few seconds of LiDAR (ahead and
-    beside, chest height) and depth (ahead: low obstacles and drops). World-fixed while the wearer's motion is known, so a
-    wall stays put while they walk; without odometry, just the latest scan in the body frame. It forgets on its
-    own (OCC_HALF_LIFE_S) and is never saved: a live picture, not a map."""
+    """What is occupied and free around the wearer, from the last few seconds of LiDAR (ahead and beside, chest
+    height) and depth (ahead: low obstacles and drops). World-fixed while the wearer's motion is known, so a wall
+    stays put while they walk; without odometry, just the latest scan in the body frame. It forgets on its own
+    (OCC_HALF_LIFE_S) and is never saved: a live picture, not a map."""
 
     def __init__(self):
         self.L = np.zeros((OCC_CELLS, OCC_CELLS), np.float32)      # LiDAR (chest height)
@@ -875,8 +869,7 @@ class OutdoorTrack:
 
     def approaching(self, speed: float) -> bool:
         """Confidently coming toward the wearer faster than `speed` (m/s): the closing speed minus two standard
-        deviations of its own uncertainty. Monocular ranges jitter by tens of centimetres per frame; on street
-        photos (not moving at all) that alone made a parked car "coming, 12 feet" with the plain estimate."""
+        deviations of its own uncertainty (monocular ranges jitter by tens of centimetres per frame)."""
         if self.hits < APPROACH_MIN_HITS:
             return False
         r = max(self.dist, 1e-3)
@@ -1024,8 +1017,7 @@ def _step_advice(lanes, block_d):
     need = block_d + 1.5
     left, right = lanes.get("left", 0.0), lanes.get("right", 0.0)
     if max(left, right) < need:
-        # Both sides blocked too. Only once it is close: "Table ahead, 7 feet. Stop." halted the wearer in the
-        # middle of a room
+        # Both sides blocked too: "Stop." only once it is close (not in the middle of a room)
         return " Stop." if block_d < STOP_ADVICE_M else ""
     if left >= need and (left > right + 0.5 or right < need):
         return " Step left."
@@ -1064,8 +1056,7 @@ def assess(tracks, lidar, ground, crossing_track=None):
                     and t.moving(SIDE_MIN_SPEED) and t.approaching(1.0) and t.ttc < SIDE_TTC and d < SIDE_RANGE):
                 side = "on your left" if bearing > 0 else "on your right"
                 what = spoken_class(lbl).capitalize() if lbl else "Something"
-                # Keyed by side, not by track: someone moving about beside the wearer broke into new tracks and
-                # was announced every 2-3 s on the rig
+                # Keyed by side, not by track: someone moving about beside the wearer breaks into new tracks
                 alerts.append(Alert(f"side:{side}", WARNING, f"{what} coming {side}, {say_distance(d)}.", d, "side"))
             continue
         if lbl is None:

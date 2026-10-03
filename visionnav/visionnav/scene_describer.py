@@ -11,8 +11,8 @@ question ("what colour is the door?", "is there a light switch?"), the node:
   3. Publishes the answer on /scene_description: voice_navigation_assistant speaks it (without the assistant,
      this node speaks it itself via Piper TTS)
 
-This is the system's only VLM. The instruct variant answers directly; the plain `qwen3-vl:2b` tag is
-the *thinking* variant, which spent its token budget on hidden reasoning and gave empty answers.
+This is the system's only VLM. The instruct variant answers directly (the plain `qwen3-vl:2b` tag is the
+thinking variant, which spends its token budget on hidden reasoning and gives empty answers).
 
 First-time setup:
   ollama pull qwen3-vl:2b-instruct
@@ -37,7 +37,7 @@ TTS_MODEL = model_path("en_US-lessac-medium.onnx")
 try:
     import rclpy
     from rclpy.node import Node
-    from sensor_msgs.msg import Image, CompressedImage
+    from sensor_msgs.msg import CompressedImage
     from std_msgs.msg import String
     from cv_bridge import CvBridge
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -101,7 +101,7 @@ class OfflineVLM:
         except Exception:
             pass
             
-        print(f"✅ GPU Warmed up! Model is now in memory. Ready to describe anything in ~2 seconds.")
+        print("✅ GPU Warmed up! Model is now in memory. Ready to describe anything in ~2 seconds.")
     
     @staticmethod
     def _jpeg(image_np) -> bytes:
@@ -199,7 +199,7 @@ def main_ros():
     rclpy.init()
     node = SceneDescriberNode(vlm)
     
-    # Background thread allowing instant frame capture and description by simply pressing ENTER!
+    # Typed questions (for testing at the laptop); Enter alone asks for a description
     def keyboard_trigger_loop():
         time.sleep(1)
         print("\n" + "="*65)

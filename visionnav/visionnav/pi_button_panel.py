@@ -30,9 +30,8 @@ a "double" follows when a second tap comes within DOUBLE_TAP_S. A hold is acted 
 (HOLD_S after the press), not at the release.
 
 The pins are read by this node itself, 200 times a second (_watch_buttons): a press counts after two readings
-with contact, a release only after RELEASE_S without contact. With the kernel's debounce filter (gpiozero's
-bounce_time) a press had to stay perfectly steady for 30 ms before it was reported at all, and on the rig short
-presses of a button with a poor contact were lost: the wearer had to keep it down to get anything.
+with contact, a release only after RELEASE_S without contact, so a quick press through a poor contact still
+counts (the kernel's debounce filter lost such presses).
 
 Parameters: <button>_pin, hold_time, double_tap_time, sensors_at_start (turn the sensors on at boot).
 Needs gpiozero with the lgpio backend (RPi.GPIO does not work on the Pi 5).
@@ -134,7 +133,6 @@ class ButtonPanel(Node):
         down = {b: False for b in self._buttons}      # pressed, as decided here
         since = {b: None for b in self._buttons}      # when the pin last changed to the other level
         pressed_at = {b: 0.0 for b in self._buttons}
-        raw, raw_logged = None, []  # diag: every change of the SENSORS pin, at most 10 lines a second
         while not self._closing:
             now = time.monotonic()
             for name, dev in self._buttons.items():
@@ -142,13 +140,6 @@ class ButtonPanel(Node):
                     contact = dev.is_active
                 except Exception:  # the device is being closed
                     continue
-                if name == "sensors" and contact != raw:
-                    raw = contact
-                    raw_logged = [t for t in raw_logged if now - t < 1.0]
-                    if len(raw_logged) < 10:
-                        raw_logged.append(now)
-                        self.get_logger().info(f"diag: SENSORS pin {'contact' if contact else 'open'} "
-                                               f"(sensors {self._sensor_state})")
                 if contact == down[name]:
                     since[name] = None
                 elif since[name] is None:
@@ -201,20 +192,6 @@ class ButtonPanel(Node):
         self._sensor_state = state
         self.get_logger().info(f"sensors: {state}")
         self._state_pub.publish(String(data=state))
-        if state in ("on", "off") and "sensors" in getattr(self, "_buttons", {}):
-            self.get_logger().info("diag: " + self._pin_report("sensors"))
-
-    def _pin_report(self, name):
-        """diag: how the pin reads and who holds it (on the rig SENSORS presses were not seen while the sensors
-        were on, the other buttons were)."""
-        dev = self._buttons[name]
-        try:
-            import lgpio
-            ok, gpio, flags, _, user = lgpio.gpio_get_line_info(dev.pin.factory._handle, dev.pin._number)
-            info = f"GPIO{gpio} flags 0x{flags:x} user '{user}'"
-        except Exception as e:
-            info = f"no line info ({e})"
-        return f"{name.upper()} pin reads {'contact' if dev.is_active else 'open'}, {info}"
 
     def _sensors_on(self):
         """SENSORS tap (and sensors_at_start). Already on: the state is published again, so the laptop says so."""
@@ -248,10 +225,9 @@ class ButtonPanel(Node):
             self._park_lidar()  # not while a driver runs (sensors left on by an earlier session, or a tap just now)
 
     def _park_lidar(self):
-        """Stop the LiDAR's motor directly, when no driver is running. The driver stops the motor only on a clean
-        exit (Ctrl+C); ended any other way — this service restarted or stopped (systemd's SIGTERM makes the driver
-        abort), a crash, a kill — it leaves the LiDAR spinning, and this node, with no driver of its own to stop,
-        had nothing to turn off: holding SENSORS or MODE did nothing. Harmless when the motor is already still."""
+        """Stop the LiDAR's motor directly when no driver is running. The driver stops the motor only on a clean
+        exit (Ctrl+C); otherwise (service restart, crash, kill) the LiDAR keeps spinning. Harmless when the motor
+        is already still."""
         if subprocess.run(["pgrep", "-x", "sllidar_node"], stdout=subprocess.DEVNULL).returncode == 0:
             return  # a driver has the port (started in a terminal): the motor is its own
         try:

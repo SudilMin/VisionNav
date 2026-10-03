@@ -1,9 +1,14 @@
-import os
+"""
+pi_sensors.launch.py
+====================
+The Pi's sensors: chest camera, MPU-6050 IMU and RPLiDAR C1. Started by the SENSORS button (pi_button_panel.py).
+"""
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+
 
 def generate_launch_description():
     return LaunchDescription([
@@ -15,8 +20,7 @@ def generate_launch_description():
                               description='Start the chest camera stream (phone_camera_publisher)'),
         DeclareLaunchArgument('imu', default_value='true',
                               description='Start the chest MPU-6050 (mpu6050_imu; harmless when none is wired)'),
-        # Chest camera -> /camera/image_raw/compressed (was a separate terminal; forgetting it left the camera AI
-        # on "Waiting for camera feed")
+        # Chest camera -> /camera/image_raw/compressed
         Node(
             package='visionnav',
             executable='phone_camera_publisher',
@@ -24,7 +28,7 @@ def generate_launch_description():
             output='screen',
             condition=IfCondition(LaunchConfiguration('camera')),
         ),
-        # Four push buttons on the GPIO header: LOOK, MODE, HAND, TALK (see pi_button_panel.py for wiring)
+        # The GPIO push buttons (see pi_button_panel.py for the wiring)
         Node(
             package='visionnav',
             executable='pi_button_panel',

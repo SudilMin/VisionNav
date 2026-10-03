@@ -160,7 +160,7 @@ distances are in feet ("The table, with the cup on it, 7 feet away, at 1 o'clock
 | "go to the chair next to the door", "take me to the nearest chair", "go there" | Walking guidance (Nav2 route, turn-by-turn) |
 | "another one", "list them", "the second one", "the one in the kitchen" | When several objects match: "go to the chair" goes to the nearest ("There are 3 chairs. Taking you to the nearest one…") |
 | "what is on the table", "what is around me" | Answered from the map |
-| "call this my chair" → later "go to my chair"; "forget name my chair" | Your own names for objects (saved per map) |
+| "call this my chair" → later "go to my chair"; "forget name my chair" | Your own names for objects (kept for this session) |
 | "save this place as kitchen" (or "mark kitchen"), "go to kitchen", "where am i", "forget place kitchen" | Named places |
 | "save map" | Nothing is saved for another day: "The map is kept until you hold the mode button. It is not saved for another day." |
 | "grasp the cup" ("grab", "pick up", "reach for") | Hand guidance: "Right 4 inches", "Lower 2 inches", "Forward 6 inches"… "Stop. The cup is at your hand." (also starts on arrival at an object) |
@@ -177,8 +177,8 @@ Speech is recognised offline on the laptop's processor (Whisper `small.en`, ~0.5
 given the system's own words and the names it knows (people, places, objects on the map) as a hint, and a word it
 mishears as a sound-alike is put right ("share one" → "chair one", "vision of" → "vision off", "camel" → a
 remembered "Kamal"; the terminal shows `🎤 Understood: …`). A new name being remembered is kept as heard.
-Faster but a little less accurate: `WEARABLE_WHISPER_MODEL=base.en` (0.4 s). Measured on 120 recordings of the
-commands: 65 % understood exactly with the old `tiny.en` setup, 92.5 % now.
+Faster but a little less accurate: `WEARABLE_WHISPER_MODEL=base.en` (0.4 s). `small.en` understood 92.5 % of 120
+recorded commands.
 Colours are understood when someone says one ("the red cup") but only spoken with `WEARABLE_SPEAK_COLORS=1`
 (for a partially sighted user).
 
@@ -199,7 +199,8 @@ colcon build --symlink-install --packages-select visionnav
 * **Object detector.** YOLOE-11s-seg with the vocabulary in `VOCABULARY` (top of `visionnav/object_perception.py`),
   and outdoors `OUTDOOR_VOCABULARY` (top of `visionnav/outdoor_awareness.py`). The first start after a vocabulary
   changes builds its TensorRT engine (~2–6 min, one time); the camera window opens when it is done. To detect
-  something new, add its name to the vocabulary.
+  something new, add its name to the vocabulary. The build needs the text encoder `models/mobileclip_blt.ts`
+  (Ultralytics downloads it there if it is missing).
 * **Outdoor depth model** (outdoor mode; without it outdoor mode uses the indoor one, which reads no farther than 20 m):
   ```bash
   curl -L -o ~/wearable_ws/src/visionnav/models/depth_anything_v2_metric_outdoor_vits.pth \
@@ -390,9 +391,8 @@ loose), the map stops following you: hold SENSORS (off), then tap it (on) to res
   outdoor mode): the map, the objects, your named places ("save this place as kitchen") and your names for
   objects ("call this my chair") are all forgotten. Nothing is saved for another day and no old map is loaded:
   an old map put you in the wrong place anywhere else.
-* Behind the scenes: the map runs with `localize:=false`; this session's places and names live in a temporary
-  folder (`/tmp/visionnav_session_*`) that is deleted when the map stops. Maps saved earlier in
-  `~/.visionnav/maps/` are left as they are, but no longer used by the assistant.
+* Behind the scenes: this session's places and names live in a temporary folder (`/tmp/visionnav_session_*`)
+  that is deleted when the map stops.
 
 **What the object map does:** an object seen reliably stays on the map, drawn translucent while out of view,
 and keeps its name and ID when seen again from another side — it is not forgotten because the back of a chair
@@ -417,9 +417,8 @@ TF (`sensor_tf.launch.py`), so there is one place to fix it.
    starting the assistant:
    `export WEARABLE_BRAIN_ARGS="camera_height:=1.32 camera_pitch_deg:=12 lidar_height:=1.18 lidar_yaw_deg:=188"`.
    A camera tilted 10° but configured as 0° puts a floor object 3 m away about 2.5 m too far.
-   The defaults are this rig's, measured from a recording (2026-10-01): camera 52° wide
-   (`WEARABLE_CAMERA_HFOV_DEG`, read by object_perception), tilted 10° down, turned 2° left. A wrong width
-   spreads every object sideways (at 70° a chair 15° left was drawn 21° left, against the wall).
+   The defaults are this rig's, measured on the rig: camera 52° wide (`WEARABLE_CAMERA_HFOV_DEG`, read by
+   object_perception), tilted 10° down, turned 2° left. A wrong width spreads every object sideways.
    With the IMU, add its height and the mount `setup_pi.sh imu` printed (section 3b), e.g.
    `imu_height:=1.15 imu_roll_deg:=0 imu_pitch_deg:=1 imu_yaw_deg:=1`. If they do not put the IMU's gravity
    upward, the assistant starts the map without the IMU and says so.

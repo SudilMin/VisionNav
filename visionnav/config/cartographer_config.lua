@@ -48,8 +48,7 @@ TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.linear_search_window = 
 TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.angular_search_window = math.rad(35.)
 TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.translation_delta_cost_weight = 10.
 TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.rotation_delta_cost_weight = 1e-1
--- Trust the scan more than the (non-existent) motion prior.
--- Pin the scan to the walls; a light translation prior (no odometry exists to trust).
+-- Pin the scan to the walls; only a light translation prior (no odometry exists to trust).
 TRAJECTORY_BUILDER_2D.ceres_scan_matcher.occupied_space_weight = 20.
 TRAJECTORY_BUILDER_2D.ceres_scan_matcher.translation_weight = 10.
 TRAJECTORY_BUILDER_2D.ceres_scan_matcher.rotation_weight = 40.
@@ -59,11 +58,9 @@ TRAJECTORY_BUILDER_2D.motion_filter.max_time_seconds = 0.5
 TRAJECTORY_BUILDER_2D.motion_filter.max_distance_meters = 0.10
 TRAJECTORY_BUILDER_2D.motion_filter.max_angle_radians = math.rad(2.)
 
--- How a wall cell is believed (Cartographer's defaults). A miss of 0.45 (to clear people faster) also erased the
--- real walls: a chest-worn scan pitches with every step, so a wall is crossed by many near-miss rays. Replays of a
--- recorded walk (2026-10-01): with 0.49 the map kept 2.4x the wall cells (1347 vs 565), the loop-closure corrections
--- fell from 0.11 to 0.04 m (median; 90 %: 0.21 to 0.12 m) and the live position stopped jumping. People are kept off
--- the routes by semantic_costmap.py (tracked, not drawn into this map); a ghost of one fades as it is walked through.
+-- How a wall cell is believed (Cartographer's defaults): a lower miss probability also erased real walls, since a
+-- chest-worn scan pitches with every step and crosses a wall with many near-miss rays. People are kept off the
+-- routes by semantic_costmap.py (tracked, not drawn into this map).
 TRAJECTORY_BUILDER_2D.submaps.range_data_inserter.probability_grid_range_data_inserter.hit_probability = 0.55
 TRAJECTORY_BUILDER_2D.submaps.range_data_inserter.probability_grid_range_data_inserter.miss_probability = 0.49
 TRAJECTORY_BUILDER_2D.submaps.range_data_inserter.probability_grid_range_data_inserter.insert_free_space = true

@@ -16,7 +16,7 @@ never needs a terminal:
 A part is "running" when its ROS node is on the network — so a part started by hand in a terminal is used
 as it is and never started twice (and never stopped by the manager either: only parts it started itself).
 Parts an earlier assistant started and left running (it was killed, or crashed) are adopted at start-up, so
-the MODE button can stop them: an orphaned indoor brain kept its map window open in outdoor mode.
+the MODE button can stop them.
 A part is "ready" when its node appears (the scene describer only creates its node after Qwen3-VL is loaded
 on the GPU, so ready really means it can answer). Output of each part goes to ~/.visionnav/logs/<part>.log.
 """
@@ -45,15 +45,11 @@ def _share(*path):
 
 PARTS = {
     # WEARABLE_BRAIN_ARGS: the rig's measured geometry, e.g. "camera_height:=1.32 camera_pitch_deg:=12".
-    # Without its RViz: the map window is a part of its own (map_view). localize:=false: every indoor session
-    # maps the place it is in afresh (never the map of another day, which put the wearer in the wrong place
-    # anywhere else); see start()
-    "brain": {"cmd": ["ros2", "launch", "visionnav", "laptop_brain.launch.py", "use_rviz:=false", "localize:=false"]
+    # Without its RViz: the map window is a part of its own (map_view). Each indoor session maps afresh (start()).
+    "brain": {"cmd": ["ros2", "launch", "visionnav", "laptop_brain.launch.py", "use_rviz:=false"]
                      + shlex.split(os.environ.get("WEARABLE_BRAIN_ARGS", "")), "node": "cartographer_node",
               "env": {"LIBGL_ALWAYS_SOFTWARE": "1"}, "timeout": 40, "name": "the map"},
-    # The map window. Inside the brain's launch, a window that had been closed (or a brain left running by an
-    # earlier session without it) stayed closed: "Indoor mode activated." and no map on the screen. As a part
-    # of its own it is opened again whenever the mode starts and it is not there.
+    # The map window, as its own part so it is reopened whenever indoor mode starts and it is not there
     "map_view": {"cmd": ["ros2", "run", "rviz2", "rviz2", "-d", _share("rviz", "visionnav.rviz"),
                          "--ros-args", "-r", "__node:=rviz2"], "node": "rviz2",
                  "env": {"LIBGL_ALWAYS_SOFTWARE": "1"}, "timeout": 30, "name": "the map window"},
@@ -181,8 +177,8 @@ class SystemManager:
     def start(self, part, wait=True) -> bool:
         """Start a part unless it is running; with `wait`, block until it is ready. True when ready."""
         spec = PARTS[part]
-        # Stopped moments ago: its node lingers in the network's list for ~10 s, and a restart would look
-        # "ready" at once (indoor mode was announced 1 s after restarting the SLAM brain). Wait for it to go.
+        # Stopped moments ago: its node lingers in the network's list for ~10 s and a restart would look "ready"
+        # at once. Wait for it to go.
         t0 = time.time()
         while (time.time() - self._stopped.get(part, -1e9) < STALE_S and spec["node"] in self._node_names()
                and time.time() - t0 < 15.0):
@@ -206,9 +202,8 @@ class SystemManager:
                         self.imu_note = "The map runs without the IMU: its mount setting does not match the board."
                         self._log(f"NOT using the IMU: {why}")
                 env = dict(os.environ, PYTHONUNBUFFERED="1", **spec["env"])  # logs written as they happen
-                # OpenCV's pip wheel, once imported here (LOOK hold loads the vision AI's module), points Qt at its
-                # own plugins through os.environ: every RViz started afterwards died with "Could not load the Qt
-                # platform plugin xcb", and neither the map nor the outdoor view appeared
+                # OpenCV's pip wheel, once imported here, points Qt at its own plugins through os.environ, and every
+                # RViz started afterwards fails to load the xcb platform plugin
                 for key in ("QT_QPA_PLATFORM_PLUGIN_PATH", "QT_QPA_FONTDIR"):
                     if "cv2" in env.get(key, ""):
                         del env[key]
@@ -278,9 +273,8 @@ class SystemManager:
 
     def _imu_mount_ok(self):
         """Whether the IMU mount in the TF (imu_*_deg: WEARABLE_BRAIN_ARGS, else sensor_tf.launch.py's defaults)
-        turns the measured gravity upward. It once did not (the board lay flat, the TF had it upright), and
-        Cartographer levelled every scan 90 deg wrong: the saved map never matched, the wearer's position and every
-        object placed from it were wrong. Returns (ok, reason)."""
+        turns the measured gravity upward (a wrong mount makes Cartographer level every scan 90 deg wrong).
+        Returns (ok, reason)."""
         try:
             import importlib.util
             from ament_index_python.packages import get_package_share_directory
@@ -324,8 +318,7 @@ class SystemManager:
         return p is not None and p.poll() is None
 
     def stop_all(self):
-        """All parts at once: one by one, a slow one (8 s grace each) made Ctrl+C take half a minute, and a second
-        Ctrl+C meanwhile left the rest running on their own."""
+        """All parts at once (one by one, the 8 s grace of each would add up)."""
         threads = [threading.Thread(target=self.stop, args=(part,)) for part in list(self._procs)]
         for t in threads:
             t.start()

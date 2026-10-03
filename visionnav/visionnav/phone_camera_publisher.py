@@ -2,8 +2,8 @@
 """
 phone_camera_publisher.py
 -------------------------
-Reads the live video feed from a USB-connected smartphone (Webcam mode) 
-and publishes it to the ROS 2 `/camera/image_raw` topic so the AI can process it.
+Streams the chest camera (a USB webcam on the Pi, or an IP webcam stream given in CAMERA_URL) to the laptop
+as JPEG on /camera/image_raw/compressed. Runs on the Pi, started by pi_sensors.launch.py.
 """
 
 import cv2
@@ -23,8 +23,7 @@ class PhoneCameraNode(Node):
     def __init__(self):
         super().__init__('phone_camera_publisher')
         
-        # We use BEST_EFFORT so if the AI lags, it just drops old frames 
-        # rather than building up a massive backlog.
+        # BEST_EFFORT: if the receiver lags, old frames are dropped rather than queued
         realtime_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -41,7 +40,7 @@ class PhoneCameraNode(Node):
         
         self.cap = None
         
-        # 1. Check if user specified an IP Webcam URL (via environment variable CAMERA_URL)
+        # An IP webcam stream (CAMERA_URL), else the first working local video device
         camera_url = os.environ.get('CAMERA_URL', '').strip()
         if camera_url:
             self.get_logger().info(f"Connecting to wireless IP Webcam stream at: {camera_url}...")
@@ -50,12 +49,11 @@ class PhoneCameraNode(Node):
                 ret, frame = candidate.read()
                 if ret and frame is not None:
                     self.cap = candidate
-                    self.get_logger().info(f"✅ Successfully linked to IP Webcam stream!")
+                    self.get_logger().info("✅ Successfully linked to IP Webcam stream!")
             if self.cap is None:
                 self.get_logger().error(f"Failed to open IP Webcam stream at {camera_url}. Check Wi-Fi connection and URL.")
                 import sys; sys.exit(1)
         else:
-            # 2. Fall back to scanning local hardware video devices 0..34
             self.get_logger().info("No CAMERA_URL set. Scanning local USB hardware webcams...")
             for index in range(0, 35):
                 candidate = cv2.VideoCapture(index, cv2.CAP_V4L2)
@@ -71,21 +69,20 @@ class PhoneCameraNode(Node):
                 self.get_logger().error("Could not open any camera device or IP stream. Set CAMERA_URL or check USB permissions.")
                 import sys; sys.exit(1)
             
-        # 3. FIX LAG: Force MJPEG hardware compression to prevent USB bandwidth bottlenecks
+        # MJPEG from the camera (less USB bandwidth), 640x480 at 30 fps
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         
-        # 4. FIX LAG: Lower resolution back to 640x480 for ultra-fast, zero-lag inference
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self.cap.set(cv2.CAP_PROP_FPS, 30)
         
-        # FIX LAG: Force OpenCV to only keep the newest frame in memory, dropping old ones
+        # Keep only the newest frame in the driver's buffer
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         
         self.get_logger().info(f"Phone Camera connected. Publishing freshest frames at up to {self.publish_fps:.0f} FPS "
                                f"(JPEG quality {self.jpeg_quality}).")
         
-        # FIX LAG: Launch a dedicated background thread to drain the camera buffer instantly
+        # A dedicated thread drains the camera buffer as fast as it fills
         self.running = True
         self.capture_thread = threading.Thread(target=self.capture_loop, daemon=True)
         self.capture_thread.start()

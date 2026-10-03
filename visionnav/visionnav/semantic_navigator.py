@@ -42,7 +42,7 @@ from std_msgs.msg import String
 # The user should end within arm's reach: about 0.25 m between their body and the object's edge.
 APPROACH_DIST = 0.45        # m from the object's centre to where the user stops, along the user->object line
 MIN_EDGE_CLEARANCE = 0.25   # m from the object's edge (decides for wide objects: tables, sofas)
-ARRIVED_RADIUS = 0.15       # m from the stopping point (was 0.35: "arrived" fired ~1 m from a chair)
+ARRIVED_RADIUS = 0.15       # m from the stopping point
 REPLAN_PERIOD = 1.0         # s
 MAX_APPROACH_COST = 90      # costmap value (0-100): anything below Nav2's "inscribed" (99) is standable
 APPROACH_ANGLES = sorted(range(-180, 180, 15), key=abs)  # 0 = straight between user and object

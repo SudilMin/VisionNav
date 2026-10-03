@@ -24,7 +24,6 @@
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>sllidar_ros2</exec_depend>
   <exec_depend>cartographer_ros</exec_depend>
-  <exec_depend>slam_toolbox</exec_depend>
   <exec_depend>nav2_planner</exec_depend>
   <exec_depend>nav2_smoother</exec_depend>
   <exec_depend>nav2_lifecycle_manager</exec_depend>
