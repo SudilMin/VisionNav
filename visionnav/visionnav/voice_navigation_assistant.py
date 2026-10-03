@@ -82,7 +82,7 @@ NAME_LEADS = ("his name is ", "her name is ", "their name is ", "this is ", "it 
 FLIP_CAMERA = os.environ.get("WEARABLE_CAMERA_FLIP", "1") == "1"
 HAND_REACH_M = 1.0        # m: an object this close is within reach, hand guidance starts at once
 HAND_SEARCH_RANGE = 2.5   # m: without a found object, HAND picks the nearest object ahead within this range
-SENSOR_SETTLE_S = 15.0    # s after "Camera and LiDAR on." in which their streams appearing is not announced
+SENSOR_SETTLE_S = 15.0    # s after "Sensors turned on." in which it is not said again (nor a stream appearing)
 LOOK_REPEAT_S = 1.5       # a second LOOK tap this soon after the first is the same press: one description
 # Words of the commands themselves (never "corrected" into the name of an object or a person)
 COMMAND_WORDS = ("go take bring walk lead guide navigate find locate search look describe read grasp grab pick reach "
@@ -130,6 +130,7 @@ OUTDOOR_AHEAD = ("what is ahead", "what s ahead", "whats ahead", "what is in fro
                  "whats in front of me", "what is in front", "is the path clear", "is the way clear")
 # The Pi's sensors (pi_sensors.launch.py): said aloud when one is missing, lost or back
 SENSORS = {"/camera/image_raw/compressed": "camera", "/scan": "LiDAR"}
+SENSORS_ON_TEXT = "Sensors turned on."
 # Colours are not spoken unless asked for (someone blind from birth may not know them); set 1 for low vision
 SPEAK_COLORS = os.environ.get("WEARABLE_SPEAK_COLORS", "0") == "1"
 
@@ -1002,7 +1003,7 @@ class FindObjectNode(Node):
         if state in ("stopping", "off"):
             self._off = False  # a fresh start: the next SENSORS press starts the mode as usual
         # Said once, when it is done ("starting" and "stopping" are not announced: the button clicked)
-        said = {"on": "Camera and LiDAR on.", "off": "Camera and LiDAR off.",
+        said = {"off": "Camera and LiDAR off.",
                 "failed": "The camera and LiDAR could not start. Check their cables."}.get(state)
         if state == "off":
             if self._turning_off:
@@ -1010,10 +1011,19 @@ class FindObjectNode(Node):
             if AUTOSTART == "sensors":
                 threading.Thread(target=self._pause, daemon=True).start()  # says it, with the mode
                 return
-        if state == "on":
-            self._sensors_on_t = time.monotonic()  # their streams appear over the next seconds: not said again
+        if state == "on" and self._claim_sensors_on():
+            said = SENSORS_ON_TEXT
         if said:
             threading.Thread(target=self.speak, args=(said,), daemon=True).start()
+
+    def _claim_sensors_on(self) -> bool:
+        """True when "Sensors turned on." should be said now: once, however it is noticed (the Pi's SENSORS state,
+        the streams appearing, the Pi reconnecting with them on)."""
+        now = time.monotonic()
+        if now - getattr(self, "_sensors_on_t", -math.inf) < SENSOR_SETTLE_S:
+            return False
+        self._sensors_on_t = now
+        return True
 
     def _pause(self):
         """Sensors switched off with the SENSORS button: say so, once, and stop the mode's programs (the session's
@@ -1053,21 +1063,27 @@ class FindObjectNode(Node):
                     self.speak("VisionNav is on. Waiting for the Pi. Check that it is switched on "
                                "and on the same Wi-Fi.")
             elif pi != pi_was:
-                self.speak("Connected to the Pi." if pi else
-                           "The Pi is not answering. Check that it is switched on and on the same Wi-Fi.")
-            # Streams lost or back: not while the SENSORS button is switching them, nor while they appear after
-            # "Camera and LiDAR on."
+                if pi and all_on and self._claim_sensors_on():
+                    self.speak(SENSORS_ON_TEXT)  # the Pi is back with its sensors on: one sentence
+                elif not (pi and all_on):
+                    self.speak("Connected to the Pi." if pi else
+                               "The Pi is not answering. Check that it is switched on and on the same Wi-Fi.")
+            # Streams lost or back: not while the SENSORS button is switching them, nor just after
+            # "Sensors turned on."
             settling = time.monotonic() - getattr(self, "_sensors_on_t", -math.inf) < SENSOR_SETTLE_S
             if self._pi_sensors in ("starting", "stopping", "off") or settling:
                 self._sensor_ok = {}
             else:
+                came_on = False
                 for name, ok in sensors.items():
                     was = self._sensor_ok.get(name)
                     if was is True and not ok and pi:
                         self.speak(f"The {name} signal is lost.")
                     elif was is False and ok and not first:
-                        self.speak(f"The {name} is on.")
+                        came_on = True
                     self._sensor_ok[name] = ok
+                if came_on and all_on and self._claim_sensors_on():
+                    self.speak(SENSORS_ON_TEXT)
             if AUTOSTART == "sensors" and all_on and not self._active and not self._switching and not self._off:
                 threading.Thread(target=self._switch_mode, args=(self._mode, True), daemon=True).start()
                 self._switching = True  # until the thread takes over

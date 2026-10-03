@@ -29,7 +29,7 @@ VisionNav runs on two computers:
    source install/setup.bash
    ros2 run visionnav voice_navigation_assistant
    ```
-2. **Press SENSORS.** Click → "Camera and LiDAR on." → the laptop starts indoor mode by itself (the map window
+2. **Press SENSORS.** Click → "Sensors turned on." → the laptop starts indoor mode by itself (the map window
    and the camera window open) → **"Indoor mode activated."** Each thing is said once, when it is done.
 3. Use the buttons (below), or type commands in the assistant's terminal. Every tap clicks, so you know it was
    heard. Hold LOOK and say **"help"** to hear what the buttons do.
@@ -41,7 +41,7 @@ VisionNav runs on two computers:
 
 | Button | Press | What happens and what you hear |
 |---|---|---|
-| **SENSORS** | tap | Turns the LiDAR, camera and IMU on — click → "Camera and LiDAR on." → the current mode starts → "Indoor mode activated." Already on: "Camera and LiDAR on." again. One of them stopped (e.g. the camera was unplugged): all are started again. If they fail: "The camera and LiDAR could not start. Check their cables." A very short press counts. |
+| **SENSORS** | tap | Turns the LiDAR, camera and IMU on — click → "Sensors turned on." → the current mode starts → "Indoor mode activated." Already on: "Sensors turned on." again. One of them stopped (e.g. the camera was unplugged): all are started again. If they fail: "The camera and LiDAR could not start. Check their cables." A very short press counts. |
 | | hold | Turns them off as soon as the button has been down 0.6 s, while it is still down (the LiDAR stops; no need to let go first), and the laptop closes the mode's programs: click → "Camera and LiDAR off. Indoor mode paused. Press the sensor button to continue." The Pi does this by itself: it works with the laptop off. Letting go afterwards does not turn them on again. |
 | **LOOK** | tap | If the vision AI is off: "Turning on the vision AI." → starts Qwen3-VL (about half a minute) → describes the scene. If it is already on: "Looking." → the description |
 | | hold | Beep → ask the camera a question while holding ("what colour is the door?") → let go → the answer (the vision AI starts first if it is off). Only the newest request is answered: a description still waiting or being made when you ask is dropped. A command said here is carried out instead ("help", "status", "vision off", "find the cup", "what is ahead", "can I cross"…). To turn the vision AI off and free its ~2 GB of GPU memory: hold LOOK, say **"vision off"** → "Vision AI off." |
@@ -59,7 +59,7 @@ A hold is 0.6 s and acts at that moment, with the button still down; a double ta
 Pi reads the buttons 200 times a second, so a very short press counts and a poor contact does not split one press
 into several. Every tap clicks, and so does a SENSORS, LOOK or MODE
 hold once it is long enough (let go). What a button did is said once, when it is done. If the camera or LiDAR stream stops
-you hear "The camera signal is lost." ("The camera is on." when it returns), and if the Pi drops off the
+you hear "The camera signal is lost." ("Sensors turned on." when it returns), and if the Pi drops off the
 network, "The Pi is not answering. Check that it is switched on and on the same Wi-Fi."
 
 ### Which programs each mode runs
