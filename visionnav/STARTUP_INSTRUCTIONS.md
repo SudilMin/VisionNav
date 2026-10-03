@@ -44,14 +44,16 @@ VisionNav runs on two computers:
 | **SENSORS** | tap | Turns the LiDAR, camera and IMU on — click → "Camera and LiDAR on." → the current mode starts → "Indoor mode activated." Already on: "Camera and LiDAR on." again. One of them stopped (e.g. the camera was unplugged): all are started again. If they fail: "The camera and LiDAR could not start. Check their cables." A very short press counts. |
 | | hold | Turns them off as soon as the button has been down 0.6 s, while it is still down (the LiDAR stops; no need to let go first), and the laptop closes the mode's programs: click → "Camera and LiDAR off. Indoor mode paused. Press the sensor button to continue." The Pi does this by itself: it works with the laptop off. Letting go afterwards does not turn them on again. |
 | **LOOK** | tap | If the vision AI is off: "Turning on the vision AI." → starts Qwen3-VL (about half a minute) → describes the scene. If it is already on: "Looking." → the description |
-| | hold | Beep → ask the camera a question while holding ("what colour is the door?") → let go → the answer (the vision AI starts first if it is off). A command said here is carried out instead ("help", "status", "vision off", "find the cup", "what is ahead", "can I cross"…). To turn the vision AI off and free its ~2 GB of GPU memory: hold LOOK, say **"vision off"** → "Vision AI off." |
+| | hold | Beep → ask the camera a question while holding ("what colour is the door?") → let go → the answer (the vision AI starts first if it is off). Only the newest request is answered: a description still waiting or being made when you ask is dropped. A command said here is carried out instead ("help", "status", "vision off", "find the cup", "what is ahead", "can I cross"…). To turn the vision AI off and free its ~2 GB of GPU memory: hold LOOK, say **"vision off"** → "Vision AI off." |
+| | double press | **Vision AI off** (frees its GPU memory) → "Vision AI off." (A single tap now describes after a short wait, 0.45 s, to tell it from a double press.) |
 | **MODE** | tap | While paused (sensors off): "Outdoor mode selected. It starts when the camera and LiDAR are on." Otherwise: click → closes the indoor map (Cartographer, Nav2, its RViz), opens the outdoor view (its own RViz) → "Outdoor mode activated." Tap again: the outdoor view closes and the indoor map opens → "Indoor mode activated." The camera window stays open throughout. |
 | | hold | **Close the map and the camera feed; the session ends.** Stops the map (Cartographer, Nav2, the map window), the camera AI with its camera window and the outdoor view, and any guidance → click → "Map and camera closed. Press mode to start again." The map, the objects, the places and the names of this session are forgotten (nothing is kept for another day). The camera and LiDAR stay on (SENSORS is their button); tap MODE to start again, with a new map. The vision AI stays on: say "vision off" to stop it. The status is a voice command: hold LOOK, say "status". |
-| **HAND** | tap | Starts the camera AI if it is off → "Hand guidance enabled." → guides your hand to the object found last (or the nearest one ahead), walking you there first if it is more than 1 m away. Tap again: "Hand guidance disabled." |
+| **HAND** | tap | (After 0.45 s, see double tap.) Starts the camera AI if it is off ("Turning on the camera AI.") → guides your hand to the object found last (or the nearest one ahead): "Reach out your hand toward the cup." — walking you there first if it is more than 1 m away. Nothing found: "Nothing to reach for yet…". Tap again: "Hand guidance disabled." |
 | | hold | Click → stops hand guidance (and the walk to the object), and closes the camera AI and its camera window if the HAND button opened it (no mode running): "Hand guidance off. Camera closed." In indoor or outdoor mode the camera stays (the mode needs it; MODE hold closes it): "Hand guidance off." Nothing running: "Hand guidance is already off." |
-| **TALK** | tap | Stops what is being said. When not navigating, also stops hand guidance → "Stopped." |
-| | hold | **Navigation (indoor mode only).** Beep → say where to go while holding ("chair", "the table with the cup", "my chair", "kitchen") → let go → "Taking you to the chair…" → turn-by-turn guidance → "You have arrived at the chair." and the navigation ends (no hand guidance; the HAND button does that). A command also works here ("status", "save this place as kitchen", "call this my chair"). Not in indoor mode: "You can't use navigation now. It works only in indoor mode." |
-| | double tap | While navigating: **ends the navigation** → "Navigation stopped." Otherwise: what is around you |
+| | double tap | **Face mode** on / off: "Face mode. Press to recognise a person. Hold and say a name to remember them." / "Face mode off." In face mode: **tap** → who is in front: "This is Kamal." / "I see 2 people: Kamal on your left, and someone I do not know on your right." / "I don't know this person…"; **hold** → beep → say the name ("Kamal", "his name is Kamal") → let go → "I will remember Kamal." (the largest face in view; do it again from another angle to recognise them better). Faces are kept for another day, on this laptop only (`~/.visionnav/faces/faces.json`). A HAND tap waits 0.45 s to see whether a second one follows. |
+| **TALK** | tap | While navigating: **ends the navigation** → "Navigation stopped." Otherwise nothing. |
+| | hold | **Navigation (indoor mode only).** Beep → say where to go while holding ("chair", "chair 1" — the ID shown on the map and camera window —, "the table with the cup", "my chair", "kitchen") → let go → "Taking you to the chair…" → turn-by-turn guidance, always with the clock direction and the feet left ("Turn left, to 10 o'clock. 12 feet.", "Bear slightly right, 1 o'clock. 6 feet.", "Straight ahead. 3 feet."; every 2 feet in the last 12 feet) → "You have arrived. The chair is at 12 o'clock, about 2 feet away." (where it is from where you stopped, for your last step) and the navigation ends (no hand guidance; the HAND button does that). A command also works here ("status", "save this place as kitchen", "call this my chair"). Not in indoor mode: "You can't use navigation now. It works only in indoor mode." |
+| | double tap | What is around you |
 
 A hold is 0.6 s and acts at that moment, with the button still down; a double tap is two taps within 0.4 s. The
 Pi reads the buttons 200 times a second, so a very short press counts and a poor contact does not split one press
@@ -96,7 +98,16 @@ with the distance in feet and the direction — **one sentence at a time, about 
 * A sentence is never cut off by another one of the same urgency. Only a greater danger cuts in: a danger over a
   warning or over anything else being said, and "Stop. Car coming…" over any other danger.
 * A warning that could not be said within 2 s (the voice was busy) is dropped instead of being said late.
-* Nothing behind you is tracked or said.
+* What is shown and said follows the camera: an object it named disappears 1 s after the camera stops
+  seeing it (4 s once it is beside you, out of the camera's view; the LiDAR still warns there, unnamed).
+* Nothing behind you is tracked or said. The LiDAR spins all round, but its returns behind you (more than 100°
+  from straight ahead: your own body) are dropped before outdoor mode uses the scan.
+* Positions come from the LiDAR wherever it sees the object (anything reaching chest height); the camera
+  names it. Things lower than the LiDAR (a chair, a kerb, a rock) are placed from the camera's depth, and
+  never take the range of the wall behind them. That depth comes from whichever depth model agrees with
+  the LiDAR (checked every second). In a room the indoor one won (the street one read everything 1-3 m
+  away as about 5 m); on a street the street one is expected to. `~/.visionnav/logs/perception.log` shows
+  `📏 Depth: the indoor model now …` when it changes.
 
 | What | Example of what you hear | How it is found |
 |---|---|---|
@@ -130,7 +141,6 @@ with the distance in feet and the direction — **one sentence at a time, about 
 * **Say** (hold LOOK): "what is ahead" (also TALK double tap), "what colour is the light", "can I cross" (the
   crossing, its signal and any vehicle coming — it never says it is safe; listen for traffic), "quiet warnings"
   (two minutes; dangers are still said), "warnings on", "help".
-* **TALK tap** stops the speech and quiets the warnings for 6 s (dangers are still said).
 * **Settings**: `WEARABLE_USER_HEIGHT=1.75` (m, for head-height warnings), `WEARABLE_UNITS=metric` (metres instead
   of feet), `WEARABLE_RECORD_DIR=~/walk1` (saves the camera view of every warning, and one frame every 2 s, with
   `alerts.jsonl` — to review a walk afterwards).
@@ -156,12 +166,19 @@ distances are in feet ("The table, with the cup on it, 7 feet away, at 1 o'clock
 | "grasp the cup" ("grab", "pick up", "reach for") | Hand guidance: "Right 4 inches", "Lower 2 inches", "Forward 6 inches"… "Stop. The cup is at your hand." (also starts on arrival at an object) |
 | "what colour is the door?", "describe …", "read …", "how many people are here?" | Sent to the vision AI (it starts first if it is off) |
 | "vision off" | Stops the vision AI and frees its GPU memory |
+| "who is this", "who is here" | Who is in front of the camera (as a HAND tap in face mode) |
+| "forget face Kamal" | Deletes that remembered face |
 | "status" | Mode (or "All modes are off."), vision AI on/off, missing sensors, map, how many objects, what is around you |
 | "help" | What the buttons do and what you can say |
 | "stop" / "exit" | Stop everything / shut the assistant down |
 
-Speech is recognised offline (Whisper `tiny.en`, cached in `~/.cache/huggingface`) in about 0.3–0.6 s: wait for
-the beep, then speak. For more accuracy in noise: `WEARABLE_WHISPER_MODEL=base.en` (downloaded once).
+Speech is recognised offline on the laptop's processor (Whisper `small.en`, ~0.5 GB, downloaded once into
+`~/.cache/huggingface` at the first start) about 1.4 s after you let go: wait for the beep, then speak. Whisper is
+given the system's own words and the names it knows (people, places, objects on the map) as a hint, and a word it
+mishears as a sound-alike is put right ("share one" → "chair one", "vision of" → "vision off", "camel" → a
+remembered "Kamal"; the terminal shows `🎤 Understood: …`). A new name being remembered is kept as heard.
+Faster but a little less accurate: `WEARABLE_WHISPER_MODEL=base.en` (0.4 s). Measured on 120 recordings of the
+commands: 65 % understood exactly with the old `tiny.en` setup, 92.5 % now.
 Colours are understood when someone says one ("the red cup") but only spoken with `WEARABLE_SPEAK_COLORS=1`
 (for a partially sighted user).
 
@@ -257,10 +274,10 @@ Run the same two Pi lines again after every update. Then `exit` — the Pi needs
 | Button | GPIO (BCM) | Header pin | Main job |
 |--------|-----------|------------|----------|
 | **SENSORS** | GPIO24 | pin 18 | LiDAR + camera + IMU: tap on, hold off |
-| **LOOK** | GPIO17 | pin 11 | Vision AI: tap describe, hold ask a question |
+| **LOOK** | GPIO17 | pin 11 | Vision AI: tap describe, hold ask a question, double press off |
 | **MODE** | GPIO27 | pin 13 | Tap indoor ↔ outdoor, hold everything off |
-| **HAND** | GPIO22 | pin 15 | Tap hand guidance to an object, hold off |
-| **TALK** | GPIO23 | pin 16 | Indoor navigation: hold say where to go, double tap end; tap quiet |
+| **HAND** | GPIO22 | pin 15 | Tap hand guidance, hold off; double tap face mode |
+| **TALK** | GPIO23 | pin 16 | Indoor navigation: hold say where to go, press again to stop |
 | GND (shared) | — | pin 14 (also 9, 20, 25) | Second leg of every button |
 
 **Parts:** 5 momentary, normally-open push buttons (12 mm tactile or 16–19 mm panel buttons; give each a
@@ -351,7 +368,7 @@ the LiDAR, so it goes on the same rigid part:
 
 **Check it** (Pi, after `setup_pi.sh` and one reboot): `bash ~/wearable_ws/src/visionnav/scripts/setup_pi.sh imu`
 shows `68` in the I2C table, the chip's readings, which arrow points up, then asks you to stand straight and to
-lean forward, and prints the mount, e.g. `imu_roll_deg:=-1 imu_pitch_deg:=6 imu_yaw_deg:=1` (the default: this rig's
+lean forward, and prints the mount, e.g. `imu_roll_deg:=0 imu_pitch_deg:=1 imu_yaw_deg:=1` (the default: this rig's
 board, flat, chip up, X arrow forward). If it prints other numbers, add them to `WEARABLE_BRAIN_ARGS` (section 5): with a wrong mount the map is levelled the
 wrong way. Board flat on a shelf, chip up, X arrow forward: `imu_roll_deg:=0 imu_pitch_deg:=0 imu_yaw_deg:=0`.
 
@@ -400,8 +417,11 @@ TF (`sensor_tf.launch.py`), so there is one place to fix it.
    starting the assistant:
    `export WEARABLE_BRAIN_ARGS="camera_height:=1.32 camera_pitch_deg:=12 lidar_height:=1.18 lidar_yaw_deg:=188"`.
    A camera tilted 10° but configured as 0° puts a floor object 3 m away about 2.5 m too far.
+   The defaults are this rig's, measured from a recording (2026-10-01): camera 52° wide
+   (`WEARABLE_CAMERA_HFOV_DEG`, read by object_perception), tilted 10° down, turned 2° left. A wrong width
+   spreads every object sideways (at 70° a chair 15° left was drawn 21° left, against the wall).
    With the IMU, add its height and the mount `setup_pi.sh imu` printed (section 3b), e.g.
-   `imu_height:=1.15 imu_roll_deg:=-1 imu_pitch_deg:=6 imu_yaw_deg:=1`. If they do not put the IMU's gravity
+   `imu_height:=1.15 imu_roll_deg:=0 imu_pitch_deg:=1 imu_yaw_deg:=1`. If they do not put the IMU's gravity
    upward, the assistant starts the map without the IMU and says so.
 3. **Check the LiDAR overlay:** press **`l`** in the camera window. The dots are the LiDAR returns drawn where TF
    says they are (red = near, blue = far). They should sit on walls, door frames and people's torsos at chest

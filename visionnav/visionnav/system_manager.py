@@ -194,7 +194,8 @@ class SystemManager:
             if proc is None or proc.poll() is not None:
                 cmd = list(spec["cmd"])
                 # The chest IMU, when the Pi publishes it (mpu6050_imu advertises /imu/data only once the chip
-                # answers): Cartographer waits for every sensor it is given, so never without that publisher
+                # answers): Cartographer waits for every sensor it is given, so never without that publisher.
+                # WEARABLE_IMU=0 maps without it.
                 self.imu_note = ""
                 if (part == "brain" and os.environ.get("WEARABLE_IMU", "auto") != "0"
                         and self._node.count_publishers("/imu/data") > 0):

@@ -59,10 +59,13 @@ TRAJECTORY_BUILDER_2D.motion_filter.max_time_seconds = 0.5
 TRAJECTORY_BUILDER_2D.motion_filter.max_distance_meters = 0.10
 TRAJECTORY_BUILDER_2D.motion_filter.max_angle_radians = math.rad(2.)
 
--- Clear dynamic obstacles faster: a miss outweighs a hit (defaults 0.55 / 0.49). Finished submaps are
--- frozen, so old ghosts only fade where newer submaps overlap them. Below ~0.44 thin walls start to erode.
+-- How a wall cell is believed (Cartographer's defaults). A miss of 0.45 (to clear people faster) also erased the
+-- real walls: a chest-worn scan pitches with every step, so a wall is crossed by many near-miss rays. Replays of a
+-- recorded walk (2026-10-01): with 0.49 the map kept 2.4x the wall cells (1347 vs 565), the loop-closure corrections
+-- fell from 0.11 to 0.04 m (median; 90 %: 0.21 to 0.12 m) and the live position stopped jumping. People are kept off
+-- the routes by semantic_costmap.py (tracked, not drawn into this map); a ghost of one fades as it is walked through.
 TRAJECTORY_BUILDER_2D.submaps.range_data_inserter.probability_grid_range_data_inserter.hit_probability = 0.55
-TRAJECTORY_BUILDER_2D.submaps.range_data_inserter.probability_grid_range_data_inserter.miss_probability = 0.45
+TRAJECTORY_BUILDER_2D.submaps.range_data_inserter.probability_grid_range_data_inserter.miss_probability = 0.49
 TRAJECTORY_BUILDER_2D.submaps.range_data_inserter.probability_grid_range_data_inserter.insert_free_space = true
 
 -- Smaller submaps drift less between loop closures in small indoor rooms.

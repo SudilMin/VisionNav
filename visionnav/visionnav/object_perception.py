@@ -387,6 +387,8 @@ LIDAR_CLUSTER_GAP = 0.25     # m, range gap separating an object from what is be
 LIDAR_BODY_RANGE = 0.30      # m, returns closer than this are the wearer's body
 LIDAR_SNAP_RANGE = (0.45, 1.15)  # LiDAR range / camera depth accepted when snapping (near objects: depth net reads long)
 LIDAR_SNAP_PLANE_MARGIN = 0.15   # m: only objects whose top reaches this close to the scan plane may snap to it
+LIDAR_BELOW_PLANE_M = 0.25       # m: a floor object normally this far below the scan plane never takes a LiDAR range
+                                 # (chairs, tables, benches; not barriers, bushes or prams ~1 m tall)
 # Snap regardless of height (the old behaviour), for a rig whose mounting heights in TF are wrong
 LIDAR_SNAP_ANY_HEIGHT = os.environ.get("WEARABLE_LIDAR_SNAP_ANY_HEIGHT", "0") == "1"
 SCAN_MATCH_MAX_DT = 0.25     # s, max image/scan time offset before falling back to latest scan
@@ -411,12 +413,24 @@ DEPTH_WEIGHTS_OUTDOOR = model_path("depth_anything_v2_metric_outdoor_vits.pth")
 DEPTH_MAX = {"indoor": 20.0, "outdoor": 80.0}
 DEPTH_INPUT_SIZE = int(os.environ.get("WEARABLE_DEPTH_SIZE", "392"))  # short side, multiple of 14
 DEPTH_SCALE_MIN_PTS = 15     # LiDAR points needed to (re)calibrate the depth scale
-DEPTH_SCALE_ALPHA = 0.2      # smoothing of the per-frame scale estimate
+# The scale follows the LiDAR slowly and robustly. It was re-estimated on every frame (each frame's estimate weighing
+# 20 %): on the rig it jumped between 0.8 and 2.0 within a session (it held 1.04-1.07 when it worked), so an object
+# was placed up to twice too far one moment and right the next. The depth network's real scale changes slowly.
+DEPTH_SCALE_TAU_S = 6.0      # s: time constant of the scale following the LiDAR
+DEPTH_SCALE_STEP = 0.25      # one frame may pull the scale at most this fraction toward its own estimate
+DEPTH_SCALE_START_FRAMES = 8 # frames whose median starts the scale (no single first frame decides it)
 DEPTH_SCALE_MAX_RESID = 0.15 # a frame whose depth/LiDAR ratios spread more than this is not used to calibrate
 DEPTH_SCALE_FRESH_S = 3.0    # s: the scale only earns the tight range sigma while calibrated this recently
 # Range of the LiDAR scale correction. The outdoor (street-trained) model read a room twice too far on the rig
 # (true scale ~0.5, pinned at the old 0.5 floor), so outdoors it may correct more.
-DEPTH_SCALE_LIMITS = {"indoor": (0.5, 2.0), "outdoor": (0.3, 3.0)}
+DEPTH_SCALE_LIMITS = {"indoor": (0.5, 2.0), "outdoor": (0.3, 3.0)}   # per depth model
+# Outdoor mode uses whichever depth model fits the LiDAR better. The street-trained one cannot tell near from far
+# in a room or a narrow lane (recording ~/visionnav_chair: things 1-1.5 m away read 5.1 m, 2-3 m read 5.5 m; the
+# indoor one 1.1 and 2.6 m): no scale fixes that, and a chair 2.3 m away was placed at 3.2 m, at the wall behind
+# it. On that recording the indoor model fitted the LiDAR better in 136 of 150 frames (spread 3.5% vs 8.5%).
+DEPTH_PICK_EVERY_S = 1.0     # s between comparisons (one extra depth inference each, ~15 ms on the GPU)
+DEPTH_PICK_MARGIN = 0.75     # the other model takes over when its smoothed spread is below this x the current one's
+DEPTH_PICK_MIN_SAMPLES = 3   # comparisons before a switch
 MONO_MAX_POINTS = 2000       # object pixels back-projected per detection
 
 # ── TRACKING PARAMETERS ──
@@ -1091,8 +1105,11 @@ class ObjectPerceptionNode(Node):
             os.makedirs(self._record_dir, exist_ok=True)
 
         # ── CAMERA MODEL ──
-        # Intrinsics: HFOV-derived pinhole unless calibrated values are given.
-        self._camera_hfov = math.radians(float(os.environ.get("WEARABLE_CAMERA_HFOV_DEG", "70.0")))
+        # Intrinsics: HFOV-derived pinhole unless calibrated values are given. 52 deg MEASURED on the rig's camera
+        # (recording ~/visionnav_chair, 2026-10-01): projected into the depth picture, the LiDAR ranges agree with
+        # it on 49-53% of the points ahead at 52 deg, 28% at the 70 deg assumed before, and their breaks fall on the
+        # doorway's edges. 70 deg spread every bearing 1.4x: a chair 15 deg left was drawn 21 deg left, by the wall.
+        self._camera_hfov = math.radians(float(os.environ.get("WEARABLE_CAMERA_HFOV_DEG", "52.0")))
         self._calib_fx = os.environ.get("WEARABLE_CAMERA_FX")
         self._calib_fy = os.environ.get("WEARABLE_CAMERA_FY")
         self._calib_cx = os.environ.get("WEARABLE_CAMERA_CX")
@@ -1100,7 +1117,7 @@ class ObjectPerceptionNode(Node):
         # Extrinsics: read from TF (sensor_tf.launch.py). These env values are only a fallback
         # for running without the brain launch.
         fallback_h = float(os.environ.get("WEARABLE_CAMERA_HEIGHT", "1.3"))
-        fallback_pitch = math.radians(float(os.environ.get("WEARABLE_CAMERA_PITCH_DEG", "0.0")))
+        fallback_pitch = math.radians(float(os.environ.get("WEARABLE_CAMERA_PITCH_DEG", "10.0")))
         cp, sp = math.cos(fallback_pitch), math.sin(fallback_pitch)
         R_pitch = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]])
         self._cam_R = R_pitch @ R_BODY_OPTICAL
@@ -1215,7 +1232,10 @@ class ObjectPerceptionNode(Node):
             # Each mode has its own depth model, with its own scale
             if getattr(self, "_depth_models", None):
                 self._depth_model = self._depth_models.get(self._mode)
+                self._depth_model_name = self._mode
                 self._depth_scale, self._depth_scale_valid, self._depth_scale_t = 1.0, False, -math.inf
+                self._depth_scale_first = []
+                self._depth_fit, self._depth_pick_t = {}, -math.inf
 
             # New window title: the window is replaced by the GUI (main) thread. Qt windows may only be touched
             # from that thread; doing it here, in a ROS callback, crashed the node on every mode switch.
@@ -1562,31 +1582,89 @@ class ObjectPerceptionNode(Node):
         outcome = f"lidar={lidar[0]:.2f}m/{lidar[2]}pts" if lidar is not None else "none"
         self.get_logger().info(f"🔎 LiDAR snap [{label}] depth_hint={depth_hint:.2f}m -> {outcome} | {info}")
 
-    def _update_depth_scale(self, proj, dmap):
-        """Correct the depth network's scale with the LiDAR ranges visible in the same frame."""
-        if proj is None or dmap is None:
-            return
+    @staticmethod
+    def _lidar_fit(proj, dmap, model_name):
+        """(scale, spread) of a depth map against the LiDAR ranges drawn into it: the median LiDAR/depth ratio and
+        the median relative deviation from it. None with too few points."""
         u, v, _, _, zc = proj
         H, W = dmap.shape
         ok = (u >= 0) & (u < W) & (v >= 0) & (v < H) & (zc > 0.4) & (zc < 8.0)
         if ok.sum() < DEPTH_SCALE_MIN_PTS:
-            return
+            return None
         d = dmap[v[ok].astype(int), u[ok].astype(int)]
         ratio = zc[ok] / np.maximum(d, 0.05)
-        lo, hi = DEPTH_SCALE_LIMITS[self._mode]
+        lo, hi = DEPTH_SCALE_LIMITS[model_name]
         ratio = ratio[(ratio > 0.8 * lo) & (ratio < 1.25 * hi)]
         if ratio.size < DEPTH_SCALE_MIN_PTS:
-            return
+            return None
         r = float(np.median(ratio))
-        spread = float(np.median(np.abs(ratio / r - 1.0)))
+        return r, float(np.median(np.abs(ratio / r - 1.0)))
+
+    def _pick_depth_model(self, proj, frame, dmap):
+        """Outdoor mode: every DEPTH_PICK_EVERY_S, the other depth model on the same frame; switch to it when it
+        fits the LiDAR clearly better for a while. Returns the depth map to use for this frame."""
+        models = getattr(self, "_depth_models", {})
+        if (self._mode != "outdoor" or proj is None or dmap is None or not models.get("indoor")
+                or models.get("outdoor") is models.get("indoor")):
+            return dmap
+        now = time.monotonic()
+        if now - getattr(self, "_depth_pick_t", -math.inf) < DEPTH_PICK_EVERY_S:
+            return dmap
+        self._depth_pick_t = now
+        cur = self._depth_model_name
+        other = "indoor" if cur == "outdoor" else "outdoor"
+        try:
+            other_map = self._infer_depth(frame, models[other])
+        except Exception:
+            return dmap
+        fits = {cur: self._lidar_fit(proj, dmap, cur), other: self._lidar_fit(proj, other_map, other)}
+        if fits[cur] is None or fits[other] is None:
+            return dmap
+        hist = getattr(self, "_depth_fit", None)
+        if hist is None:
+            hist = self._depth_fit = {}
+        for name, (_, spread) in fits.items():
+            old = hist.get(name)
+            hist[name] = (spread, 1) if old is None else (0.6 * old[0] + 0.4 * spread, old[1] + 1)
+        if hist[other][1] < DEPTH_PICK_MIN_SAMPLES or hist[other][0] >= DEPTH_PICK_MARGIN * hist[cur][0]:
+            return dmap
+        lo, hi = DEPTH_SCALE_LIMITS[other]
+        self._depth_model, self._depth_model_name = models[other], other
+        self._depth_scale = max(lo, min(hi, fits[other][0]))
+        self._depth_scale_valid, self._depth_scale_t, self._depth_scale_first = True, now, []
+        self._depth_fit = {}
+        self.get_logger().info(f"📏 Depth: the {other} model now (it fits the LiDAR here: "
+                               f"{100 * hist[other][0]:.0f}% vs {100 * hist[cur][0]:.0f}%)")
+        return other_map
+
+    def _update_depth_scale(self, proj, dmap):
+        """Correct the depth network's scale with the LiDAR ranges visible in the same frame."""
+        if proj is None or dmap is None:
+            return
+        fit = self._lidar_fit(proj, dmap, getattr(self, "_depth_model_name", self._mode))
+        if fit is None:
+            return
+        r, spread = fit
+        lo, hi = DEPTH_SCALE_LIMITS[getattr(self, "_depth_model_name", self._mode)]
         if spread > DEPTH_SCALE_MAX_RESID:
             return  # LiDAR and depth disagree in shape this frame (glitch / wrong row): keep the old scale
-        self._depth_scale = r if not self._depth_scale_valid else (
-            (1 - DEPTH_SCALE_ALPHA) * self._depth_scale + DEPTH_SCALE_ALPHA * r)
+        now = time.monotonic()
+        if not self._depth_scale_valid:
+            # Start from the median of the first few good frames
+            self._depth_scale_first = getattr(self, "_depth_scale_first", []) + [r]
+            if len(self._depth_scale_first) < DEPTH_SCALE_START_FRAMES:
+                return
+            self._depth_scale = float(np.median(self._depth_scale_first))
+            self._depth_scale_first = []
+        else:
+            # Log-domain low-pass with a clipped step: one odd frame barely moves it, a real change takes seconds
+            alpha = 1.0 - math.exp(-min(1.0, now - self._depth_scale_t) / DEPTH_SCALE_TAU_S)
+            step = math.log(max(1.0 / (1 + DEPTH_SCALE_STEP), min(1 + DEPTH_SCALE_STEP, r / self._depth_scale)))
+            self._depth_scale *= math.exp(alpha * step)
         self._depth_scale = max(lo, min(hi, self._depth_scale))
         self._depth_scale_valid = True
         self._depth_scale_resid = spread
-        self._depth_scale_t = time.monotonic()
+        self._depth_scale_t = now
 
     def _mono_object(self, det, K, dmap):
         """Back-project the object's own pixels with metric depth.
@@ -1725,7 +1803,13 @@ class ObjectPerceptionNode(Node):
         # (its own mask is too small to contain a scan point)
         obj_mask = None if label in WALL_MOUNTED else det.get("mask")
         lidar_info = {} if lidar_debug is None else lidar_debug
-        lidar = self._lidar_hits_in_box(proj, det["box"], obj_mask, depth_hint=snap_hint, debug=lidar_info)
+        # A floor object normally well below the scan plane (a chair 0.88 m, a table 0.75 m: the LiDAR is at 1.2 m)
+        # is never hit, even with its top cut off by the frame (then the height check above cannot run): close up,
+        # a chair filling the picture took the range of the wall behind it, 1.0 m for a chair half that far
+        below_plane = (not LIDAR_SNAP_ANY_HEIGHT and known_size and on_floor and not is_dynamic
+                       and self._lidar_t is not None and typ_h < self._lidar_t[2] - LIDAR_BELOW_PLANE_M)
+        lidar = None if below_plane else self._lidar_hits_in_box(proj, det["box"], obj_mask, depth_hint=snap_hint,
+                                                                 debug=lidar_info)
         if lidar_debug is not None:
             self._log_lidar_snap_debug(label, depth, lidar, lidar_debug)
         # Returns inside the object's own mask at the scan row are the object: no optical estimate may veto
@@ -1904,6 +1988,7 @@ class ObjectPerceptionNode(Node):
                 self._depth_models[mode] = model.cuda().half().eval()
             self._depth_models.setdefault("outdoor", self._depth_models.get("indoor"))
             self._depth_model = self._depth_models.get(self._mode)
+            self._depth_model_name = self._mode
             self._depth_mean = torch.tensor([0.485, 0.456, 0.406], device='cuda').view(1, 3, 1, 1)
             self._depth_std = torch.tensor([0.229, 0.224, 0.225], device='cuda').view(1, 3, 1, 1)
             self.get_logger().info(f"Metric depth: Depth Anything V2 indoor"
@@ -1942,9 +2027,11 @@ class ObjectPerceptionNode(Node):
 
     @staticmethod
     def _gpu_full(e) -> bool:
-        # A TensorRT engine that could not get its memory surfaces as a None engine in Ultralytics
+        # A TensorRT engine that could not get its memory surfaces as a None engine in Ultralytics. cuBLAS/cuDNN
+        # report it as ALLOC_FAILED: with the vision AI loaded first (3.1 GB of the 4 GB), every frame failed with
+        # "CUBLAS_STATUS_ALLOC_FAILED", which was not taken for a full GPU, and nothing was detected in either mode
         text = str(e).lower()
-        return "out of memory" in text or "create_execution_context" in text
+        return any(k in text for k in ("out of memory", "create_execution_context", "alloc_failed"))
 
     def _free_vision_ai(self) -> bool:
         """GPU full: unload the vision AI (Qwen3-VL in Ollama). The obstacle warnings come first; Ollama loads it
@@ -2720,6 +2807,7 @@ class ObjectPerceptionNode(Node):
         proj = self._project_scan(self._scan_for_stamp(msg_stamp), K, h)
         with self._hud_lock:
             self._lidar_overlay = None if proj is None else (proj[0], proj[1], proj[3])
+        dmap = self._pick_depth_model(proj, frame, dmap)
         self._update_depth_scale(proj, dmap)
         if self._grasp.active:
             self._grasp_step(frame, dets, dmap, K)
@@ -3048,7 +3136,10 @@ class ObjectPerceptionNode(Node):
     # ── OUTDOOR: live hazards (outdoor_awareness.py) ──
     # ══════════════════════════════════════════════════════════════════════
     def _scan_xy_base(self, scan):
-        """All LiDAR returns (360°) in base_footprint (N,2), the wearer's body excluded, or None."""
+        """The LiDAR returns in front of and beside the wearer in base_footprint (N,2), or None. Behind them
+        (past oa.FRONT_LIMIT_DEG from straight ahead) is their own body and what they have walked past: the
+        chest LiDAR spins all round, but those returns are dropped here, for the walking corridor, the objects,
+        the occupancy view and the odometry (the body moves with the wearer and held the scan match still)."""
         if scan is None or self._lidar_R is None or scan.header.frame_id != self._lidar_frame:
             return None
         ranges = np.asarray(scan.ranges, dtype=np.float64)
@@ -3056,7 +3147,8 @@ class ObjectPerceptionNode(Node):
         ok = np.isfinite(ranges) & (ranges >= max(scan.range_min, LIDAR_BODY_RANGE)) & (ranges <= scan.range_max)
         r, a = ranges[ok], angles[ok]
         pts = np.stack([r * np.cos(a), r * np.sin(a), np.zeros_like(r)], axis=1) @ self._lidar_R.T + self._lidar_t
-        return pts[:, :2]
+        front = np.abs(np.degrees(np.arctan2(pts[:, 1], pts[:, 0]))) <= oa.FRONT_LIMIT_DEG
+        return pts[front, :2]
 
     def _project_base(self, pts, K):
         """Pixels (u, v) of base_footprint points (N,3); v is NaN behind the camera."""
@@ -3108,8 +3200,8 @@ class ObjectPerceptionNode(Node):
                 "length_m": (far[0] - near[0]) if far is not None else None}
 
     def _outdoor_scan(self, msg, t_rx):
-        """Every LiDAR scan in outdoor mode: the wearer's motion, the occupancy grid (360°), and the objects ahead
-        of and beside them (nothing behind is tracked). Times are when the scan arrived (monotonic), the same clock
+        """Every LiDAR scan in outdoor mode: the wearer's motion, the occupancy grid and the objects ahead of and
+        beside them (the scan's rear half is dropped: _scan_xy_base). Times are when the scan arrived (monotonic), the same clock
         as the camera frames."""
         self._refresh_extrinsics(t_rx)
         xy = self._scan_xy_base(msg)

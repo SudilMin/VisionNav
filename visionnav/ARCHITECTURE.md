@@ -26,7 +26,7 @@ VisionNav adapts to its environment to provide the safest experience.
 
 ## 4. Navigation & Feedback Mechanisms
 VisionNav offers dual-modality feedback to ensure the user is safely guided to their destination:
-* **Voice Navigation:** A voice assistant utilizing Piper TTS provides clean, turn-by-turn auditory directions (e.g., "Bear slightly right. 3 feet remaining.", "You have arrived at the chair.").
+* **Voice Navigation:** A voice assistant utilizing Piper TTS provides clean, turn-by-turn auditory directions (e.g., "Bear slightly right, 1 o'clock. 6 feet.", "You have arrived. The chair is at 12 o'clock, about 2 feet away.").
 * **Vibration Navigation (The "Last Inch" Grasping System):** While voice navigation gets the user to the correct side of the room, grasping the actual object is notoriously difficult for the blind. VisionNav pairs with a Bluetooth-enabled haptic wristband. As the user reaches out, the system calculates the Euclidean distance between their hand and the target object, modulating the vibration frequency to peak exactly when their hand touches the object.
 
 ## 5. Hardware Interface: ESP32 Smart Buttons

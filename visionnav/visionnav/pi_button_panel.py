@@ -12,18 +12,20 @@ pin reads 1 when released and 0 when pressed). Default pins (BCM numbering / phy
                                 already on: said again; one of them stopped (camera unplugged): all restarted
                            hold: turn them off, at once, while the button is still down (no laptop needed)
   LOOK    GPIO17 / pin 11  tap: describe what is in front (Qwen3-VL)   hold: ask the camera a question (speak)
+                           double tap: the vision AI off (frees its GPU memory)
   MODE    GPIO27 / pin 13  tap: switch indoor <-> outdoor
                            hold: the laptop closes the map and the camera feed (the sensors stay on)
   HAND    GPIO22 / pin 15  tap: guide the hand to the object found last (walks there first if it is far);
                                 tap again to stop        hold: hand guidance off
+                           double tap: face mode (then tap: who is it; hold: say a name to remember the face)
   TALK    GPIO23 / pin 16  hold (indoor mode): say where to go, the laptop guides you there
-                           double tap: end the navigation (not navigating: what is around me)   tap: quiet
+                           tap: end the navigation (otherwise nothing)   double tap: what is around me
   GND     pin 14 (or 9, 20, 25) shared by all buttons
 
 Publishes /button_event (std_msgs/String, JSON): {"button": "sensors"|"look"|"mode"|"hand"|"talk",
 "event": "tap"|"double"|"hold_start"|"hold_end"}, and /pi_sensors_state (latched String: "off", "starting",
 "on", "stopping", "failed"). voice_navigation_assistant (on the laptop) acts on the events and speaks the
-results. A tap is published the moment the button is released (STOP must not wait for a possible second tap);
+results. A tap is published the moment the button is released (it must not wait for a possible second tap);
 a "double" follows when a second tap comes within DOUBLE_TAP_S. A hold is acted on when it is recognised
 (HOLD_S after the press), not at the release.
 

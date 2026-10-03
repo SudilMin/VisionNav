@@ -155,7 +155,12 @@ DROP_MAX_RANGE = 5.0         # m: holes are only trusted this close (depth error
 # ── TRACKING (body frame, everything moves relative to a walking wearer) ──
 TRACK_ACCEL = {"vehicle": 8.0, "mover": 3.0, "static": 1.5}  # m^2/s^3 white-noise acceleration
 TRACK_MAX_GAP_S = 0.8        # s a track survives unseen
-TRACK_CONFIRM_HITS = 2       # sightings before it is reported (kills one-frame hallucinations)
+TRACK_CONFIRM_HITS = 3       # camera sightings before it is reported (kills one- and two-frame hallucinations)
+# What the camera named is kept only while the camera keeps seeing it. The LiDAR returns near it used to keep it
+# alive for good: a "bus stop" the camera saw twice on a wall, and a "person" in a doorway, stayed on the view and in
+# the warnings while the camera looked straight at the wall and saw neither.
+CAM_KEEP_IN_VIEW_S = 1.0     # s a named object in the camera's view lasts without the camera seeing it
+CAM_KEEP_BESIDE_S = 4.0      # s once out of the camera's view (beside the wearer; the LiDAR still warns, unnamed)
 DROP_CONFIRM_HITS = 3        # ground hazards are noisier (texture): one more sighting
 TRACK_GATE_M = {"vehicle": 4.0, "mover": 1.5, "static": 1.2}  # m association gate (+ speed * dt)
 SPEED_MIN_AGE_S = 0.5        # s tracked before its speed is trusted
@@ -176,7 +181,7 @@ DROP_WARNING_M = 4.5
 OVERHEAD_CRITICAL_M = 1.5
 OVERHEAD_WARNING_M = 3.5
 PERSON_WARNING_M = 2.0       # a person in the path this close (and not walking away)
-CAMERA_HALF_FOV_DEG = 38.0   # beyond this bearing only the LiDAR sees an object
+CAMERA_HALF_FOV_DEG = 26.0   # beyond this bearing only the LiDAR sees an object (camera: 52 deg wide)
 FRONT_LIMIT_DEG = 100.0      # farther round than this from straight ahead is behind the wearer: not tracked, drawn
                              # or said (someone walking behind was "Something coming behind you" again and again)
 SIDE_MIN_SPEED = 1.2         # m/s of its own: something coming from the side (needs odometry)
@@ -554,7 +559,7 @@ def lidar_corridor(xy: np.ndarray):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ── LIDAR OBJECTS (360°) ──
+# ── LIDAR OBJECTS (ahead and beside the wearer) ──
 # ══════════════════════════════════════════════════════════════════════
 CLUSTER_GAP = 0.20           # m (+ CLUSTER_GAP_PER_M x range) between neighbouring returns of one object
 CLUSTER_GAP_PER_M = 0.03
@@ -611,8 +616,8 @@ OCC_FREE_SHOW = -0.8         # ...below which it is walkable free space
 
 
 class LocalOccupancy:
-    """What is occupied and what is free around the wearer, from the last few seconds of LiDAR (360°, chest
-    height) and depth (ahead: low obstacles and drops). World-fixed while the wearer's motion is known, so a
+    """What is occupied and what is free around the wearer, from the last few seconds of LiDAR (ahead and
+    beside, chest height) and depth (ahead: low obstacles and drops). World-fixed while the wearer's motion is known, so a
     wall stays put while they walk; without odometry, just the latest scan in the body frame. It forgets on its
     own (OCC_HALF_LIFE_S) and is never saved: a live picture, not a map."""
 
@@ -959,10 +964,18 @@ class OutdoorTracker:
             t = OutdoorTrack(m, now, ego)
             m["track"] = t
             self.tracks.append(t)
-        # Gone: not seen for a moment, or now behind the wearer (they walked past it, or turned round)
+        # Gone: not seen for a moment, or now behind the wearer (they walked past it, or turned round), or named by
+        # the camera that no longer sees it (CAM_KEEP_*)
         self.tracks = [t for t in self.tracks
-                       if now - t.last_seen <= TRACK_MAX_GAP_S and not behind(*t.body_xy(ego))]
+                       if now - t.last_seen <= TRACK_MAX_GAP_S and not behind(*t.body_xy(ego))
+                       and (t.label is None or t.cam_hits == 0 or now - t.last_cam <= self._cam_keep(t, ego))]
         return [t for t in self.tracks if t.confirmed]
+
+    @staticmethod
+    def _cam_keep(t, ego):
+        x, y = t.body_xy(ego)
+        in_view = x > 0.3 and abs(math.degrees(math.atan2(y, x))) < 0.85 * CAMERA_HALF_FOV_DEG
+        return CAM_KEEP_IN_VIEW_S if in_view else CAM_KEEP_BESIDE_S
 
     def confirmed(self):
         """Confirmed objects ahead of and beside the wearer (as of the last set_view)."""
