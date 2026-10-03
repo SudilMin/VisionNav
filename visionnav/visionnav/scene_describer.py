@@ -63,14 +63,16 @@ def speak(text):
 # ── VLM Model Configuration ──
 VLM_MODEL = "qwen3-vl:2b-instruct"
 SYSTEM_PROMPT = (
-    "You are the eyes of a blind person, looking through a camera on their chest. Answer their "
-    "question about this image in one to three short, complete spoken sentences. Only mention what "
-    "is clearly visible; if you cannot tell, say so. Give left and right from the wearer's point of "
-    "view, and mention anything in their way when it matters for walking. Give distances in feet. "
-    "Do not rely on colours to tell things apart (they may never have seen colour): use position, "
-    "shape, size and what things are next to; name a colour only when asked about it."
+    "You are the eyes of a blind person, looking through a camera on their chest. Answer exactly the question "
+    "they ask and nothing else, in one short spoken sentence. Do not describe anything the question did not ask "
+    "about. If you cannot tell, say so. Speak to the wearer: directions are their left and right, not yours."
 )
-ANSWER_TOKENS = 256
+DESCRIBE_PROMPT = (
+    "Say only the most important things in front of the wearer, nearest first, in at most two short spoken "
+    "sentences. Give left and right from their point of view and distances in feet. No colours."
+)
+ANSWER_TOKENS = 60      # a question: one short sentence
+DESCRIBE_TOKENS = 100   # "describe": two short sentences
 KEEP_ALIVE = "30m"   # keep the model in VRAM between questions
 # The Pi's ROS camera stream arrives mirrored (as in object_perception): flip it back so that
 # "left" in the answer is the wearer's left. Override with WEARABLE_CAMERA_FLIP=0/1.
@@ -112,16 +114,26 @@ class OfflineVLM:
         return ollama.chat(model=VLM_MODEL, messages=messages, keep_alive=KEEP_ALIVE, think=False,
                            options={'num_predict': num_predict, 'temperature': 0.2})
 
+    @staticmethod
+    def _sentences(text, n):
+        """The first `n` complete sentences (a small model does not always keep to the asked length)."""
+        parts = [p for p in re.split(r'(?<=[.!?])\s+', text.strip()) if p]
+        whole = [p for p in parts if p[-1] in ".!?"]
+        return " ".join((whole or parts)[:n])
+
     def describe(self, image_np, question=DEFAULT_QUESTION):
         """Answer a question about a BGR image."""
+        describing = question.strip().lower().rstrip(".") in (
+            "describe", DEFAULT_QUESTION.lower().rstrip("."), "describe what you see in this image in one sentence")
         try:
             response = self._chat([
-                {'role': 'system', 'content': SYSTEM_PROMPT},
+                {'role': 'system', 'content': DESCRIBE_PROMPT if describing else SYSTEM_PROMPT},
                 {'role': 'user', 'content': question, 'images': [self._jpeg(image_np)]},
-            ])
+            ], num_predict=DESCRIBE_TOKENS if describing else ANSWER_TOKENS)
         except Exception as e:
             return f"Error connecting to Ollama: {e}"
         answer = re.sub(r'<think>.*?</think>', '', response['message']['content'], flags=re.DOTALL).strip()
+        answer = self._sentences(answer, 2 if describing else 1)
         return answer or "I can see the scene but could not answer that. Please ask again."
 
 
