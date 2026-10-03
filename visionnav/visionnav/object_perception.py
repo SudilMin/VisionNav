@@ -1020,6 +1020,8 @@ class ObjectPerceptionNode(Node):
         # one interrupting); /outdoor_scene: what is ahead, 2 Hz (JSON; "what is around me", the status)
         self._outdoor_tracker = oa.OutdoorTracker()
         self._alert_policy = oa.AlertPolicy()
+        self._hazard_confirm = oa.HazardConfirm()
+        self._turn_until = -math.inf  # until when the wearer counts as turning fast
         self._outdoor_alert_pub = self.create_publisher(String, "/outdoor_alert", 10)
         self._outdoor_scene_pub = self.create_publisher(String, "/outdoor_scene", 10)
         # RViz outdoor view (rviz/visionnav_outdoor.rviz, fixed frame base_footprint): only what is detected now
@@ -1148,6 +1150,7 @@ class ObjectPerceptionNode(Node):
                 self._hud_tracks.clear()
             self._outdoor_tracker.clear()
             self._alert_policy.reset()
+            self._hazard_confirm.reset()
             self._outdoor_hud = None
             clear = Marker()
             clear.action = Marker.DELETEALL
@@ -3086,9 +3089,11 @@ class ObjectPerceptionNode(Node):
         ground = oa.analyze_ground(dmap, K, self._cam_R, self._cam_t, dscale,
                                    exclude_boxes=[m["box"] for m in meas if m["label"] in oa.MOVERS]) \
             if dmap is not None else None
-        # Zebra crossings: the detector rarely finds them; the white-stripe pattern does
+        ground = self._hazard_confirm.apply(ground)
+        # Zebra crossings: the detector rarely finds them; the white-stripe pattern does. Only on a floor found in
+        # the depth (stripes must lie on it): a chair's slats or a window's bars are not a crossing
         horizon = self._horizon_row(K, h)
-        zebra = oa.find_zebra_crossing(frame, horizon)
+        zebra = oa.find_zebra_crossing(frame, horizon) if ground is not None and ground.fitted else None
         if zebra is not None and not any(m["label"] in oa.CROSSINGS and _box_overlap(m["box"], zebra) > 0.3
                                          for m in meas):
             zm = self._crossing_measurement(zebra, K, ground)
@@ -3115,7 +3120,9 @@ class ObjectPerceptionNode(Node):
             gxy = np.stack([gx, gy], 1)
             self._occ.add_ground(ego, gxy[near & (hgt > oa.OBSTACLE_MIN_H) & (hgt < oa.HEAD_LOW)],
                                  gxy[near & (hgt < -oa.DROP_MIN_H) & (gx < oa.DROP_MAX_RANGE)], t_meas)
-        alerts, lanes = oa.assess(tracks, lidar, ground)
+        if vel_now is not None and abs(vel_now[2]) > oa.SIDE_TURN_RATE:
+            self._turn_until = now + oa.SIDE_TURN_HOLD_S
+        alerts, lanes = oa.assess(tracks, lidar, ground, turning=now < self._turn_until)
         self._publish_outdoor_markers(tracks, alerts, lanes, lidar, ground, now, vel_now)
         if now - self._last_occ_pub >= 0.2:
             self._last_occ_pub = now

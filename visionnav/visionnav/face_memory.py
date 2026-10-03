@@ -74,17 +74,56 @@ class FaceMemory:
         people = [(*self._best(feat), cx) for _, feat, cx in self._faces(bgr)]
         return sorted(people, key=lambda p: p[2])
 
-    def remember(self, name, bgr):
-        """Remember the largest face in the picture as `name`. Returns "ok", "no_face" or "several" (more than
-        one face of about the same size: which one is meant is not clear)."""
+    def _main_face(self, bgr):
+        """Feature of the one face the wearer means (the largest), or "no_face" / "several" (more than one face
+        of about the same size: which one is meant is not clear)."""
         faces = self._faces(bgr)
         if not faces:
             return "no_face"
         if len(faces) > 1 and faces[1][0][2] * faces[1][0][3] > 0.6 * faces[0][0][2] * faces[0][0][3]:
             return "several"
-        samples = self._people.setdefault(name, [])
-        samples.append(faces[0][1])
+        return faces[0][1]
+
+    def _take_face(self, feat, names):
+        """Remove the samples of `names` that match this face; a name left without samples is forgotten.
+        Returns the names that had it."""
+        had = []
+        for n in list(names):
+            keep = [v for v in self._people[n] if float(feat @ v) < MATCH_COSINE]
+            if len(keep) < len(self._people[n]):
+                had.append(n)
+                if keep:
+                    self._people[n] = keep
+                else:
+                    del self._people[n]
+        return had
+
+    def remember(self, name, bgr):
+        """Remember the largest face in the picture as `name`. A face can have only one name: the same face kept
+        under another name (a misheard name) is taken from it. Returns (status, [names that had this face]),
+        status "ok", "no_face" or "several"."""
+        feat = self._main_face(bgr)
+        if isinstance(feat, str):
+            return feat, []
+        key = next((n for n in self._people if n.lower() == name.lower()), name)
+        replaced = self._take_face(feat, [n for n in self._people if n != key])
+        samples = self._people.setdefault(key, [])
+        samples.append(feat)
         del samples[:-SAMPLES_PER_NAME]
+        self._save()
+        return "ok", replaced
+
+    def not_this(self, name, bgr):
+        """"No, not Jordan": the face in front is not `name`. Returns "ok", "unknown_name", "no_match" (it was
+        not kept under that name), "no_face" or "several"."""
+        key = next((n for n in self._people if n.lower() == name.lower()), None)
+        if key is None:
+            return "unknown_name"
+        feat = self._main_face(bgr)
+        if isinstance(feat, str):
+            return feat
+        if not self._take_face(feat, [key]):
+            return "no_match"
         self._save()
         return "ok"
 

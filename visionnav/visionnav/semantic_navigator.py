@@ -40,11 +40,12 @@ from rclpy.time import Time
 from std_msgs.msg import String
 
 # The user should end within arm's reach: about 0.25 m between their body and the object's edge.
-APPROACH_DIST = 0.45        # m from the object's centre to where the user stops, along the user->object line
+APPROACH_DIST = 0.35        # m from the object's centre to where the user stops, along the user->object line
 MIN_EDGE_CLEARANCE = 0.25   # m from the object's edge (decides for wide objects: tables, sofas)
-ARRIVED_RADIUS = 0.15       # m from the stopping point
+ARRIVED_RADIUS = 0.08       # m from the stopping point
 REPLAN_PERIOD = 1.0         # s
-MAX_APPROACH_COST = 90      # costmap value (0-100): anything below Nav2's "inscribed" (99) is standable
+MAX_APPROACH_COST = 98      # costmap value (0-100): anything below Nav2's "inscribed" (99, closer than the body's
+                            # 0.25 m radius to an obstacle) is standable
 APPROACH_ANGLES = sorted(range(-180, 180, 15), key=abs)  # 0 = straight between user and object
 ANGLE_PENALTY = 0.4         # cost points per degree away from the side facing the user
 PLANNER_ID = 'GridBased'
@@ -56,8 +57,8 @@ CLEAR_COST = 70              # costmap value (0-100): below this, a line needs n
 POSITION_ERROR_ALLOWANCE = 0.8  # m a camera-only (no LiDAR hit) sighting can be off by (seen live)
 BODY_CLEARANCE = 0.30        # m from an obstacle's surface where Nav2's cost first reaches "blocked"
                              # (body radius 0.25 + inflation), i.e. where a walking ray stops
-STOP_MARGIN = 0.05           # m to back off from a blocking cell that turned out to be the target
-                             # (the block is already ~0.27 m from its edge: Nav2's body radius + margin)
+STOP_MARGIN = 0.0            # m to back off from a blocking cell that turned out to be the target
+                             # (the block is already ~0.25 m from its edge: Nav2's body radius)
 GOAL_MOVE_TOLERANCE = 0.3    # m: recompute the chosen goal once the object has moved this much
 
 

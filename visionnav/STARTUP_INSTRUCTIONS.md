@@ -52,13 +52,15 @@ VisionNav runs on two computers:
 | | hold | Click → stops hand guidance (and the walk to the object), and closes the camera AI and its camera window if the HAND button opened it (no mode running): "Hand guidance off. Camera closed." In indoor or outdoor mode the camera stays (the mode needs it; MODE hold closes it): "Hand guidance off." Nothing running: "Hand guidance is already off." |
 | | double tap | **Face mode** on / off: "Face mode. Press to recognise a person. Hold and say a name to remember them." / "Face mode off." In face mode: **tap** → who is in front: "This is Kamal." / "I see 2 people: Kamal on your left, and someone I do not know on your right." / "I don't know this person…"; **hold** → beep → say the name ("Kamal", "his name is Kamal") → let go → "I will remember Kamal." (the largest face in view; do it again from another angle to recognise them better). Faces are kept for another day, on this laptop only (`~/.visionnav/faces/faces.json`). A HAND tap waits 0.45 s to see whether a second one follows. |
 | **TALK** | tap | While navigating: **ends the navigation** → "Navigation stopped." Otherwise nothing. |
-| | hold | **Navigation (indoor mode only).** Beep → say where to go while holding ("chair", "chair 1" — the ID shown on the map and camera window —, "the table with the cup", "my chair", "kitchen") → let go → "Taking you to the chair…" → turn-by-turn guidance, always with the clock direction and the feet left ("Turn left, to 10 o'clock. 12 feet.", "Bear slightly right, 1 o'clock. 6 feet.", "Straight ahead. 3 feet."; every 2 feet in the last 12 feet) → "You have arrived. The chair is at 12 o'clock, about 2 feet away." (where it is from where you stopped, for your last step) and the navigation ends (no hand guidance; the HAND button does that). A command also works here ("status", "save this place as kitchen", "call this my chair"). Not in indoor mode: "You can't use navigation now. It works only in indoor mode." |
+| | hold | **Navigation (indoor mode only).** Beep → say where to go while holding ("chair", "chair 1" — the ID shown on the map and camera window —, "the table with the cup", "my chair", "kitchen") → let go → "Taking you to the chair…" → turn-by-turn guidance, always with the clock direction and the feet left ("Turn left, to 10 o'clock. 12 feet.", "Bear slightly right, 1 o'clock. 6 feet.", "Straight ahead. 3 feet."; every 2 feet in the last 12 feet, every foot in the last 4) → "You have arrived. The chair is at 12 o'clock, within reach." (where it is from where you stopped, about an arm's length from its near edge) and the navigation ends (no hand guidance; the HAND button does that). A command also works here ("status", "save this place as kitchen", "call this my chair"). Not in indoor mode: "You can't use navigation now. It works only in indoor mode." |
 | | double tap | What is around you |
 
 A hold is 0.6 s and acts at that moment, with the button still down; a double tap is two taps within 0.4 s. The
 Pi reads the buttons 200 times a second, so a very short press counts and a poor contact does not split one press
 into several. Every tap clicks, and so does a SENSORS, LOOK or MODE
-hold once it is long enough (let go). What a button did is said once, when it is done. If the camera or LiDAR stream stops
+hold once it is long enough (let go). What a button did is said once, when it is done. MODE presses are carried
+out one after another and the last one wins: three quick taps from indoor end in outdoor mode, and only that final
+state is said ("Outdoor mode."); a press made while modes are switching is never refused. If the camera or LiDAR stream stops
 you hear "The camera signal is lost." ("Sensors turned on." when it returns), and if the Pi drops off the
 network, "The Pi is not answering. Check that it is switched on and on the same Wi-Fi."
 
@@ -93,11 +95,15 @@ with the distance in feet and the direction — **one sentence at a time, about 
 
 * However many things are in your path, only the nearest / most urgent one is spoken about ("Chair ahead, 1 foot.
   Step right."); the next one is announced once that one is out of the way.
-* It is said again only when it gets much closer, becomes a danger, or after a while (4 s for a danger, 8 s for a
-  warning, twice as long each time while nothing changes — standing in front of a table is not repeated forever).
+* It is said again only when it becomes more urgent (a warning turning into a danger) or after a while (6 s for a
+  danger, 15 s for a warning, twice as long each time while nothing changes), never just because it came a little
+  closer. Between two warnings there are at least 2.5 s of silence (dangers can come sooner).
+* Holes, drops and head-height hazards found in the depth picture are said only once seen in several frames, and
+  only when the floor itself is visible (a chair seat or a table top is never taken for the ground). Something
+  coming from the side is not said while you are turning (your own turn makes things beside you seem to move).
 * A sentence is never cut off by another one of the same urgency. Only a greater danger cuts in: a danger over a
   warning or over anything else being said, and "Stop. Car coming…" over any other danger.
-* A warning that could not be said within 2 s (the voice was busy) is dropped instead of being said late.
+* A warning that could not be said within 1.5 s (the voice was busy) is dropped instead of being said late.
 * What is shown and said follows the camera: an object it named disappears 1 s after the camera stops
   seeing it (4 s once it is beside you, out of the camera's view; the LiDAR still warns there, unnamed).
 * Nothing behind you is tracked or said. The LiDAR spins all round, but its returns behind you (more than 100°

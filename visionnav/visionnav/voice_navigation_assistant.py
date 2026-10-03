@@ -46,7 +46,8 @@ TTS_MODEL = model_path("en_US-lessac-medium.onnx")
 # Memory-anchored arrival: the target's map position is locked when navigation starts (a low object drops below the
 # chest sensors in the last metre), and arrival is decided by the SLAM distance to that point.
 ARRIVAL_RADIUS = 0.6  # m from the locked point: a named place
-OBJECT_ARRIVAL_RADIUS = 0.45  # m from an object's centre
+OBJECT_REACH_GAP = 0.35   # m between the wearer and an object's near edge: arrived, within arm's reach
+REACH_SAY_GAP = 0.6       # m: an object this close to the wearer is said to be "within reach"
 # Grasp mode: guide the hand to an object ("grasp cup"), also started on arrival at an object
 GRASP_COMMANDS = ("grasp ", "grab ", "pick up ", "reach for ")
 GRASP_TOL = 0.05          # m left/right or up/down still worth a cue
@@ -77,6 +78,8 @@ FRAME_MAX_AGE_S = 1.5     # a camera picture older than this is not used to reco
 WHO_COMMANDS = ("who is this", "who is it", "who is here", "who is in front of me", "who is there",
                 "who s this", "whos this", "who s there", "whos there")
 NAME_LEADS = ("his name is ", "her name is ", "their name is ", "this is ", "it is ", "it s ", "name ")
+CORRECTION_WORDS = ("no", "nope", "wrong")  # "no, this is Sudil" / "no, not Jordan": a correction, not a name
+MAX_NAME_WORDS = 3        # a longer sentence is not a name
 # The Pi's camera stream arrives mirrored (as for object_perception and the vision AI): flipped back so that
 # "on your left" is the wearer's left
 FLIP_CAMERA = os.environ.get("WEARABLE_CAMERA_FLIP", "1") == "1"
@@ -122,7 +125,7 @@ OUTDOOR_LOUD = ("warnings on", "unmute", "unmute warnings", "talk to me", "resum
 HELP_COMMANDS = ("help", "what can i do", "what can i say", "how does it work")
 STOP_COMMANDS = ("stop", "stop navigation", "cancel", "stop it")
 # Outdoor mode (object_perception + outdoor_awareness.py): spoken hazard alerts on /outdoor_alert
-ALERT_MAX_AGE_S = 2.0     # an alert whose turn to be spoken comes after this long is out of date (the wearer has moved on)
+ALERT_MAX_AGE_S = 1.5     # an alert whose turn to be spoken comes after this long is out of date (the wearer has moved on)
 ALERT_MUTE_TAP_S = 6.0    # stopping everything quiets non-critical alerts this long (critical ones are always spoken)
 ALERT_MUTE_SAID_S = 120.0 # "quiet warnings": non-critical alerts off this long (or until "warnings on")
 SCENE_MAX_AGE_S = 3.0
@@ -310,7 +313,16 @@ class FindObjectNode(Node):
         self._mode_pub = self.create_publisher(String, '/perception_mode', 10)
         self._ptt = PushToTalk()
         self._sys = SystemManager(self, log=lambda m: print(f"⚙️  {m}"))
-        self._switching = False     # a mode switch (starting/stopping parts) is under way
+        # MODE and sensor requests are carried out one at a time by _mode_worker; a newer one replaces one still
+        # waiting, and what is said about an older one is dropped (_say), so quick presses end in one clear state
+        self._want = None           # the latest request not yet carried out: ("mode", m), ("off",), ...
+        self._want_gen = 0          # +1 per request
+        self._doing_gen = 0         # _want_gen of the request being carried out
+        self._want_lock = threading.Lock()
+        self._want_event = threading.Event()
+        self._mode_busy = False     # a request is being carried out (parts starting / stopping)
+        self._intended = self._mode  # the mode the presses so far lead to (each MODE tap toggles it)
+        self._intended_off = False  # the last press was a MODE hold: the next tap starts the same mode again
         self._off = False           # all modes turned off with a MODE hold while the sensors stay on: they stay
                                     # off until a MODE tap
         self._turning_off = False   # a MODE hold is under way: it says what is off, once
@@ -333,8 +345,6 @@ class FindObjectNode(Node):
         self.create_subscription(String, '/scene_description', self._description_callback, 10)
         self.create_subscription(String, '/button_event', self._button_callback, 10)
         self._active = False  # the current mode's parts are running
-        if AUTOSTART == "now":
-            threading.Thread(target=self._switch_mode, args=(self._mode, True), daemon=True).start()
         self._sensor_ok = {}
         self._pi_sensors = None  # the Pi's SENSORS button state (pi_button_panel, latched)
         threading.Thread(target=self._system_watch, daemon=True).start()
@@ -388,6 +398,9 @@ class FindObjectNode(Node):
         self.create_subscription(String, '/outdoor_scene', self._outdoor_scene_callback, 10)
         threading.Thread(target=self._alert_loop, daemon=True).start()
         
+        threading.Thread(target=self._mode_worker, daemon=True).start()
+        if AUTOSTART == "now":
+            self._request(("start",))
         self.get_logger().info("Find Object Node Started! Waiting for AI to map objects...")
         
         # Commands (typed, or spoken with push-to-talk) are handled one at a time by main_logic_loop
@@ -421,17 +434,20 @@ class FindObjectNode(Node):
         subprocess.run(["piper", "--model", TTS_MODEL, "--output_file", wav_path], input=text.encode(),
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    def speak(self, text, expires=None, rank=0):
+    def speak(self, text, expires=None, rank=0, still=None):
         """Speak text aloud (Piper TTS). One sentence at a time, in order; stop_speech() cuts it off.
 
         `expires` (monotonic time): a warning still waiting for its turn by then is dropped, not said late.
-        `rank`: how urgent it is, for what may cut it off (_outdoor_alert_callback)."""
+        `rank`: how urgent it is, for what may cut it off (_outdoor_alert_callback).
+        `still`: a function; when its turn comes and it returns False, the sentence is out of date and dropped."""
         print(f"🔊 Speaking: '{text}'")
         gen = self._speech_gen
         with self._speech_lock:
             if gen != self._speech_gen:  # STOP was pressed while this was waiting its turn
                 return
             if expires is not None and time.monotonic() > expires:
+                return
+            if still is not None and not still():
                 return
             self._speaking_rank = rank
             try:
@@ -761,13 +777,26 @@ class FindObjectNode(Node):
         self.speak(f"I see {len(people)} people: {', '.join(said[:-1])}, and {said[-1]}.")
 
     def _remember_face(self, target):
-        """HAND hold in face mode: the name just said goes to the face in front."""
+        """HAND hold in face mode: the name just said goes to the face in front. A correction ("no, not Jordan",
+        "no, this is Sudil") is never taken as a name."""
+        words = target.split()
+        correcting = False
+        while words and words[0] in CORRECTION_WORDS:
+            words, correcting = words[1:], True
+        target = " ".join(words)
+        if target.startswith("not "):
+            self._not_this_face(target[len("not "):])
+            return
         for lead in NAME_LEADS:
             if target.startswith(lead):
                 target = target[len(lead):]
         name = " ".join(w.capitalize() for w in target.split())
         if not name:
-            self.speak("I did not catch the name.")
+            self.speak("Then who is it? Hold the hand button and say just the name." if correcting
+                       else "I did not catch the name.")
+            return
+        if len(name.split()) > MAX_NAME_WORDS:
+            self.speak("Hold the hand button and say just the name.")
             return
         if self._load_faces() is None:
             return
@@ -775,10 +804,29 @@ class FindObjectNode(Node):
         if img is None:
             self.speak("The camera is not sending pictures. Press the sensor button.")
             return
-        result = self._faces.remember(name, img)
-        self.speak({"ok": f"I will remember {name}.",
+        result, replaced = self._faces.remember(name, img)
+        said = {"ok": f"I will remember {name}.",
+                "no_face": "I don't see a face. Point the camera at the person, then try again.",
+                "several": f"I see more than one face. Only {name} should be in front of the camera."}[result]
+        if replaced:
+            said += f" I had this face as {' and '.join(replaced)}; that is corrected."
+        self.speak(said)
+
+    def _not_this_face(self, wrong):
+        """ "No, not Jordan": take the face in front away from that name."""
+        wrong = " ".join(w.capitalize() for w in wrong.split())
+        if self._load_faces() is None:
+            return
+        img = self._picture()
+        if img is None:
+            self.speak("The camera is not sending pictures. Press the sensor button.")
+            return
+        result = self._faces.not_this(wrong, img)
+        self.speak({"ok": f"Okay, this is not {wrong}. Hold the hand button and say who it is.",
+                    "unknown_name": f"I don't know anyone called {wrong}.",
+                    "no_match": f"I did not have this face as {wrong}.",
                     "no_face": "I don't see a face. Point the camera at the person, then try again.",
-                    "several": f"I see more than one face. Only {name} should be in front of the camera."}[result])
+                    "several": "I see more than one face. Only that person should be in front of the camera."}[result])
 
     def _outdoor_words(self, t) -> bool:
         """An outdoor question or setting (answered from the hazard view, _outdoor_command)."""
@@ -809,7 +857,7 @@ class FindObjectNode(Node):
 
     def _no_navigation(self):
         """TALK hold outside indoor mode."""
-        if self._switching and self._mode == "indoor":
+        if self._switching and self._intended == "indoor":
             self.speak("Indoor mode is still starting. Please wait.")
         else:
             self.speak("You can't use navigation now. It works only in indoor mode.")
@@ -834,24 +882,15 @@ class FindObjectNode(Node):
 
     def _on_button(self, button, event):
         if button == "mode" and event == "tap":
-            new = "outdoor" if self._mode == "indoor" else "indoor"
-            if self._switching:
-                self.speak("Still switching modes. Please wait.")
-            elif self._off:
-                # Turned off with a MODE hold: a tap starts the same mode again (at once, or with the sensors)
-                self._off = False
-                if AUTOSTART == "sensors" and self._missing_sensors():
-                    self._say_selected(self._mode)
-                else:
-                    self._switch_mode(self._mode, True)
-            elif not self._active and AUTOSTART == "sensors":
-                # Paused (sensors off): just choose the mode; it starts with the camera and LiDAR
-                self._mode = new
-                self._say_selected(new)
+            if self._intended_off or (self._off and not self._switching):
+                target = self._intended  # after a MODE hold a tap starts the same mode again
             else:
-                self._switch_mode(new)
+                target = "outdoor" if self._intended == "indoor" else "indoor"
+            self._intended, self._intended_off = target, False
+            self._request(("mode", target))
         elif button == "mode" and event == "hold_start":
-            self._all_off()
+            self._intended_off = True
+            self._request(("off",))
         elif button == "hand" and event == "tap":
             self._hand_button()
         elif button == "hand" and event == "hold_start":
@@ -865,11 +904,76 @@ class FindObjectNode(Node):
             else:
                 self._around()
 
+    # ── MODE AND SENSOR REQUESTS: one at a time, the latest press wins ──
+    @property
+    def _switching(self):
+        """A mode request is waiting or being carried out."""
+        return self._mode_busy or self._want is not None
+
+    def _request(self, want):
+        with self._want_lock:
+            self._want = want
+            self._want_gen += 1
+        self._want_event.set()
+
+    def _say(self, text):
+        """Say what a request did, unless a newer request has made it out of date by the time it is its turn."""
+        gen = self._doing_gen  # the request being carried out: any press since then makes this out of date
+        if gen != self._want_gen:
+            return
+        threading.Thread(target=self.speak, args=(text,), kwargs={"still": lambda: gen == self._want_gen},
+                         daemon=True).start()
+
+    def _mode_worker(self):
+        while rclpy.ok():
+            self._want_event.wait(0.5)
+            self._want_event.clear()
+            with self._want_lock:
+                want, self._want = self._want, None
+                self._mode_busy = want is not None
+                self._doing_gen = self._want_gen
+            if want is None:
+                continue
+            try:
+                self._carry_out(want)
+            except Exception as e:  # never stop serving the buttons
+                print(f"⚙️  {want} failed: {e}")
+            finally:
+                self._mode_busy = False
+
+    def _carry_out(self, want):
+        kind = want[0]
+        if kind == "mode":
+            mode = want[1]
+            if self._off:
+                # Turned off with a MODE hold: a tap starts the mode again (at once, or with the sensors)
+                self._off = False
+                if AUTOSTART == "sensors" and self._missing_sensors():
+                    self._mode = mode
+                    self._say_selected(mode)
+                else:
+                    self._switch_mode(mode, True)
+            elif not self._active and AUTOSTART == "sensors":
+                # Paused (sensors off): just choose the mode; it starts with the camera and LiDAR
+                self._mode = mode
+                self._say_selected(mode)
+            elif self._active and mode == self._mode:
+                self._say(f"{mode.capitalize()} mode.")  # quick presses cancelled out: where it stands now
+            else:
+                self._switch_mode(mode)
+        elif kind == "off":
+            self._all_off()
+        elif kind == "pause":
+            self._pause()
+        elif kind == "start" and not self._active and not self._off:
+            self._switch_mode(self._mode, True)
+        self._intended = self._mode
+
     def _say_selected(self, mode):
         """The mode is chosen but waits for the sensors. Names the one that is missing: the Pi says "on" when the
         LiDAR started even if the camera publisher exited."""
         missing = self._missing_sensors() or [name for name in SENSORS.values()]
-        self.speak(f"{mode.capitalize()} mode selected. It starts when the "
+        self._say(f"{mode.capitalize()} mode selected. It starts when the "
                    f"{' and the '.join(missing)} {'is' if len(missing) == 1 else 'are'} on. "
                    + self._sensor_sentence(self._missing_sensors()))
 
@@ -896,17 +1000,14 @@ class FindObjectNode(Node):
         objects and the places and names given in it are forgotten (nothing is kept for another day). The camera
         and LiDAR stay on (the SENSORS button's job); the modes stay off until MODE is tapped. The vision AI has its
         own off switch (say "vision off")."""
-        if self._switching:
-            self.speak("Still switching modes. Please wait.")
-            return
         parts = list(dict.fromkeys(p for mode_parts in MODE_PARTS.values() for p in mode_parts))
-        self._switching = self._turning_off = True
+        self._turning_off = True
         try:
             self._stop_all(say=None)
             if not self._active and not any(self._sys.owned(p) for p in parts):
                 by_hand = any(self._sys.running(p) for p in parts)
-                self.speak("The modes were started in a terminal. Close them there." if by_hand and not self._off
-                           else "All modes are already off.")
+                self._say("The modes were started in a terminal. Close them there." if by_hand and not self._off
+                          else "All modes are already off.")
                 return
             for part in parts:
                 self._sys.stop(part)
@@ -919,9 +1020,9 @@ class FindObjectNode(Node):
             if by_hand:  # started in a terminal, not by the assistant: left alone
                 msg += (f" {' and '.join(by_hand).capitalize()} {'was' if len(by_hand) == 1 else 'were'} started in "
                         f"a terminal. Close {'it' if len(by_hand) == 1 else 'them'} there.")
-            self.speak(msg)
+            self._say(msg)
         finally:
-            self._switching = self._turning_off = False
+            self._turning_off = False
 
     def _forget_session(self):
         """The session's map is gone (MODE hold, the sensors off, indoor mode left): forget what was learned in it
@@ -940,36 +1041,30 @@ class FindObjectNode(Node):
         """Start the parts the mode needs, stop the other mode's, and say when it is active.
         Indoor: SLAM brain (map, Nav2, walls) + camera AI. Outdoor: sensor mounts and the live RViz view + camera AI
         (hazard warnings). The camera AI switches mode without a restart."""
-        self._switching = True
         self._off = False
-        try:
-            # Said once, when it is ready (the button's click already said the press was heard)
-            print(f"⚙️  {'starting' if startup else 'switching to'} {mode} mode")
-            leaving = [p for m, parts in MODE_PARTS.items() if m != mode for p in parts if p not in MODE_PARTS[mode]]
-            for part in leaving:
-                self._sys.stop(part)
-            if "brain" in leaving:
-                self._forget_session()  # the indoor map is gone: the next indoor mode maps the place it is in
-            wanted = list(MODE_PARTS[mode])
-            for part in wanted:
-                self._sys.start(part, wait=False)  # all at once; then wait for each
-            failed = [p for p in wanted if not self._sys.wait_ready(p)]
-            self._mode = mode
-            self._active = True
-            self._mode_pub.publish(String(data=mode))
-            msg = f"{mode.capitalize()} mode activated."
-            if failed:
-                msg += " " + " ".join(f"{self._sys.name(p).capitalize()} did not start." for p in failed)
-            if getattr(self._sys, "imu_note", "") and "brain" in wanted:
-                msg += " " + self._sys.imu_note
-            missing = self._missing_sensors()
-            if missing:
-                msg += " " + self._sensor_sentence(missing)
-            # The switch is done: the next MODE press works while this is still being said
-            self._switching = False
-            self.speak(msg)
-        finally:
-            self._switching = False
+        # Said once, when it is ready (the button's click already said the press was heard)
+        print(f"⚙️  {'starting' if startup else 'switching to'} {mode} mode")
+        leaving = [p for m, parts in MODE_PARTS.items() if m != mode for p in parts if p not in MODE_PARTS[mode]]
+        for part in leaving:
+            self._sys.stop(part)
+        if "brain" in leaving:
+            self._forget_session()  # the indoor map is gone: the next indoor mode maps the place it is in
+        wanted = list(MODE_PARTS[mode])
+        for part in wanted:
+            self._sys.start(part, wait=False)  # all at once; then wait for each
+        failed = [p for p in wanted if not self._sys.wait_ready(p)]
+        self._mode = mode
+        self._active = True
+        self._mode_pub.publish(String(data=mode))
+        msg = f"{mode.capitalize()} mode activated."
+        if failed:
+            msg += " " + " ".join(f"{self._sys.name(p).capitalize()} did not start." for p in failed)
+        if getattr(self._sys, "imu_note", "") and "brain" in wanted:
+            msg += " " + self._sys.imu_note
+        missing = self._missing_sensors()
+        if missing:
+            msg += " " + self._sensor_sentence(missing)
+        self._say(msg)
 
     def _missing_sensors(self):
         """Names of the Pi sensors nobody is publishing (the stream's publisher is gone, no Wi-Fi traffic used)."""
@@ -1009,7 +1104,7 @@ class FindObjectNode(Node):
             if self._turning_off:
                 return  # a MODE hold: _all_off says it
             if AUTOSTART == "sensors":
-                threading.Thread(target=self._pause, daemon=True).start()  # says it, with the mode
+                self._request(("pause",))  # says it, with the mode
                 return
         if state == "on" and self._claim_sensors_on():
             said = SENSORS_ON_TEXT
@@ -1028,20 +1123,16 @@ class FindObjectNode(Node):
     def _pause(self):
         """Sensors switched off with the SENSORS button: say so, once, and stop the mode's programs (the session's
         map and objects are forgotten); they start again, with a new map, with the sensors."""
-        if not self._active or self._switching:
+        if not self._active:
             if not self._turning_off:
-                self.speak("Camera and LiDAR off.")
+                self._say("Camera and LiDAR off.")
             return
-        self._switching = True
-        try:
-            for part in MODE_PARTS[self._mode]:
-                self._sys.stop(part)
-            self._active = False
-            self._forget_session()
-            self.speak(f"Camera and LiDAR off. {self._mode.capitalize()} mode paused. "
-                       f"Press the sensor button to start again.")
-        finally:
-            self._switching = False
+        for part in MODE_PARTS[self._mode]:
+            self._sys.stop(part)
+        self._active = False
+        self._forget_session()
+        self._say(f"Camera and LiDAR off. {self._mode.capitalize()} mode paused. "
+                  f"Press the sensor button to start again.")
 
     def _system_watch(self):
         """The Pi connection and its sensors, checked every WATCH_S: greets the wearer, says when the Pi or a
@@ -1085,8 +1176,7 @@ class FindObjectNode(Node):
                 if came_on and all_on and self._claim_sensors_on():
                     self.speak(SENSORS_ON_TEXT)
             if AUTOSTART == "sensors" and all_on and not self._active and not self._switching and not self._off:
-                threading.Thread(target=self._switch_mode, args=(self._mode, True), daemon=True).start()
-                self._switching = True  # until the thread takes over
+                self._request(("start",))
             pi_was, first = pi, False
             time.sleep(WATCH_S)
 
@@ -1838,6 +1928,7 @@ class FindObjectNode(Node):
                 return
             # Locked once: the route must not follow (or lose) the live detection near the object
             tx, ty = target_pos.x, target_pos.y
+        width = 0.0 if place else self._width_of(target_name)
 
         last_instruction = ""
         last_speech_time = 0
@@ -1861,9 +1952,9 @@ class FindObjectNode(Node):
             dist_ft = dist_to_target * 3.28084
             
             # ---- ARRIVAL CHECK (SLAM distance only: the object is in the blind spot by now) ----
-            if dist_to_target < (ARRIVAL_RADIUS if place else OBJECT_ARRIVAL_RADIUS):
+            if self._reached(pose, (tx, ty), width, place):
                 self._arrive(friendly_name, place is not None, target_name.rsplit('_', 1)[0].replace('_', ' '),
-                             target=(tx, ty))
+                             target=(tx, ty), width=width)
                 break
                 
             # ---- RECALCULATE A* PATH every 1.0 second (10 cycles) ----
@@ -1930,18 +2021,29 @@ class FindObjectNode(Node):
             self.navigating = False
         print("\n✅ Navigation ended.\n")
 
-    def _arrive(self, friendly_name, is_place=False, obj_class=None, target=None):
+    def _width_of(self, name):
+        """The mapped width (m) of an object on the map, for its near edge."""
+        return float(next((o.get("w", 0.4) for o in self.objects if o.get("name") == name), 0.4))
+
+    @staticmethod
+    def _reached(pose, target, width, place):
+        """Arrived: at a named place, or within arm's reach of the object's near edge (not its centre)."""
+        d = math.hypot(target[0] - pose[0], target[1] - pose[1])
+        return d < ARRIVAL_RADIUS if place else d - 0.5 * width <= OBJECT_REACH_GAP
+
+    def _arrive(self, friendly_name, is_place=False, obj_class=None, target=None, width=0.0):
         """Arrival: say where the object is from here and clear the drawn path; the navigation ends. Hand guidance
         follows only when the HAND button asked for it."""
         pose = self.get_robot_pose()
         if is_place or target is None or pose is None:
             self.speak(f"You have arrived at the {friendly_name}.")
         else:
-            # Where it is from here, so the last step is the wearer's own and not a guess
+            # Where it is from here (its near edge), so the last step is the wearer's own and not a guess
             rel, clock_hr = self.get_relative_direction(pose[2], target[0], target[1], pose[0], pose[1])
-            feet = max(1, int(round(math.hypot(target[0] - pose[0], target[1] - pose[1]) * 3.28084)))
-            self.speak(f"You have arrived. The {friendly_name} is at {clock_hr} o'clock, about "
-                       f"{feet} {'foot' if feet == 1 else 'feet'} away.")
+            gap = max(0.0, math.hypot(target[0] - pose[0], target[1] - pose[1]) - 0.5 * width)
+            feet = max(1, int(round(gap * 3.28084)))
+            where = "within reach" if gap <= REACH_SAY_GAP else f"about {feet} {'foot' if feet == 1 else 'feet'} away"
+            self.speak(f"You have arrived. The {friendly_name} is at {clock_hr} o'clock, {where}.")
         empty_path = Path()
         empty_path.header.frame_id = 'map'
         self._path_pub.publish(empty_path)
@@ -1964,9 +2066,11 @@ class FindObjectNode(Node):
 
     @staticmethod
     def _say_again(kind, dist_ft, last_kind, last_ft, last_t, now):
-        """Say the next instruction when the direction changes, every 8 s, or (within 12 feet) every 2 feet."""
+        """Say the next instruction when the direction changes, every 8 s, within 12 feet every 2 feet, and within
+        4 feet every foot (the last steps are counted down to the object)."""
+        step = 1.0 if dist_ft <= 4 else 2.0
         return (kind != last_kind or now - last_t > 8.0
-                or (dist_ft <= 12 and last_ft is not None and last_ft - dist_ft >= 2.0 and now - last_t > 1.5))
+                or (dist_ft <= 12 and last_ft is not None and last_ft - dist_ft >= step and now - last_t > 1.2))
 
     def _navigate_nav2(self, target_name, place=None, spoken=None):
         """Guide the user along the smooth Nav2 path from semantic_navigator.py (re-planned every second)."""
@@ -1980,6 +2084,7 @@ class FindObjectNode(Node):
                 return
             # Lock the goal in the map frame: Nav2 routes to this fixed point, not the live detection
             tx, ty = target_pos.x, target_pos.y
+        width = 0.0 if place else self._width_of(target_name)
         self._nav_gen += 1
         gen = self._nav_gen
         self.navigating, self._using_nav2 = True, True
@@ -1995,7 +2100,7 @@ class FindObjectNode(Node):
             state = status.get("state")
             if state == "arrived":
                 self._arrive(friendly_name, place is not None, target_name.rsplit('_', 1)[0].replace('_', ' '),
-                             target=(tx, ty))
+                             target=(tx, ty), width=width)
                 break
             if state in ("no_path", "blocked", "not_found", "no_planner") and state != last_problem:
                 last_problem = state
@@ -2004,10 +2109,9 @@ class FindObjectNode(Node):
                             "not_found": f"I can't see the {friendly_name} on the map any more.",
                             "no_planner": "The path planner is not running."}[state])
             pose = self.get_robot_pose()
-            if pose is not None and math.hypot(tx - pose[0], ty - pose[1]) < (ARRIVAL_RADIUS if place
-                                                                                else OBJECT_ARRIVAL_RADIUS):
+            if pose is not None and self._reached(pose, (tx, ty), width, place):
                 self._arrive(friendly_name, place is not None, target_name.rsplit('_', 1)[0].replace('_', ' '),
-                             target=(tx, ty))
+                             target=(tx, ty), width=width)
                 break
             path = self._nav2_path
             if pose is None or len(path) < 2:
