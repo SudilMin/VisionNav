@@ -1,7 +1,7 @@
 include "map_builder.lua"
 include "trajectory_builder.lua"
 
--- Chest-worn RPLIDAR C1, no wheel odometry, no IMU.
+-- Chest-worn RPLIDAR C1, no wheel odometry, no IMU (cartographer_imu.lua adds the chest MPU-6050).
 -- Cartographer does scan-to-submap matching on its own, so it is the right backend for a
 -- wearable: it publishes map -> odom and the static odom -> base_footprint does the rest.
 options = {
@@ -48,8 +48,7 @@ TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.linear_search_window = 
 TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.angular_search_window = math.rad(35.)
 TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.translation_delta_cost_weight = 10.
 TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.rotation_delta_cost_weight = 1e-1
--- Trust the scan more than the (non-existent) motion prior.
--- Pin the scan to the walls; a light translation prior (no odometry exists to trust).
+-- Pin the scan to the walls; only a light translation prior (no odometry exists to trust).
 TRAJECTORY_BUILDER_2D.ceres_scan_matcher.occupied_space_weight = 20.
 TRAJECTORY_BUILDER_2D.ceres_scan_matcher.translation_weight = 10.
 TRAJECTORY_BUILDER_2D.ceres_scan_matcher.rotation_weight = 40.
@@ -59,10 +58,11 @@ TRAJECTORY_BUILDER_2D.motion_filter.max_time_seconds = 0.5
 TRAJECTORY_BUILDER_2D.motion_filter.max_distance_meters = 0.10
 TRAJECTORY_BUILDER_2D.motion_filter.max_angle_radians = math.rad(2.)
 
--- Clear dynamic obstacles faster: a miss outweighs a hit (defaults 0.55 / 0.49). Finished submaps are
--- frozen, so old ghosts only fade where newer submaps overlap them. Below ~0.44 thin walls start to erode.
+-- How a wall cell is believed (Cartographer's defaults): a lower miss probability also erased real walls, since a
+-- chest-worn scan pitches with every step and crosses a wall with many near-miss rays. People are kept off the
+-- routes by semantic_costmap.py (tracked, not drawn into this map).
 TRAJECTORY_BUILDER_2D.submaps.range_data_inserter.probability_grid_range_data_inserter.hit_probability = 0.55
-TRAJECTORY_BUILDER_2D.submaps.range_data_inserter.probability_grid_range_data_inserter.miss_probability = 0.45
+TRAJECTORY_BUILDER_2D.submaps.range_data_inserter.probability_grid_range_data_inserter.miss_probability = 0.49
 TRAJECTORY_BUILDER_2D.submaps.range_data_inserter.probability_grid_range_data_inserter.insert_free_space = true
 
 -- Smaller submaps drift less between loop closures in small indoor rooms.

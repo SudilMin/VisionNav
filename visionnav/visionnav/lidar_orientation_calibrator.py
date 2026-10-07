@@ -175,7 +175,7 @@ def static_check():
         warnings.simplefilter("ignore")
         from visionnav.depth_anything_v2.dpt import DepthAnythingV2
 
-    hfov = math.radians(float(os.environ.get("WEARABLE_CAMERA_HFOV_DEG", "70.0")))
+    hfov = math.radians(float(os.environ.get("WEARABLE_CAMERA_HFOV_DEG", "52.0")))  # as object_perception (measured)
     flip = os.environ.get("WEARABLE_CAMERA_FLIP", "1") == "1"
     rclpy.init()
     node = Node('lidar_orientation_calibrator')

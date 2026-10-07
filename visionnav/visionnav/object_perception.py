@@ -2,26 +2,20 @@
 """
 object_perception.py
 ====================
-ROS 2 Jazzy – Wearable Blind-Assist Vision Node  (Ultralytics YOLOE open-vocabulary edition)
+Camera AI of VisionNav (ROS 2 Jazzy): YOLOE open-vocabulary detection fused with metric depth and the LiDAR.
 
-Tesla AI-Grade Dual-Mode Perception System:
-  INDOOR  – Persistent spatial memory map, scene recall, object finding
-  OUTDOOR – Live hazard warnings, no memory (outdoor_awareness.py): its own detector vocabulary and outdoor
-            metric depth, LiDAR walking corridor, ground analysis (obstacles, drops, head-height hazards),
-            zebra crossings, traffic / pedestrian light colours, approaching vehicles; spoken on /outdoor_alert
+  INDOOR  – objects are placed in the SLAM map and remembered for the session (find, recall, navigate)
+  OUTDOOR – live hazards only, nothing remembered (outdoor_awareness.py): walking corridor, ground hazards,
+            zebra crossings, traffic lights, approaching vehicles; spoken via /outdoor_alert
 
 Geometry pipeline (per detection):
-  1. Camera and LiDAR extrinsics come from TF (sensor_tf.launch.py), so the objects and the
-     SLAM map share one calibration — no hard-coded sign flips.
-  2. Every LiDAR point is projected into the image. A point only ranges an object if it lands
-     inside the object's segmentation mask *at the row where the scan plane crosses it*. The
-     chest LiDAR (1.2 m) passes over chairs, tables and desk items; those points hit the wall
-     behind and are rejected instead of being used as the object's depth.
-  3. Without a LiDAR hit, depth comes from ray/plane geometry (floor or desk contact point,
-     table-top edge) and a known-size prior, fused by inverse variance.
-  4. Positions go to the map frame using TF at the image timestamp, then into a Kalman
-     tracker whose measurement noise matches the depth source, so close LiDAR-ranged
-     sightings outweigh distant optical guesses.
+  1. Camera and LiDAR extrinsics come from TF (sensor_tf.launch.py), shared with SLAM.
+  2. A LiDAR point ranges an object only if it lands inside the object's mask at the row where the scan
+     plane crosses it; points passing over low objects hit the wall behind and are rejected.
+  3. Otherwise depth comes from metric depth, floor/desk contact geometry and a known-size prior,
+     fused by inverse variance.
+  4. Positions go to the map frame (TF at the image timestamp) and into a Kalman tracker whose
+     measurement noise matches the depth source.
 """
 
 import os
@@ -29,10 +23,10 @@ os.environ["QT_QPA_PLATFORM"]  = "xcb"          # force X11/XWayland
 os.environ["QT_LOGGING_RULES"] = "*.debug=false;qt.qpa.fonts=false"
 
 import cv2
-# pip's OpenCV points Qt at a font folder inside its package that ships no fonts (a warning per window).
-# It sets this on import, so it is overridden here, before the first window creates the Qt app.
+# pip's OpenCV points Qt at an empty font folder on import; use the system fonts before any window opens
 if os.path.isdir("/usr/share/fonts/truetype/dejavu"):
     os.environ["QT_QPA_FONTDIR"] = "/usr/share/fonts/truetype/dejavu"
+import contextlib
 import json
 import math
 import time
@@ -42,6 +36,7 @@ import zlib
 import glob
 import hashlib
 import shutil
+import subprocess
 from collections import deque
 import rclpy
 from cv_bridge import CvBridge
@@ -49,13 +44,13 @@ from rclpy.node import Node
 
 from visionnav.grasp_tracker import GraspTracker
 from visionnav import outdoor_awareness as oa
-from visionnav.lidar_odometry import ScanOdometry
+from visionnav.lidar_odometry import GyroYaw, ScanOdometry
 from nav_msgs.msg import Odometry
-from visionnav.model_paths import model_path
+from visionnav.model_paths import model_path, models_dir
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 from rclpy.duration import Duration
-from sensor_msgs.msg import Image, LaserScan, CompressedImage
+from sensor_msgs.msg import Image, Imu, LaserScan, CompressedImage
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import ColorRGBA, String
 from geometry_msgs.msg import Point
@@ -69,8 +64,8 @@ except ImportError:  # greedy fallback below
 MODEL_PATH  = model_path("yoloe-11s-seg.pt")
 
 # ── OPEN-VOCABULARY DETECTION ──
-# YOLOE is prompted once with these names (text embeddings are baked into the TensorRT engine, so
-# there is no text encoder at run time). Add a word here and the engine is rebuilt automatically.
+# YOLOE is prompted once with these names; the text embeddings are baked into the TensorRT engine, which is
+# rebuilt automatically when this list changes.
 VOCABULARY = [
     # doors, stairs and building structure
     "door", "wooden door", "doorway", "doorway to another room", "entrance to room", "room entrance",
@@ -115,24 +110,20 @@ VOCABULARY = [
     "car", "bicycle", "motorcycle", "three-wheeler", "bus", "truck", "traffic light", "stop sign",
     "fire hydrant", "curb",
 ]
-# Negative prompts: things that are not objects but look like one to an open-vocabulary detector. They are
-# in the model's vocabulary so they win the box (YOLO keeps one class per box), and are never reported.
-# Measured on the rig: the floor past a doorway threshold was a "floor step" in 22-100 % of frames in three
-# views; with these (and without the "floor step" prompt) it was a step in none.
+# Negative prompts: non-objects that an open-vocabulary detector mistakes for objects (a doorway threshold read
+# as a "step"). They win the box (one class per box) and are never reported.
 NEGATIVE_PROMPTS = ["door threshold", "floor", "tiled floor", "kitchen floor", "floor edge", "kitchen cabinet"]
 VOCABULARY = VOCABULARY + NEGATIVE_PROMPTS
-# Several prompts for one thing raise recall; they are reported, mapped and navigated to under one
-# name. Measured on the rig: a switch scores 0.60 as "black switch", 0.44 "electric switch", 0.38
-# "switch", but only 0.01 as "light switch", and without them it was mostly called a "doorbell".
+# Several prompts for one thing raise recall; they are reported, mapped and navigated to under one name
+# (a switch scores far higher as "black switch" than as "light switch").
 PROMPT_SYNONYMS = {
     "wall switch": "light switch", "black switch": "light switch", "white switch": "light switch",
     "electric switch": "light switch", "switch": "light switch", "switch board": "light switch",
     "electrical switch panel": "light switch",
     "power outlet": "wall socket", "plug socket": "wall socket",
     "staircase": "stairs", "doorway": "door", "sliding door": "door",
-    # Measured on the rig: a closed wooden door scored 0.67 as "wardrobe" and only 0.65 as "door" (and was
-    # called a wardrobe in 71 % of frames); as "wooden door" it scores 0.89 in every frame. An open doorway
-    # was mostly a "mirror" (0.40-0.47); "entrance to room" (0.62) and "room entrance" win over it.
+    # A closed door scores higher as "wooden door" (else it reads as a wardrobe), an open doorway as
+    # "entrance to room" (else it reads as a mirror)
     "wooden door": "door", "doorway to another room": "door", "entrance to room": "door", "room entrance": "door",
     "coffee table": "table", "side table": "table",
     "glass door": "door", "door knob": "door handle", "dustbin": "trash can",
@@ -142,9 +133,10 @@ PROMPT_SYNONYMS = {
     "wire": "cable on floor", "wash basin": "sink", "elevator door": "door",
 }
 _VOCAB_HASH = hashlib.sha1("|".join(VOCABULARY).encode()).hexdigest()[:8]
+GPU_MARGIN_BYTES = 500e6  # free GPU memory perception keeps after warm-up (else the vision AI is unloaded)
 ENGINE_PATH = model_path(f"yoloe-11s-seg-indoor-{_VOCAB_HASH}.engine")
-# Outdoor mode has its own vocabulary (outdoor_awareness.py) and engine: one engine for both would make outdoor
-# prompts compete with indoor ones for every box (a filtered-out class still wins the box it takes).
+# Outdoor mode has its own vocabulary (outdoor_awareness.py) and engine, so outdoor prompts never compete with
+# indoor ones for a box.
 _OUTDOOR_HASH = hashlib.sha1("|".join(oa.OUTDOOR_VOCABULARY).encode()).hexdigest()[:8]
 OUTDOOR_ENGINE_PATH = model_path(f"yoloe-11s-seg-outdoor-{_OUTDOOR_HASH}.engine")
 
@@ -160,8 +152,7 @@ DETECTORS = {
 }
 # Drops: a blind user needs more warning before these than before a chair.
 DROP_HAZARDS = {"stairs", "step", "hole in floor", "pothole", "curb", "escalator"}
-# Hazards in the floor itself: a measured top (metric depth or LiDAR) higher than this is not one. The edge
-# of a kitchen counter seen through a doorway was read as a "floor step" on the rig.
+# Hazards in the floor itself: one whose measured top is higher than this is not one (a counter edge)
 FLOOR_LEVEL_HAZARDS = {"step", "hole in floor", "pothole", "curb"}
 FLOOR_HAZARD_MAX_TOP = 0.5   # m above the floor
 
@@ -172,9 +163,7 @@ CONFUSABLE_GROUPS = [
     {"tv", "monitor", "laptop"},
     # a door and the furniture doors that look just like it
     {"door", "wardrobe", "cabinet", "refrigerator"},
-    # an open doorway looks like a mirror (a framed view of another room); kept apart from the group above
-    # so a mirror and a cabinet are not interchangeable (the kitchen counter through a doorway was renamed
-    # a mirror)
+    # an open doorway looks like a mirror; kept apart from the group above so a mirror and a cabinet never merge
     {"door", "mirror"},
     # one table seen as a desk, a coffee table and a table
     {"table", "coffee table", "side table", "desk", "dining table", "tv stand", "dressing table",
@@ -197,8 +186,7 @@ RELABEL_RATIO = 1.5
 WALL_MOUNTED = {"light switch", "wall socket", "doorbell", "thermostat", "intercom", "fire alarm",
                 "smoke detector", "door handle", "door knob", "exit sign", "power strip"}
 WALL_MOUNTED_FOOTPRINT = 0.35  # m
-# Flat things in or on a wall: drawn as a thin panel along the wall, not a width x width block (a 1.1 m door
-# was a 1.1 x 1.1 x 2.1 m cube). The wall direction is fitted to the LiDAR points around the object.
+# Flat things in or on a wall: drawn as a thin panel along the wall (direction fitted to nearby LiDAR points)
 PANEL_OBJECTS = WALL_MOUNTED | {"door", "window", "curtain", "window blinds", "mirror", "picture frame",
                                 "painting", "poster", "whiteboard", "notice board", "calendar", "clock",
                                 "sign", "air conditioner", "circuit breaker panel"}
@@ -206,8 +194,7 @@ PANEL_THICKNESS = 0.05       # m
 WALL_FIT_MIN_PTS = 5         # LiDAR points needed to fit the wall line
 WALL_FIT_MIN_ELONGATION = 6.0  # variance along / across the fitted line
 DOOR_MIN_HEIGHT = 1.9        # m: doors are standard height; a doorway's top is often cut off by the frame
-DOOR_MIN_WIDTH = 0.3         # m: a "door" measured narrower than this (and not cut off by the frame edge) is a
-                             # sliver of frame or wall corner: one 10 cm wide at 1 m became a phantom door
+DOOR_MIN_WIDTH = 0.3         # m: a narrower "door" (not cut off by the frame) is a sliver of frame or wall
 YOLO_IOU = 0.50
 # Small objects are the ones YOLO misnames most (a door handle as a cup, a remote as a phone),
 # so they need more confidence than furniture before they are shown or mapped.
@@ -216,9 +203,8 @@ SMALL_OBJECTS = {"door handle", "door knob", "keys", "pen", "wallet", "glasses",
                  "scissors", "toothbrush", "spoon", "fork", "knife", "wine glass", "sports ball"}
 CROSS_CLASS_OVERLAP = 0.70   # intersection / smaller box area
 CROSS_CLASS_SAME_BOX_IOU = 0.80  # any two static labels on (almost) the same box are one detection
-# A look-alike label on a box where a better-ranked look-alike was detected this recently is the same
-# object flickering between names (an open doorway alternated "door" / "mirror" on the rig and spawned a
-# second object 7.8 m away, where the LiDAR saw through the opening).
+# A look-alike label on a box where a better-ranked look-alike was just detected is the same object flickering
+# between names (an open doorway alternating "door" / "mirror").
 LOOKALIKE_MEMORY_S = 1.0
 LOOKALIKE_BOX_AGE = 2.0      # s: a confirmed object's last image box claims look-alike detections this long
 
@@ -231,8 +217,7 @@ FRIENDLY_NAMES = {
     "parking meter": "meter", "traffic light": "signal",
 }
 
-# ── KNOWN REAL-WORLD MAXIMUM PHYSICAL SIZES (width_m, height_m) ──
-# Used to clamp estimated sizes to prevent wildly oversized RViz markers.
+# ── MAXIMUM PHYSICAL SIZES (width_m, height_m): estimated sizes are clamped to these ──
 OBJECT_MAX_SIZES = {
     "doorbell": (0.15, 0.20), "thermostat": (0.20, 0.20), "intercom": (0.25, 0.35),
     "fire alarm": (0.25, 0.25), "smoke detector": (0.20, 0.10), "door handle": (0.30, 0.12),
@@ -337,10 +322,8 @@ for _k, _v in oa.OUTDOOR_TYPICAL_SIZES.items():
 FLAT_OBJECTS = {"keyboard", "mouse", "cell phone", "smartphone", "book", "laptop", "remote",
                 "dining table", "table", "bed"}
 
-# ── SEMANTIC 2D ASPECT RATIO LIMITS (Height / Width) ──
-# Prevents YOLO from drawing massive vertical boxes around flat objects (like confusing a wall for a laptop)
-# Boxes far outside a class's possible shape are misdetections, e.g. a tall dark door seen as a
-# "tv". They are dropped instead of squashed. (Height / Width)
+# ── 2D ASPECT RATIO LIMITS (height / width) ──
+# Boxes far outside a class's possible shape are misdetections (a tall dark door seen as a "tv") and are dropped.
 OBJECT_REJECT_ASPECT_RATIOS = {"tv": 1.9, "laptop": 1.8, "microwave": 1.5, "keyboard": 1.2, "bed": 1.5,
                                "couch": 1.6, "dining table": 1.6}
 
@@ -358,7 +341,7 @@ FLOOR_OBJECTS = {"door", "stairs", "step", "table", "obstacle", "hole in floor",
                  "box", "chair", "couch", "bed", "dining table", "toilet", "refrigerator", "oven",
                  "potted plant", "bench", "suitcase", "person", "bicycle", "car", "motorcycle",
                  "bus", "truck", "dog", "cat", "fire hydrant", "backpack",
-                 # tall furniture stands on the floor (a wardrobe was drawn "on a 0.37 m surface")
+                 # tall furniture
                  "wardrobe", "cabinet", "shelf", "bookshelf", "chest of drawers", "sofa", "stool",
                  "tv stand", "dressing table", "kitchen counter", "washing machine", "water dispenser",
                  "crib", "shoe rack"}
@@ -385,7 +368,9 @@ LIDAR_CLUSTER_GAP = 0.25     # m, range gap separating an object from what is be
 LIDAR_BODY_RANGE = 0.30      # m, returns closer than this are the wearer's body
 LIDAR_SNAP_RANGE = (0.45, 1.15)  # LiDAR range / camera depth accepted when snapping (near objects: depth net reads long)
 LIDAR_SNAP_PLANE_MARGIN = 0.15   # m: only objects whose top reaches this close to the scan plane may snap to it
-# Snap regardless of height (the old behaviour), for a rig whose mounting heights in TF are wrong
+LIDAR_BELOW_PLANE_M = 0.25       # m: a floor object normally this far below the scan plane never takes a LiDAR range
+                                 # (chairs, tables, benches; not barriers, bushes or prams ~1 m tall)
+# Snap regardless of height, for a rig whose TF mounting heights are wrong
 LIDAR_SNAP_ANY_HEIGHT = os.environ.get("WEARABLE_LIDAR_SNAP_ANY_HEIGHT", "0") == "1"
 SCAN_MATCH_MAX_DT = 0.25     # s, max image/scan time offset before falling back to latest scan
 BOX_EDGE_PX = 4              # a box this close to the border is truncated by the frame
@@ -409,20 +394,27 @@ DEPTH_WEIGHTS_OUTDOOR = model_path("depth_anything_v2_metric_outdoor_vits.pth")
 DEPTH_MAX = {"indoor": 20.0, "outdoor": 80.0}
 DEPTH_INPUT_SIZE = int(os.environ.get("WEARABLE_DEPTH_SIZE", "392"))  # short side, multiple of 14
 DEPTH_SCALE_MIN_PTS = 15     # LiDAR points needed to (re)calibrate the depth scale
-DEPTH_SCALE_ALPHA = 0.2      # smoothing of the per-frame scale estimate
+# The scale follows the LiDAR slowly and robustly: the network's real scale drifts slowly, and per-frame
+# re-estimation made objects jump between the right distance and twice too far.
+DEPTH_SCALE_TAU_S = 6.0      # s: time constant of the scale following the LiDAR
+DEPTH_SCALE_STEP = 0.25      # one frame may pull the scale at most this fraction toward its own estimate
+DEPTH_SCALE_START_FRAMES = 8 # frames whose median starts the scale (no single first frame decides it)
 DEPTH_SCALE_MAX_RESID = 0.15 # a frame whose depth/LiDAR ratios spread more than this is not used to calibrate
 DEPTH_SCALE_FRESH_S = 3.0    # s: the scale only earns the tight range sigma while calibrated this recently
-# Range of the LiDAR scale correction. The outdoor (street-trained) model read a room twice too far on the rig
-# (true scale ~0.5, pinned at the old 0.5 floor), so outdoors it may correct more.
-DEPTH_SCALE_LIMITS = {"indoor": (0.5, 2.0), "outdoor": (0.3, 3.0)}
+# Range of the LiDAR scale correction (the street-trained outdoor model can be ~2x off in a room)
+DEPTH_SCALE_LIMITS = {"indoor": (0.5, 2.0), "outdoor": (0.3, 3.0)}   # per depth model
+# Outdoor mode uses whichever depth model fits the LiDAR better: the street-trained one cannot tell near from far
+# in a room or a narrow lane, and no scale fixes that.
+DEPTH_PICK_EVERY_S = 1.0     # s between comparisons (one extra depth inference each, ~15 ms on the GPU)
+DEPTH_PICK_MARGIN = 0.75     # the other model takes over when its smoothed spread is below this x the current one's
+DEPTH_PICK_MIN_SAMPLES = 3   # comparisons before a switch
 MONO_MAX_POINTS = 2000       # object pixels back-projected per detection
 
 # ── TRACKING PARAMETERS ──
 MIN_HITS_STATIC = 4          # sightings before a static object is mapped / remembered
 MIN_HITS_DYNAMIC = 2
 # ── MOVING OBJECTS (people, pets) ──
-# Constant-velocity pedestrian model, timed by when each camera frame arrived (not when it was processed:
-# processing delay varies and turned into fake speed, 0.5 m/s median for people sitting still on the rig).
+# Constant-velocity pedestrian model, timed by when each frame arrived (processing delay varies and looks like speed)
 DYN_ACCEL_NOISE = 1.5        # m^2/s^3, white-noise acceleration of a walking person
 DYN_INIT_VEL_VAR = 1.0       # (m/s)^2 before the first two sightings
 DYN_MIN_SIGMA = 0.10         # m: a person's measured centre wobbles this much (arms, torso turning)
@@ -435,24 +427,18 @@ DYN_BOX_MAX_AGE = 0.3        # ...within this many seconds
 DYN_EXTRAPOLATE_S = 0.3      # s a moving object's drawn position may run ahead of its last sighting
 MONO_RATIO_ALPHA = 0.3       # per-person LiDAR/metric-depth ratio, used when the LiDAR misses them
 DYN_REANCHOR_RUN = 3         # consecutive agreeing out-of-gate sightings that move a person's track there
-# A static object must be detected in at least this share of the frames in which the camera is looking at
-# its spot. A real object is found in nearly every frame (chairs 95-100 % on the rig); a hallucination
-# flickers (a "step" on a doorway threshold: 77 % of frames at a mean score of 0.27, so it crossed
-# the 0.30 threshold only now and then). Without it a flicker never timed out and even became "reliable".
+# A static object must be detected in at least this share of the frames in which the camera is looking at its
+# spot: real objects are found in nearly every frame, hallucinations flicker.
 MIN_DETECTION_RATE = 0.5
 RELIABLE_DETECTION_RATE = 0.6  # stricter before an object is remembered for good, so a lucky run of
                                # detections early in a flicker cannot latch it into the map
-# ...and its mean detection score must reach this. Real objects on the rig averaged 0.52 (an open doorway)
-# to 0.89; the "floor step" hallucination on a doorway threshold came in bursts just over the 0.30
-# threshold and latched on detection rate alone.
+# ...and its mean detection score must reach this (hallucinations come in bursts just over the threshold)
 RELIABLE_MIN_MEAN_CONF = 0.40
-# ...and it must have been measured within this range: beyond it the position is a guess (a "mirror" 7.8 m
-# away, where the LiDAR looked through an open doorway, latched into memory). Farther objects are
-# remembered once the wearer comes closer.
+# ...and it must have been measured within this range (beyond it the position is a guess; farther objects are
+# remembered once the wearer comes closer)
 MEMORY_MAX_RANGE = 6.0
-# ...and, while metric depth is running, at least this many of its sightings must have been ranged by the
-# LiDAR or depth. A position from box size alone moves with every view: roaming the room without depth mapped
-# one switch at three places. (Without depth, chairs and tables below the LiDAR plane have nothing else.)
+# ...and, while metric depth runs, at least this many sightings must be ranged by the LiDAR or depth: a position
+# from box size alone moves with every view.
 MEMORY_MIN_RANGED_HITS = 5
 DETECTION_VIEW_MARGIN = 0.03  # fraction of the frame border ignored when counting a missed detection
 DETECTION_VIEW_RANGE = 10.0   # m, objects this close count as in view for the detection rate
@@ -467,13 +453,10 @@ VISIBILITY_MAX_RANGE = 6.0   # m, only apply the rule above to objects this clos
 LIVE_WINDOW = 1.0            # s
 LIVE_MIN_HITS = 2            # sightings within LIVE_WINDOW (one stray frame is not enough)
 MARKER_LIFETIME = 0.5        # s, RViz removes an object this soon after it stops being published
-# PERSISTENT GLOBAL MAP (indoor): once an object has been seen reliably it stays on the map, faded,
-# for the rest of the session, and keeps its ID/name when seen again from another angle. Set
-# WEARABLE_MEMORY_S (e.g. 8) for the old real-time-only behaviour instead. Walking around the room, the
-# detector often misses a remembered object from a new angle (the back of a chair) and SLAM/depth put it
-# a few decimetres off, so "not detected" alone never removes it. It is removed only when the depth map
-# reads clearly past its whole spot, wide enough to absorb that offset, for FREE_SPACE_CLEAR_RELIABLE_S
-# (the object was taken away). A live object of the same class on its spot is merged into it (same ID).
+# PERSISTENT MAP (indoor): a reliably seen object stays on the map, faded, for the rest of the session and keeps its
+# ID when seen again from another angle (WEARABLE_MEMORY_S limits that). "Not detected" alone never removes it (the
+# back of a chair is often missed): it goes when depth reads clearly past its spot for FREE_SPACE_CLEAR_RELIABLE_S,
+# or by the TAKEN AWAY rule below. A live object of the same class on its spot is merged into it.
 MEMORY_MIN_HITS = 15
 MEMORY_MIN_SPAN = 1.0        # s between first and latest sighting
 MEMORY_TTL = float(os.environ.get("WEARABLE_MEMORY_S", "inf"))  # s a reliable object outlives its last sighting
@@ -484,17 +467,14 @@ OCCLUSION_DEPTH_MARGIN = 0.3  # m: something this much closer in the same pixel 
 FREE_SPACE_MARGIN = 1.0      # m: live depth this far beyond a remembered object means its spot is empty
 FREE_SPACE_CLEAR_S = 0.4     # s of consistent free-space evidence before it is pruned (rejects depth glitches)
 FREE_SPACE_CLEAR_RELIABLE_S = 1.5  # s of it before a remembered object is removed (seen from a new direction)
-# TAKEN AWAY: a remembered object is removed quickly once the camera looks at its spot from a direction it was
-# detected from before (so "not detected" means something: it is not the back of a chair seen for the first
-# time), close enough, with nothing in front, and it is not there. Only the slow rule above applied before, and
-# its wide patch and 1 m margin never cleared a cup taken off a table or a chair moved away from a wall.
+# TAKEN AWAY: a remembered object is removed quickly when the camera looks at its spot, close and unobstructed,
+# from a direction it was detected from before, and it is not there.
 REMOVE_MAX_RANGE = 4.0       # m
 REMOVE_VIEW_BIN_DEG = 30.0   # viewing directions are remembered in bins this wide (+-1 bin counts as the same)
 REMOVE_UNSEEN_S = 2.0        # s undetected in plain view from a known direction...
 REMOVE_GAP_FACTOR = 3.0      # ...and at least this many times the longest gap it has ever shown between detections
                              # (an open doorway's detection flickers for 1-2 s; a chair's almost never)
-REMOVE_VISIBLE_FRACTION = 0.6  # share of an object's projected 3-D box inside the frame for "in plain view" (its
-                               # centre in the middle 76 % excluded table-height things low in a chest camera's view)
+REMOVE_VISIBLE_FRACTION = 0.6  # share of an object's projected 3-D box inside the frame for "in plain view"
 REMOVE_PERSON_OVERLAP = 0.3  # share of the object's spot covered by a person's box that counts as hiding it
 REMOVE_FREE_S = 0.7          # s, if the depth also shows the background behind its spot
 REMOVE_FREE_MARGIN = 0.3     # m (+15 % of range) behind the object's range counts as background
@@ -504,18 +484,15 @@ SEE_THROUGH = {"door", "window"}  # open doorways / windows: depth reading past 
 MAX_REMEMBERED_OBJECTS = 200  # oldest-seen remembered objects are evicted first past this count
 REMEMBERED_ALPHA = 0.30      # remembered (not currently seen) objects are drawn translucent
 OBJECTS_PUBLISH_PERIOD = 0.2 # s, /semantic_objects rate (5 Hz)
-# A static object's position is the running average of about the last 1.5 s of sightings at 20 Hz. With an
-# 8 cm floor and 0.01 m^2/s drift, each sighting moved it 25-60 %: with the rig standing still, objects
-# wandered over 22 cm (median) and up to 35 cm on the map. Real shifts (SLAM, a new viewpoint) are handled by
-# the revisit prior, image-space association and re-anchoring, not by trusting every frame.
+# A static object's position averages roughly the last 1.5 s of sightings; real shifts (SLAM corrections, a new
+# viewpoint) are handled by the revisit prior, image-space association and re-anchoring.
 STATIC_POS_Q = 0.0005        # m^2/s, static objects may slowly be re-estimated / moved
 STATIC_MIN_VAR = 0.01 ** 2   # m^2: never more certain than this
 STATIC_DIM_ALPHA = 0.08      # smoothing of a static object's width, height and elevation per sighting
 REVISIT_GAP_S = 2.0          # s unseen after which the next sighting is treated as a revisit
 REVISIT_VAR = 0.30 ** 2      # m^2: prior widened to this on a revisit (absorbs SLAM drift / a new viewing angle)
-DRIFT_MERGE_S = 1.5          # s a remembered object may go unseen in plain view, while a newer live object of its
-                             # class stands within the revisit gate, before the two are merged under the old ID
-                             # (a SLAM loop closure or depth jump moved it; it did not become two objects)
+DRIFT_MERGE_S = 1.5          # s a remembered object may go unseen in plain view, with a newer live object of its
+                             # class inside the revisit gate, before the two are merged under the old ID (SLAM moved it)
 CHI2_GATE_2D = 9.21          # 99 % gate for a 2-D innovation
 SAME_OBJECT_IOU = 0.3        # footprints overlapping this much (and statistically consistent) are one object
 # Two *different* labels on one spot (a cabinet also read as a door and a notice board) are one object when
@@ -525,23 +502,19 @@ SAME_PLACE_IOU = 0.40
 SAME_PLACE_SIZE_RATIO = 1.6
 SAME_PLACE_Z_OVERLAP = 0.5
 BIG_COST = 1e6
-# Image-space association: a static object's box overlapping, this much, the box its track had this recently
-# is that object even when its distance estimate jumped (a table's cut-off box was sized 3 m too far and
-# became a second table). The jumped position is then weighted by the jump, so it barely moves the object.
+# Image-space association: a box overlapping this much with the box its track had this recently is that object even
+# when its distance estimate jumped; the jumped position is down-weighted.
 BOX_TRACK_IOU = 0.5
 BOX_TRACK_MAX_AGE = 1.0      # s
-# After this many image-only matches in a row ranged by LiDAR or depth that agree with each other within
-# BOX_SNAP_SPREAD, the object really is at the new position (SLAM corrected the map) and is moved there;
-# box-size guesses never move it this way. With 3 unchecked sightings, a door jumped 2 m on the rig whenever
-# a chair in front of it put LiDAR ranges of 0.8 m and 3.1 m into its outline by turns.
+# After this many consecutive image-only matches, ranged by LiDAR or depth and agreeing within BOX_SNAP_SPREAD, the
+# object is moved to the new position (SLAM corrected the map). Box-size guesses never move it.
 BOX_SNAP_RUN = 10
 BOX_SNAP_SPREAD = 0.2        # m
 BOX_ONLY_COST = 2.0 * CHI2_GATE_2D  # assignment cost of an image-only match (above the 3-D gate, so 3-D matches win)
 HUD_TIMEOUT = 0.7            # s, camera-view boxes vanish this fast once the object is not detected
 RECORD_PERIOD_S = 2.0        # s between frames saved with WEARABLE_RECORD_DIR (besides every spoken alert)
 OUTDOOR_SHOW_S = 0.3         # s: outdoors an object is drawn in RViz only this long after it was last detected
-OUTDOOR_STRUCTURE = {"wall", "fence", "railing", "gate", "bus stop", "construction site"}  # drawn by the occupancy
-                             # grid, not as objects (a wall was a 3 m block on the rig)
+OUTDOOR_STRUCTURE = {"wall", "fence", "railing", "gate", "bus stop", "construction site"}  # drawn by the occupancy grid
 OUTDOOR_MARKER_LIFETIME = 0.5  # s: RViz drops the outdoor view this soon if frames stop coming
 HUD_SYNC_MAX_AGE = 0.3       # s: the window shows the frame the boxes were computed on while it is this fresh
 HUD_BOX_ALPHA, HUD_BOX_SCALE_PX = 0.15, 40.0     # static box: weight of a new corner, +1 per this many px moved
@@ -558,9 +531,7 @@ OBJECT_PALETTE = [
 
 
 # ── OBJECT COLOUR (spoken references: "the red cup", "the brown door") ──
-# Named from the object's own mask pixels, with brightness relative to the frame's white level (the chest
-# camera runs dark: a white wall reads ~0.8, a red cup 0.28, a brown door 0.09-0.16 of it). Measured on the
-# rig: cup 94 % saturated pixels, hue red; door 55-82 %, hue red/orange but dark; chairs <30 %, very dark.
+# Named from the object's mask pixels, with brightness relative to the frame's white level (the chest camera runs dark).
 COLOR_MIN_CHROMA = 0.45      # share of saturated pixels for a chromatic colour
 COLOR_SAT = 60               # HSV saturation (0-255) of a "saturated" pixel
 COLOR_MIN_VREL = 0.08        # ...and its minimum brightness relative to the frame's white level
@@ -768,7 +739,6 @@ class KalmanTracker:
         self.seen_times = deque([now], maxlen=10)
         self.uid = 0  # globally unique object id (assigned by the node), used for RViz marker ids
         self.votes = {}  # label -> accumulated (priority-weighted) confidence, for look-alike classes
-        self.from_memory = False  # reloaded from a saved map, not yet seen in this session
         self.wall_vec = np.zeros(2)  # weighted sum of (cos 2a, sin 2a) of the wall direction a (map)
         self.max_gap = 0.0  # longest time in plain view without a detection before it was seen again
         self.view_bins = set()  # directions (object -> camera, map) it has been detected from, REMOVE_VIEW_BIN_DEG bins
@@ -817,8 +787,7 @@ class KalmanTracker:
         return float(self.x[0] + self.x[2] * dt), float(self.x[1] + self.x[3] * dt)
 
     def predict(self, now: float):
-        # dt is measured from the previous predict (not the last sighting), so calling this
-        # at 20 Hz between detections no longer compounds the extrapolation.
+        # dt from the previous predict (not the last sighting), so repeated calls do not compound the extrapolation
         dt = now - self.last_predict
         if dt <= 0.0:
             return
@@ -956,14 +925,15 @@ class ObjectPerceptionNode(Node):
 
         # Press 'l' in the window to toggle the LiDAR-on-camera calibration overlay
         self._show_lidar_overlay = os.environ.get("WEARABLE_SHOW_LIDAR_OVERLAY", "0") == "1"
-        # Diagnostics for the LiDAR snap (see _lidar_hits_in_box): logs, once per second per class,
-        # why an object did or did not get a LiDAR-anchored position. Turn on to see why a mapped
-        # object's distance disagrees with the LiDAR.
+        # LiDAR snap diagnostics (_lidar_hits_in_box): logs once per second per class why an object did or did not
+        # get a LiDAR-anchored position
         self._lidar_snap_debug = os.environ.get("WEARABLE_LIDAR_SNAP_DEBUG", "0") == "1"
         self._lidar_debug_last_log = {}
 
         self.get_logger().info(f"Loading YOLO model: {MODEL_PATH}")
+        self._last_gpu_free = self._last_yolo_error = -math.inf
         self._load_model()
+        self._warm_up()
         self.get_logger().info("Model loaded. Ready for detections.")
         # Opened only now: during a first-start engine build (minutes) the window would sit frozen
         if self._show_window:
@@ -981,9 +951,8 @@ class ObjectPerceptionNode(Node):
         # ── CAMERA ACQUISITION MODE (Direct USB or ROS Wi-Fi) ──
         self._camera_mode = os.environ.get("WEARABLE_CAMERA_MODE", "direct").lower()
         self._camera_pub = self.create_publisher(Image, '/camera/image_raw', realtime_qos)
-        # The Pi's ROS camera stream arrives mirrored, so it is flipped back on arrival. From then
-        # on the frame shows the world exactly as seen from the chest, and the HUD and all
-        # geometry use it as-is. Override with WEARABLE_CAMERA_FLIP=0/1 for other cameras.
+        # The Pi's ROS camera stream arrives mirrored and is flipped back on arrival; all geometry uses the flipped
+        # frame. WEARABLE_CAMERA_FLIP=0/1 overrides it for other cameras.
         flip_default = "1" if self._camera_mode == "ros" else "0"
         self._flip_input = os.environ.get("WEARABLE_CAMERA_FLIP", flip_default) == "1"
 
@@ -1022,8 +991,7 @@ class ObjectPerceptionNode(Node):
             else:
                 self.get_logger().error("Failed to open any camera. Check USB connection.")
 
-        # Tracking and TF2 timer (runs in background ROS thread)
-        # Finished inference is picked up within 10 ms (was up to 50 ms); prediction and markers at 20 Hz
+        # Finished inference is picked up within 10 ms; prediction and markers run at 20 Hz
         self._results_timer = self.create_timer(0.01, self._results_callback)
         self._tracking_timer = self.create_timer(0.05, self._tracking_callback)
 
@@ -1033,8 +1001,6 @@ class ObjectPerceptionNode(Node):
             LaserScan, "/scan", self._scan_callback, qos_profile_sensor_data,
         )
         self._marker_pub = self.create_publisher(MarkerArray, "/semantic_markers", 10)
-        # Alias requested for other tooling; voice_navigation_assistant.py and the RViz config use /semantic_markers
-        self._marker_pub_alias = self.create_publisher(MarkerArray, "/vision_markers", 10)
         # Machine-readable object map for navigation (semantic_costmap.py / semantic_navigator.py)
         self._objects_pub = self.create_publisher(String, "/semantic_objects", 10)
         self._last_objects_pub = 0.0
@@ -1045,27 +1011,27 @@ class ObjectPerceptionNode(Node):
         delete_marker = Marker()
         delete_marker.action = Marker.DELETEALL
         self._marker_pub.publish(MarkerArray(markers=[delete_marker]))
-        self._marker_pub_alias.publish(MarkerArray(markers=[delete_marker]))
 
         # Dynamic object tracking for live map markers and warnings.
         self._hazard_pub = self.create_publisher(String, "/hazard_warning", 10)
-        self._hazard_history = {}  # {label_id: (cx, cy, area, time)}
 
         # ── OUTDOOR MODE (outdoor_awareness.py): live hazards, no map ──
         # /outdoor_alert: the one sentence to say now (JSON text/level/kind; the assistant speaks it, a critical
         # one interrupting); /outdoor_scene: what is ahead, 2 Hz (JSON; "what is around me", the status)
         self._outdoor_tracker = oa.OutdoorTracker()
         self._alert_policy = oa.AlertPolicy()
+        self._hazard_confirm = oa.HazardConfirm()
+        self._turn_until = -math.inf  # until when the wearer counts as turning fast
         self._outdoor_alert_pub = self.create_publisher(String, "/outdoor_alert", 10)
         self._outdoor_scene_pub = self.create_publisher(String, "/outdoor_scene", 10)
-        # RViz (rviz/visionnav_outdoor.rviz, fixed frame base_footprint: the wearer stays at the centre): only
-        # what is detected right now. Nothing is remembered: an object that leaves the camera view is gone
-        # from RViz on the next frame.
+        # RViz outdoor view (rviz/visionnav_outdoor.rviz, fixed frame base_footprint): only what is detected now
         self._outdoor_marker_pub = self.create_publisher(MarkerArray, "/outdoor_markers", 10)
-        # Like a car: its own motion (LiDAR odometry, also on /odom), everything tracked world-fixed
-        # (a parked car is still, a car's speed is its own), LiDAR objects tracked 360° and named by the camera,
-        # and a live occupancy grid of the last few seconds (/outdoor_occupancy). Nothing is saved.
+        # Ego-motion from LiDAR odometry (also on /odom), so everything is tracked world-fixed, plus a live occupancy
+        # grid of the last few seconds (/outdoor_occupancy). Nothing is saved.
         self._odo = ScanOdometry()
+        # Chest IMU (mpu6050_imu.py on the Pi), when fitted: its gyro gives the odometry's rotation guess
+        self._gyro = GyroYaw()
+        self.create_subscription(Imu, "/imu/data", self._gyro.add_msg, qos_profile_sensor_data)
         self._odom_enabled = os.environ.get("WEARABLE_OUTDOOR_ODOM", "1") == "1"
         self._ego_hist = deque(maxlen=60)   # (receive time, pose, velocity) per scan
         self._odom_good_run, self._odom_bad_since, self._odom_good = 0, None, False
@@ -1084,8 +1050,8 @@ class ObjectPerceptionNode(Node):
             os.makedirs(self._record_dir, exist_ok=True)
 
         # ── CAMERA MODEL ──
-        # Intrinsics: HFOV-derived pinhole unless calibrated values are given.
-        self._camera_hfov = math.radians(float(os.environ.get("WEARABLE_CAMERA_HFOV_DEG", "70.0")))
+        # Intrinsics: pinhole from the horizontal FOV (52 deg, measured on the rig) unless calibrated values are given
+        self._camera_hfov = math.radians(float(os.environ.get("WEARABLE_CAMERA_HFOV_DEG", "52.0")))
         self._calib_fx = os.environ.get("WEARABLE_CAMERA_FX")
         self._calib_fy = os.environ.get("WEARABLE_CAMERA_FY")
         self._calib_cx = os.environ.get("WEARABLE_CAMERA_CX")
@@ -1093,7 +1059,7 @@ class ObjectPerceptionNode(Node):
         # Extrinsics: read from TF (sensor_tf.launch.py). These env values are only a fallback
         # for running without the brain launch.
         fallback_h = float(os.environ.get("WEARABLE_CAMERA_HEIGHT", "1.3"))
-        fallback_pitch = math.radians(float(os.environ.get("WEARABLE_CAMERA_PITCH_DEG", "0.0")))
+        fallback_pitch = math.radians(float(os.environ.get("WEARABLE_CAMERA_PITCH_DEG", "10.0")))
         cp, sp = math.cos(fallback_pitch), math.sin(fallback_pitch)
         R_pitch = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]])
         self._cam_R = R_pitch @ R_BODY_OPTICAL
@@ -1124,17 +1090,6 @@ class ObjectPerceptionNode(Node):
             String, "/perception_mode_state",
             QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self._mode_state_pub.publish(String(data=self._mode))
-
-        # ── SAVED MAPS (map_manager): reload the objects of a saved home, save them on request ──
-        self._objects_file = None
-        self._objects_loaded = False
-        # Reloaded objects are protected from removal until one of them is seen again: before that
-        # the wearer may not be localized in the saved map yet, so "not seen where expected" means nothing.
-        self._memory_confirmed = True
-        latched = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
-                             durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        self.create_subscription(String, "/active_map", self._active_map_callback, latched)
-        self.create_subscription(String, "/map_command", self._map_command_callback, 10)
 
         # ── GRASP MODE: guide the hand to an object ("start cup" / "stop" on /grasp_command) ──
         self._grasp = GraspTracker(self.get_logger())
@@ -1176,7 +1131,6 @@ class ObjectPerceptionNode(Node):
         self._dynamic_classes = {"person", "bicycle", "car", "motorcycle", "bus", "truck", "dog", "cat"}
         if self._mode == "outdoor":
             self._dynamic_classes = self._dynamic_classes | oa.MOVERS
-        self._hazard_classes = self._dynamic_classes
 
     def _mode_callback(self, msg: String):
         """Runtime mode switching via /perception_mode topic."""
@@ -1196,6 +1150,7 @@ class ObjectPerceptionNode(Node):
                 self._hud_tracks.clear()
             self._outdoor_tracker.clear()
             self._alert_policy.reset()
+            self._hazard_confirm.reset()
             self._outdoor_hud = None
             clear = Marker()
             clear.action = Marker.DELETEALL
@@ -1208,10 +1163,12 @@ class ObjectPerceptionNode(Node):
             # Each mode has its own depth model, with its own scale
             if getattr(self, "_depth_models", None):
                 self._depth_model = self._depth_models.get(self._mode)
+                self._depth_model_name = self._mode
                 self._depth_scale, self._depth_scale_valid, self._depth_scale_t = 1.0, False, -math.inf
+                self._depth_scale_first = []
+                self._depth_fit, self._depth_pick_t = {}, -math.inf
 
-            # New window title: the window is replaced by the GUI (main) thread. Qt windows may only be touched
-            # from that thread; doing it here, in a ROS callback, crashed the node on every mode switch.
+            # The window is renamed by the GUI (main) thread: Qt crashes when touched from a ROS callback
             if self._show_window:
                 self._window_rename = f"VisionNav AI [{self._mode.upper()}]"
 
@@ -1237,7 +1194,7 @@ class ObjectPerceptionNode(Node):
         return None
 
     def _cam_drain_loop(self):
-        """Dedicated high-speed thread: captures frames with 0ms latency."""
+        """Capture thread for a directly attached USB camera: always keeps the newest frame."""
         last_ros_pub = 0.0
         while rclpy.ok():
             if self._direct_cap is None or not self._direct_cap.isOpened():
@@ -1258,18 +1215,15 @@ class ObjectPerceptionNode(Node):
             now_mono = time.monotonic()
             self._last_image_time = now_mono
 
-            # 1. Update GUI display frame for main-thread rendering
             self._gui_frame = frame
 
-            # 2. Feed freshest frame to YOLO worker (non-blocking)
-            # Always the newest frame: the worker takes it the moment it finishes the previous one (a frame was
-            # only kept while the worker was idle, so it then waited up to a frame period: 12.6 Hz, not 17)
+            # Newest frame for the YOLO worker (taken as soon as it finishes the previous one)
             with self._inference_lock:
                 self._latest_frame = frame.copy()
                 self._latest_frame_stamp = self.get_clock().now().to_msg()
                 self._latest_frame_rx = now_mono
 
-            # 3. Throttled ROS2 publisher (5Hz, only when subscribed)
+            # Raw frames republished at 5 Hz, only while someone subscribes
             if now_mono - last_ros_pub >= 0.20:
                 try:
                     if rclpy.ok() and self._camera_pub.get_subscription_count() > 0:
@@ -1286,7 +1240,7 @@ class ObjectPerceptionNode(Node):
                     pass
 
     def _ros_camera_callback(self, msg: CompressedImage) -> None:
-        """Callback for Distributed Mode: Receives image over Wi-Fi."""
+        """Camera frame from the Pi over ROS (Wi-Fi)."""
         try:
             frame = self._bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
         except Exception as e:
@@ -1427,9 +1381,8 @@ class ObjectPerceptionNode(Node):
         A point qualifies if its column is inside the (slightly shrunk) box, the scan plane's
         image row at that range crosses the box, and — with a mask — the object occupies that
         pixel. The nearest range cluster wins (front surface); single stray returns are ignored.
-        Fallback when the mounting heights in TF are off (e.g. the rig resting on a table, so the scan
-        plane cuts through chair backs but is projected to the wrong image row): LiDAR points inside
-        the object's own mask columns whose range agrees with the camera depth estimate
+        Fallback when the TF mounting heights are off (the scan row lands on the wrong image row): LiDAR
+        points inside the object's mask columns whose range agrees with the camera depth estimate
         (LIDAR_SNAP_RANGE x depth_hint). The wall behind an object is always farther than that.
         Returns (horiz_dist, xy_base_of_front_surface, n_points) or None.
 
@@ -1555,31 +1508,89 @@ class ObjectPerceptionNode(Node):
         outcome = f"lidar={lidar[0]:.2f}m/{lidar[2]}pts" if lidar is not None else "none"
         self.get_logger().info(f"🔎 LiDAR snap [{label}] depth_hint={depth_hint:.2f}m -> {outcome} | {info}")
 
-    def _update_depth_scale(self, proj, dmap):
-        """Correct the depth network's scale with the LiDAR ranges visible in the same frame."""
-        if proj is None or dmap is None:
-            return
+    @staticmethod
+    def _lidar_fit(proj, dmap, model_name):
+        """(scale, spread) of a depth map against the LiDAR ranges drawn into it: the median LiDAR/depth ratio and
+        the median relative deviation from it. None with too few points."""
         u, v, _, _, zc = proj
         H, W = dmap.shape
         ok = (u >= 0) & (u < W) & (v >= 0) & (v < H) & (zc > 0.4) & (zc < 8.0)
         if ok.sum() < DEPTH_SCALE_MIN_PTS:
-            return
+            return None
         d = dmap[v[ok].astype(int), u[ok].astype(int)]
         ratio = zc[ok] / np.maximum(d, 0.05)
-        lo, hi = DEPTH_SCALE_LIMITS[self._mode]
+        lo, hi = DEPTH_SCALE_LIMITS[model_name]
         ratio = ratio[(ratio > 0.8 * lo) & (ratio < 1.25 * hi)]
         if ratio.size < DEPTH_SCALE_MIN_PTS:
-            return
+            return None
         r = float(np.median(ratio))
-        spread = float(np.median(np.abs(ratio / r - 1.0)))
+        return r, float(np.median(np.abs(ratio / r - 1.0)))
+
+    def _pick_depth_model(self, proj, frame, dmap):
+        """Outdoor mode: every DEPTH_PICK_EVERY_S, the other depth model on the same frame; switch to it when it
+        fits the LiDAR clearly better for a while. Returns the depth map to use for this frame."""
+        models = getattr(self, "_depth_models", {})
+        if (self._mode != "outdoor" or proj is None or dmap is None or not models.get("indoor")
+                or models.get("outdoor") is models.get("indoor")):
+            return dmap
+        now = time.monotonic()
+        if now - getattr(self, "_depth_pick_t", -math.inf) < DEPTH_PICK_EVERY_S:
+            return dmap
+        self._depth_pick_t = now
+        cur = self._depth_model_name
+        other = "indoor" if cur == "outdoor" else "outdoor"
+        try:
+            other_map = self._infer_depth(frame, models[other])
+        except Exception:
+            return dmap
+        fits = {cur: self._lidar_fit(proj, dmap, cur), other: self._lidar_fit(proj, other_map, other)}
+        if fits[cur] is None or fits[other] is None:
+            return dmap
+        hist = getattr(self, "_depth_fit", None)
+        if hist is None:
+            hist = self._depth_fit = {}
+        for name, (_, spread) in fits.items():
+            old = hist.get(name)
+            hist[name] = (spread, 1) if old is None else (0.6 * old[0] + 0.4 * spread, old[1] + 1)
+        if hist[other][1] < DEPTH_PICK_MIN_SAMPLES or hist[other][0] >= DEPTH_PICK_MARGIN * hist[cur][0]:
+            return dmap
+        lo, hi = DEPTH_SCALE_LIMITS[other]
+        self._depth_model, self._depth_model_name = models[other], other
+        self._depth_scale = max(lo, min(hi, fits[other][0]))
+        self._depth_scale_valid, self._depth_scale_t, self._depth_scale_first = True, now, []
+        self._depth_fit = {}
+        self.get_logger().info(f"📏 Depth: the {other} model now (it fits the LiDAR here: "
+                               f"{100 * hist[other][0]:.0f}% vs {100 * hist[cur][0]:.0f}%)")
+        return other_map
+
+    def _update_depth_scale(self, proj, dmap):
+        """Correct the depth network's scale with the LiDAR ranges visible in the same frame."""
+        if proj is None or dmap is None:
+            return
+        fit = self._lidar_fit(proj, dmap, getattr(self, "_depth_model_name", self._mode))
+        if fit is None:
+            return
+        r, spread = fit
+        lo, hi = DEPTH_SCALE_LIMITS[getattr(self, "_depth_model_name", self._mode)]
         if spread > DEPTH_SCALE_MAX_RESID:
             return  # LiDAR and depth disagree in shape this frame (glitch / wrong row): keep the old scale
-        self._depth_scale = r if not self._depth_scale_valid else (
-            (1 - DEPTH_SCALE_ALPHA) * self._depth_scale + DEPTH_SCALE_ALPHA * r)
+        now = time.monotonic()
+        if not self._depth_scale_valid:
+            # Start from the median of the first few good frames
+            self._depth_scale_first = getattr(self, "_depth_scale_first", []) + [r]
+            if len(self._depth_scale_first) < DEPTH_SCALE_START_FRAMES:
+                return
+            self._depth_scale = float(np.median(self._depth_scale_first))
+            self._depth_scale_first = []
+        else:
+            # Log-domain low-pass with a clipped step: one odd frame barely moves it, a real change takes seconds
+            alpha = 1.0 - math.exp(-min(1.0, now - self._depth_scale_t) / DEPTH_SCALE_TAU_S)
+            step = math.log(max(1.0 / (1 + DEPTH_SCALE_STEP), min(1 + DEPTH_SCALE_STEP, r / self._depth_scale)))
+            self._depth_scale *= math.exp(alpha * step)
         self._depth_scale = max(lo, min(hi, self._depth_scale))
         self._depth_scale_valid = True
         self._depth_scale_resid = spread
-        self._depth_scale_t = time.monotonic()
+        self._depth_scale_t = now
 
     def _mono_object(self, det, K, dmap):
         """Back-project the object's own pixels with metric depth.
@@ -1706,9 +1717,8 @@ class ObjectPerceptionNode(Node):
         # ── 2. LIDAR RANGING (overrides optical when the scan plane actually hits the object) ──
         front_xy = None
         lidar_debug = {} if self._lidar_snap_debug else None
-        # The LiDAR scans one plane at chest height. An object whose top is clearly below it (a chair,
-        # a bottle on a desk) cannot be hit, so it may not borrow the range of whatever is in the same
-        # image columns (a table edge, the wall): that gave confident but wrong positions and duplicates.
+        # The LiDAR scans one plane at chest height: an object whose top is clearly below it cannot be hit, so it
+        # may not borrow the range of whatever shares its image columns (a table edge, the wall).
         snap_hint = depth
         if not LIDAR_SNAP_ANY_HEIGHT and self._lidar_t is not None and not cut_t:
             top_est = self._height_along_ray(self._pixel_ray(u_mid, y1, K), depth)
@@ -1718,19 +1728,22 @@ class ObjectPerceptionNode(Node):
         # (its own mask is too small to contain a scan point)
         obj_mask = None if label in WALL_MOUNTED else det.get("mask")
         lidar_info = {} if lidar_debug is None else lidar_debug
-        lidar = self._lidar_hits_in_box(proj, det["box"], obj_mask, depth_hint=snap_hint, debug=lidar_info)
+        # A floor object normally well below the scan plane (chair, table) is never hit, even when its top is cut
+        # off by the frame and the height check above cannot run
+        below_plane = (not LIDAR_SNAP_ANY_HEIGHT and known_size and on_floor and not is_dynamic
+                       and self._lidar_t is not None and typ_h < self._lidar_t[2] - LIDAR_BELOW_PLANE_M)
+        lidar = None if below_plane else self._lidar_hits_in_box(proj, det["box"], obj_mask, depth_hint=snap_hint,
+                                                                 debug=lidar_info)
         if lidar_debug is not None:
             self._log_lidar_snap_debug(label, depth, lidar, lidar_debug)
-        # Returns inside the object's own mask at the scan row are the object: no optical estimate may veto
-        # them (a person's cut-off box, sized 2.3 m too far, discarded a correct LiDAR range). Only the weaker
-        # column-only "snap" match must agree with the camera.
+        # Returns inside the object's own mask at the scan row are the object: no optical estimate may veto them.
+        # Only the weaker column-only "snap" match must agree with the camera.
         lidar_gate = 1e6 if lidar_info.get("reason") == "row" else (4.0 if (known_size or mono is not None) else 1e6)
         if lidar is not None and depth / lidar_gate < lidar[0] < depth * lidar_gate:
             depth, front_xy, _ = lidar
             sigma_d = 0.04 + 0.01 * depth
             source = "lidar"
-        # A door sits in its wall: range it by the frame (jambs at the box's sides). Through an open
-        # doorway the middle of the box sees the next room, which put the door metres too far away.
+        # A door sits in its wall: range it by its jambs (through an open doorway the box's middle sees the next room)
         is_door = label == "door"
         if is_door:
             jambs = self._door_frame_range(proj, det["box"])
@@ -1809,6 +1822,16 @@ class ObjectPerceptionNode(Node):
     # ══════════════════════════════════════════════════════════════════════
     # ── DETECTION ──
     # ══════════════════════════════════════════════════════════════════════
+    @staticmethod
+    def _prompted_yoloe(vocabulary):
+        """YOLOE prompted with `vocabulary`. Ultralytics looks for its text encoder (mobileclip_blt.ts) in the
+        working directory, so this runs inside models/, where that file is kept."""
+        from ultralytics import YOLOE
+        model = YOLOE(MODEL_PATH)
+        with contextlib.chdir(models_dir()):
+            model.set_classes(vocabulary, model.get_text_pe(vocabulary))
+        return model
+
     def _load_detector(self, torch, mode: str):
         """YOLOE with the mode's offline vocabulary. Returns (model, is_tensorrt_engine).
 
@@ -1816,7 +1839,7 @@ class ObjectPerceptionNode(Node):
         the per-frame path never runs a text encoder. The engine is built on first start (or after
         the vocabulary changes), before the ROS loop begins.
         """
-        from ultralytics import YOLO, YOLOE
+        from ultralytics import YOLO
         vocabulary, engine_path, _, _ = DETECTORS[mode]
         if torch.cuda.is_available():
             if not os.path.isfile(engine_path):
@@ -1824,9 +1847,8 @@ class ObjectPerceptionNode(Node):
                                        f"({len(vocabulary)} classes, one-time, 3-6 minutes; the camera window "
                                        f"opens when it is done — do not close this terminal)...")
                 try:
-                    model = YOLOE(MODEL_PATH)
-                    model.set_classes(vocabulary, model.get_text_pe(vocabulary))
-                    # 2 GB workspace: the RTX 2050 has 4 GB, and a 4 GB request ran the GPU out of memory
+                    model = self._prompted_yoloe(vocabulary)
+                    # 2 GB workspace: the laptop's RTX 2050 has only 4 GB
                     built = model.export(format="engine", half=True, workspace=2, imgsz=640, device=0)
                     shutil.move(str(built), engine_path)
                     for old in glob.glob(model_path(f"yoloe-11s-seg-{mode}-*.engine")):  # older vocabularies
@@ -1843,9 +1865,7 @@ class ObjectPerceptionNode(Node):
             if os.path.isfile(engine_path):
                 model = YOLO(engine_path, task="segment")
                 return model, True
-        model = YOLOE(MODEL_PATH)
-        model.set_classes(vocabulary, model.get_text_pe(vocabulary))
-        return model, False
+        return self._prompted_yoloe(vocabulary), False
 
     def _load_model(self):
         import torch
@@ -1897,6 +1917,7 @@ class ObjectPerceptionNode(Node):
                 self._depth_models[mode] = model.cuda().half().eval()
             self._depth_models.setdefault("outdoor", self._depth_models.get("indoor"))
             self._depth_model = self._depth_models.get(self._mode)
+            self._depth_model_name = self._mode
             self._depth_mean = torch.tensor([0.485, 0.456, 0.406], device='cuda').view(1, 3, 1, 1)
             self._depth_std = torch.tensor([0.229, 0.224, 0.225], device='cuda').view(1, 3, 1, 1)
             self.get_logger().info(f"Metric depth: Depth Anything V2 indoor"
@@ -1906,6 +1927,57 @@ class ObjectPerceptionNode(Node):
             self._depth_model = None
             self._depth_models = {}
             self.get_logger().warn(f"Metric depth disabled: {e}")
+
+    def _warm_up(self):
+        """Run every model once on a blank frame: Ultralytics puts a TensorRT engine on the GPU only at its first
+        predict, and loaded later (at a MODE switch) it may find the GPU already taken by the vision AI."""
+        import torch
+        blank = np.zeros((480, 640, 3), np.uint8)
+        for attempt in (1, 2):
+            try:
+                t0 = time.monotonic()
+                for model, _, class_ids, precision in self._detectors.values():
+                    model.predict(blank, classes=class_ids, verbose=False, **precision)
+                for model in {id(m): m for m in self._depth_models.values() if m is not None}.values():
+                    self._infer_depth(blank, model)
+                free = torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else math.inf
+                # A blank frame fits where real ones (and the tracker, the grasp view) may not: keep a margin
+                if attempt == 1 and free < GPU_MARGIN_BYTES and self._free_vision_ai():
+                    free = torch.cuda.mem_get_info()[0]
+                self.get_logger().info(f"Models warmed up on the GPU ({time.monotonic() - t0:.1f} s, "
+                                       f"{free / 1e6:.0f} MB free)")
+                return
+            except Exception as e:
+                if attempt == 1 and self._gpu_full(e) and self._free_vision_ai():
+                    continue
+                self.get_logger().error(f"Model warm-up failed: {e}")
+                return
+
+    @staticmethod
+    def _gpu_full(e) -> bool:
+        # A TensorRT engine that cannot get its memory surfaces as a None engine in Ultralytics; cuBLAS/cuDNN
+        # report it as ALLOC_FAILED
+        text = str(e).lower()
+        return any(k in text for k in ("out of memory", "create_execution_context", "alloc_failed"))
+
+    def _free_vision_ai(self) -> bool:
+        """GPU full: unload the vision AI (Qwen3-VL in Ollama). The obstacle warnings come first; Ollama loads it
+        again, into the memory that is left, at the next LOOK."""
+        self._last_gpu_free = time.monotonic()
+        try:
+            from visionnav.scene_describer import VLM_MODEL
+            done = subprocess.run(["ollama", "stop", VLM_MODEL], capture_output=True, timeout=15).returncode == 0
+        except Exception:
+            done = False
+        if done:
+            self.get_logger().warn("GPU memory full: unloaded the vision AI (it loads again at the next LOOK).")
+            import torch
+            torch.cuda.empty_cache()
+            # Ollama frees the memory a moment after `ollama stop` returns
+            t0 = time.monotonic()
+            while torch.cuda.mem_get_info()[0] < 1.0e9 and time.monotonic() - t0 < 10.0:
+                time.sleep(0.2)
+        return done
 
     def _infer_depth(self, bgr, model=None):
         """Per-pixel metric depth (m, along the optical axis) for the processed frame."""
@@ -1956,7 +2028,12 @@ class ObjectPerceptionNode(Node):
                     classes=class_ids, verbose=False, **precision,
                 )[0]
             except Exception as e:
-                self.get_logger().error(f"YOLO inference failed: {e}")
+                now = time.monotonic()
+                if self._gpu_full(e) and now - self._last_gpu_free > 30.0:
+                    self._free_vision_ai()
+                if now - self._last_yolo_error > 5.0:  # not once per frame
+                    self._last_yolo_error = now
+                    self.get_logger().error(f"YOLO inference failed: {e}")
                 with self._inference_lock:
                     self._inference_busy = False
                 continue
@@ -2000,6 +2077,8 @@ class ObjectPerceptionNode(Node):
                 try:
                     dmap = self._infer_depth(frame, depth_model)
                 except Exception as e:
+                    if self._gpu_full(e) and time.monotonic() - self._last_gpu_free > 30.0:
+                        self._free_vision_ai()
                     self._warn_once("depth_fail", f"Metric depth inference failed: {e}")
 
             # ── CROSS-CLASS SUPPRESSION: same object reported as two classes ──
@@ -2030,8 +2109,7 @@ class ObjectPerceptionNode(Node):
                 if not duplicate:
                     kept.append(d)
 
-            # A switch or socket is never on the door leaf itself: there it is the door handle (read as an
-            # "electric switch" on the rig), or something seen through an open doorway
+            # A switch or socket on a door leaf is the door handle, or something seen through an open doorway
             doors = [k["box"] for k in kept if k["label"] == "door"]
             if doors:
                 def inside(a, b):
@@ -2090,7 +2168,6 @@ class ObjectPerceptionNode(Node):
     def _associate(self, label: str, meas: list, is_dynamic: bool, now: float):
         """Globally optimal (Hungarian) matching of this frame's detections of one class to its tracks."""
         tracks_dict = self._dynamic_tracks if is_dynamic else self._static_tracks
-        timeout = self._dynamic_track_timeout if is_dynamic else self._static_track_timeout
         max_gate = self._dynamic_association_distance if is_dynamic else self._static_association_distance
         min_sep = _min_separation(label)
 
@@ -2166,18 +2243,15 @@ class ObjectPerceptionNode(Node):
                 sigma = m["sigma"]
                 if is_dynamic:
                     sigma = max(sigma, DYN_MIN_SIGMA)
-                    # Outside the 99 % gate of where the person should be: the range hit something else (the
-                    # wall behind, the person next to them) — keep the track, weight that range by its jump.
-                    # Such flips were the fake 1-2 m/s speeds of people standing still.
+                    # Outside the 99 % gate of where the person should be: the range hit something else (the wall
+                    # behind, a neighbour). Keep the track and weight that range by its jump.
                     if t.mahalanobis_sq(m["px"], m["py"], sigma) > CHI2_GATE_2D:
                         prev = t.outlier_xy
                         t.outlier_xy = (m["px"], m["py"])
                         t.outlier_run = t.outlier_run + 1 if prev is not None and math.hypot(
                             m["px"] - prev[0], m["py"] - prev[1]) <= 3 * DYN_MIN_SIGMA else 1
                         if t.outlier_run >= DYN_REANCHOR_RUN:
-                            # Several sightings agree on the new place: the track was wrong, not them. Re-anchor
-                            # there at rest (coasting on a speed made from a range flip gave 1.5 m/s to a
-                            # person standing still)
+                            # Several sightings agree on the new place: the track was wrong. Re-anchor there at rest.
                             t.x[:2], t.x[2:4] = (m["px"], m["py"]), 0.0
                             t.P[:] = 0.0
                             t.P[0, 0] = t.P[1, 1] = sigma * sigma
@@ -2204,12 +2278,6 @@ class ObjectPerceptionNode(Node):
                         keep_shape = True
                 t.update(m["px"], m["py"], t.z if keep_shape else m["z"], t.width if keep_shape else m["width_m"],
                          t.height if keep_shape else m["height_m"], m["conf"], now, sigma, m["depth"])
-                if t.from_memory:
-                    t.from_memory = False
-                    if not self._memory_confirmed:
-                        self._memory_confirmed = True
-                        self.get_logger().info(f"🏠 Localized: remembered {label}_{t.id} seen again where "
-                                               f"it was saved; the saved object map is live")
             m["track"] = t
 
         if is_dynamic:
@@ -2244,8 +2312,8 @@ class ObjectPerceptionNode(Node):
         min_sep = _min_separation(m["label"])
         if any(same(t, m["label"], min_sep) for t in self._static_tracks.get(m["label"], [])):
             return None, False
-        # In the image: a look-alike's box where a confirmed object was just seen is that object, whatever
-        # the distance says (an open doorway's "mirror" sightings ranged through the opening, 7.8 m away)
+        # In the image: a look-alike's box where a confirmed object was just seen is that object, whatever the
+        # distance says (an open doorway ranged through the opening)
         now = time.monotonic()
         best = None
         for lbl, tracks in self._static_tracks.items():
@@ -2349,69 +2417,6 @@ class ObjectPerceptionNode(Node):
         else:
             text = f"GRASP {st.get('target', '')}: {st.get('state', '')}"
         cv2.putText(frame, text, (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
-
-    # ── SAVED MAPS ──
-    def _active_map_callback(self, msg: String):
-        try:
-            info = json.loads(msg.data)
-            self._objects_file = os.path.join(info["dir"], f"{info['name']}_objects.json")
-        except (ValueError, KeyError, TypeError):
-            return
-        if info.get("mode") == "localization" and self._mode == "indoor" and not self._objects_loaded:
-            self._load_objects()
-
-    def _map_command_callback(self, msg: String):
-        if msg.data.strip().lower() == "save" and self._objects_file and self._mode == "indoor":
-            self._save_objects()
-
-    def _save_objects(self):
-        objects = [{"class": label, "x": round(float(t.x[0]), 3), "y": round(float(t.x[1]), 3),
-                    "z": round(float(t.z), 3), "w": round(t.width, 3), "h": round(t.height, 3), "hits": t.hits,
-                    **({"color": t.color} if t.color else {})}
-                   for label, tracks in self._static_tracks.items() for t in tracks if t.reliable]
-        try:
-            with open(self._objects_file, "w") as f:
-                json.dump(objects, f, indent=1)
-            self.get_logger().info(f"💾 Saved {len(objects)} objects to {self._objects_file}")
-        except OSError as e:
-            self.get_logger().error(f"Could not save objects: {e}")
-
-    def _load_objects(self):
-        self._objects_loaded = True
-        try:
-            with open(self._objects_file) as f:
-                objects = json.load(f)
-        except (OSError, ValueError):
-            return
-        now = time.monotonic()
-        for o in objects:
-            tracks = self._static_tracks.setdefault(o["class"], [])
-            taken = {t.id for t in tracks}
-            track_id = 1
-            while track_id in taken:
-                track_id += 1
-            t = KalmanTracker(track_id, o["x"], o["y"], o["z"], o["w"], o["h"], 0.5, now,
-                              False, math.sqrt(REVISIT_VAR), 0.0)
-            # Reliable and remembered, but not live: drawn faded until the camera sees it again
-            t.hits = max(int(o.get("hits", 0)), MEMORY_MIN_HITS)
-            t.is_reliable = True
-            t.conf_sum = 0.5 * t.hits
-            t.ranged_hits = t.hits
-            t.first_seen = now - MEMORY_MIN_SPAN - REVISIT_GAP_S - 1.0
-            t.last_seen = now - REVISIT_GAP_S - 1.0
-            t.seen_times.clear()
-            t.from_memory = True
-            if o.get("color"):
-                t.colors = {o["color"]: COLOR_MIN_VOTES}
-            t.uid = self._next_uid
-            self._next_uid += 1
-            tracks.append(t)
-        self._memory_confirmed = not objects
-        self.get_logger().info(f"🏠 Reloaded {len(objects)} remembered objects from {self._objects_file}")
-
-    def _protected(self, t) -> bool:
-        """A reloaded object that must not be removed yet (the wearer may not be localized)."""
-        return t.from_memory and not self._memory_confirmed
 
     def _track_ttl(self, t, is_dynamic: bool) -> float:
         """How long a track may go unseen before it is removed."""
@@ -2643,7 +2648,6 @@ class ObjectPerceptionNode(Node):
         h, w = frame.shape[:2]
         frame_dt = min(0.5, now - self._last_process_time)
         self._last_process_time = now
-        current_hazards = {}
 
         with self._hud_lock:
             # Boxes are in pixel coordinates: once stale they sit over whatever the camera turned
@@ -2655,6 +2659,7 @@ class ObjectPerceptionNode(Node):
         proj = self._project_scan(self._scan_for_stamp(msg_stamp), K, h)
         with self._hud_lock:
             self._lidar_overlay = None if proj is None else (proj[0], proj[1], proj[3])
+        dmap = self._pick_depth_model(proj, frame, dmap)
         self._update_depth_scale(proj, dmap)
         if self._grasp.active:
             self._grasp_step(frame, dets, dmap, K)
@@ -2672,13 +2677,10 @@ class ObjectPerceptionNode(Node):
             return
 
         # base_footprint -> map at the moment the image was taken
-        if self._mode == "indoor":
-            pose = self._lookup_base_pose(msg_stamp)
-            if pose is None:
-                self._warn_once("map_tf", "No map/odom TF yet — objects are not being mapped. Is SLAM running?")
-                return
-        else:
-            pose = (0.0, 0.0, 0.0)  # Outdoor: stay in base_footprint (no TF2 needed, minimum latency)
+        pose = self._lookup_base_pose(msg_stamp)
+        if pose is None:
+            self._warn_once("map_tf", "No map/odom TF yet — objects are not being mapped. Is SLAM running?")
+            return
         px0, py0, yaw0 = pose
         cyaw, syaw = math.cos(yaw0), math.sin(yaw0)
 
@@ -2716,8 +2718,8 @@ class ObjectPerceptionNode(Node):
         # Camera position in the map (viewing directions of objects)
         cam_xy_map = (px0 + cyaw * self._cam_t[0] - syaw * self._cam_t[1], py0 + syaw * self._cam_t[0] + cyaw * self._cam_t[1])
 
-        # A person the LiDAR misses this frame (arm's-length, bent down, between scan points): their metric
-        # depth, corrected by their own LiDAR/depth ratio from earlier frames (depth read people 0.37 m long)
+        # A person the LiDAR misses this frame: their metric depth, corrected by their own LiDAR/depth ratio from
+        # earlier frames
         for m in measurements:
             if m["is_dynamic"] and m["source"] != "lidar" and m.get("mono_dist"):
                 tr = self._dynamic_box_match(m, t_meas)
@@ -2760,9 +2762,6 @@ class ObjectPerceptionNode(Node):
             if id(m["track"]) in folded:
                 m["label"], m["track"] = folded[id(m["track"])]
 
-        # Track collision corridor threats (outdoor mode)
-        corridor_threats = []
-
         for m in measurements:
             track = m["track"]
             label, raw_label, conf, is_dynamic = m["label"], m["raw_label"], m["conf"], m["is_dynamic"]
@@ -2782,20 +2781,12 @@ class ObjectPerceptionNode(Node):
 
             motion_text = f"MOVING {track.velocity:.1f}m/s" if track.is_moving else "STATIONARY"
 
-            # ── OUTDOOR: Collision corridor check ──
-            if self._mode == "outdoor":
-                half_corridor = self._collision_corridor_w / 2.0
-                if abs(m["by"]) < half_corridor and 0 < m["bx"] < self._danger_distance * 1.5:
-                    corridor_threats.append((label, depth, rel_pos_text))
-
-            # ── STORE IN PERSISTENT HUD TRACKS (ZERO BLINKING) ──
+            # ── CAMERA WINDOW BOXES ──
             with self._hud_lock:
                 prev_hud = self._hud_tracks.get(final_label)
                 if prev_hud is not None:
-                    # Moving objects: the box is drawn on the frame it was detected in, so smoothing would
-                    # only make it trail the person; their distance is smoothed lightly
-                    # Static objects: small detector jitter is smoothed strongly, a real move of the box (the
-                    # wearer turning) is followed at once — adaptive, like a one-euro filter
+                    # Moving objects: the box is drawn on the frame it was detected in, so it is not smoothed (it
+                    # would trail the person). Static objects: jitter is smoothed, a real move is followed at once.
                     def smooth(old, new, scale, floor):
                         a = 1.0 if is_dynamic else min(1.0, floor + abs(new - old) / scale)
                         return (1 - a) * old + a * new
@@ -2817,7 +2808,7 @@ class ObjectPerceptionNode(Node):
                         'rel_pos': rel_pos_text, 'last_seen': now, 'source': m["source"],
                     }
 
-            # ── 5. STRUCTURED ASSISTIVE HAZARD COMMUNICATION ──
+            # ── HAZARD LOG (/hazard_warning: one text line per nearby hazard, for ros2 topic echo) ──
             danger_d = self._danger_distance * (2.0 if raw_label in DROP_HAZARDS or label in DROP_HAZARDS else 1.0)
             if track.confirmed and depth_s < danger_d * 2.0:
                 severity = "DANGER" if depth_s < danger_d else "WARNING"
@@ -2825,23 +2816,10 @@ class ObjectPerceptionNode(Node):
                               f"size {track.width:.1f}x{track.height:.1f}m, {motion_text}")
                 self._hazard_pub.publish(String(data=hazard_msg))
 
-            # ── 6. INDOOR: Register to persistent spatial memory (confirmed static objects only) ──
-
-            if raw_label in self._hazard_classes:
-                current_hazards[final_label] = (0.5 * (x1 + x2), 0.5 * (y1 + y2), (x2 - x1) * (y2 - y1), now)
-
-        # ── OUTDOOR: Publish corridor collision summary ──
-        if self._mode == "outdoor" and corridor_threats:
-            closest = min(corridor_threats, key=lambda t: t[1])
-            collision_msg = f"[COLLISION] {closest[0]} blocking path at {closest[1]:.1f}m {closest[2]} — STOP or TURN"
-            self._hazard_pub.publish(String(data=collision_msg))
-
-        self._hazard_history = current_hazards
-
-        # Objects within arm's reach: expected to have dropped into the chest sensors' blind spot,
-        # so negative evidence below must not remove them.
-        near_user = (lambda t: t.reliable and math.hypot(t.x[0] - px0, t.x[1] - py0) < BLIND_SPOT_RADIUS) \
-            if self._mode == "indoor" else (lambda t: False)
+        # Objects within arm's reach are expected to have dropped into the chest sensors' blind spot, so negative
+        # evidence below must not remove them.
+        def near_user(t):
+            return t.reliable and math.hypot(t.x[0] - px0, t.x[1] - py0) < BLIND_SPOT_RADIUS
 
         # ── CLEAN-UP OF EVERY CLASS (not only those detected this frame) ──
         for tracks in self._dynamic_tracks.values():
@@ -2856,12 +2834,10 @@ class ObjectPerceptionNode(Node):
                 m["track"] = merged_into.get(id(m["track"]), m["track"])
 
         # ── NEGATIVE EVIDENCE: mapped objects that are in plain view but not detected ──
-        # Every frame the camera looks at an object's spot (nothing closer in the way) without detecting it
-        # counts as a miss for its detection rate (MIN_DETECTION_RATE). A misdetection that is not yet
-        # reliable disappears once it goes UNSEEN_DROP_S unseen in plain view. A reliable (remembered)
-        # object is only removed on sustained free-space evidence (the depth map reads past its whole
-        # spot): not being detected from a new angle while walking around must not erase the room's map.
-        # Objects within BLIND_SPOT_RADIUS of the wearer are below the chest sensors' view and left alone.
+        # Every frame the camera looks at an object's spot (nothing closer in the way) without detecting it counts as
+        # a miss (MIN_DETECTION_RATE). An object not yet reliable disappears after UNSEEN_DROP_S unseen in plain view;
+        # a reliable one only on free-space evidence or by the TAKEN AWAY rule. Objects within BLIND_SPOT_RADIUS of
+        # the wearer are below the chest sensors' view and left alone.
         matched = {id(m["track"]) for m in measurements}
         all_static = [t for tracks in self._static_tracks.values() for t in tracks]
         view = {}
@@ -2884,7 +2860,7 @@ class ObjectPerceptionNode(Node):
         for label, tracks in self._static_tracks.items():
             survivors = []
             for t in tracks:
-                if id(t) not in matched and not near_user(t) and not self._protected(t):
+                if id(t) not in matched and not near_user(t):
                     in_view, in_view_loose, u, v, cam_depth = view[id(t)]
                     half_px = 0.5 * fx_px * t.width / max(cam_depth, 0.1)
                     clear = (not self._occluded(u, v, cam_depth, dmap, w, h, proj, half_px)
@@ -2926,10 +2902,9 @@ class ObjectPerceptionNode(Node):
                 survivors.append(t)
             tracks[:] = survivors
 
-        # ── SLAM / DEPTH JUMP: a remembered object not seen where it was, with a newer live object of its class
-        # right next to it, is that object. It keeps its old ID and takes the live position. All remembered,
-        # unseen objects of a class are matched to the newer live ones at once (Hungarian): a jump moves every
-        # object together, so nearest-first pairing handed a door's new sighting to the doorway next to it.
+        # ── SLAM / DEPTH JUMP: a remembered object not seen where it was, with a newer live object of its class right
+        # next to it, is that object: it keeps its old ID and takes the live position. All of a class are matched at
+        # once (Hungarian), since a jump moves every object together.
         for label, tracks in self._static_tracks.items():
             old = [t for t in tracks if t.is_reliable and not t.live(now)]
             if not old:
@@ -2974,8 +2949,7 @@ class ObjectPerceptionNode(Node):
             for tracks in self._static_tracks.values():
                 tracks[:] = [t for t in tracks if id(t) not in evict]
 
-        if self._mode == "indoor":
-            self._infer_tables(now)
+        self._infer_tables(now)
         # The camera window shows this frame with these boxes, so they line up even on a moving person
         self._hud_frame = (frame, now)
 
@@ -2983,7 +2957,8 @@ class ObjectPerceptionNode(Node):
     # ── OUTDOOR: live hazards (outdoor_awareness.py) ──
     # ══════════════════════════════════════════════════════════════════════
     def _scan_xy_base(self, scan):
-        """All LiDAR returns (360°) in base_footprint (N,2), the wearer's body excluded, or None."""
+        """LiDAR returns ahead of and beside the wearer in base_footprint (N,2), or None. Returns behind (past
+        oa.FRONT_LIMIT_DEG) are the wearer's own body and what they walked past, and are dropped."""
         if scan is None or self._lidar_R is None or scan.header.frame_id != self._lidar_frame:
             return None
         ranges = np.asarray(scan.ranges, dtype=np.float64)
@@ -2991,7 +2966,8 @@ class ObjectPerceptionNode(Node):
         ok = np.isfinite(ranges) & (ranges >= max(scan.range_min, LIDAR_BODY_RANGE)) & (ranges <= scan.range_max)
         r, a = ranges[ok], angles[ok]
         pts = np.stack([r * np.cos(a), r * np.sin(a), np.zeros_like(r)], axis=1) @ self._lidar_R.T + self._lidar_t
-        return pts[:, :2]
+        front = np.abs(np.degrees(np.arctan2(pts[:, 1], pts[:, 0]))) <= oa.FRONT_LIMIT_DEG
+        return pts[front, :2]
 
     def _project_base(self, pts, K):
         """Pixels (u, v) of base_footprint points (N,3); v is NaN behind the camera."""
@@ -3043,8 +3019,8 @@ class ObjectPerceptionNode(Node):
                 "length_m": (far[0] - near[0]) if far is not None else None}
 
     def _outdoor_scan(self, msg, t_rx):
-        """Every LiDAR scan in outdoor mode: the wearer's motion, the occupancy grid, and the objects around
-        (360°). Times are when the scan arrived (monotonic), the same clock as the camera frames."""
+        """Every LiDAR scan in outdoor mode: the wearer's motion, the occupancy grid and the objects ahead and
+        beside. Times are monotonic arrival times, the same clock as the camera frames."""
         self._refresh_extrinsics(t_rx)
         xy = self._scan_xy_base(msg)
         if xy is None:
@@ -3052,7 +3028,7 @@ class ObjectPerceptionNode(Node):
         ego = None
         if self._odom_enabled:
             t_scan = _stamp_to_sec(msg.header.stamp)
-            pose, vel, ok = self._odo.update(xy, t_scan)
+            pose, vel, ok = self._odo.update(xy, t_scan, self._gyro)
             # Healthy after a run of matched scans; lost after 2 s of failures (then everything falls back to
             # the body frame until it recovers)
             if ok:
@@ -3113,9 +3089,11 @@ class ObjectPerceptionNode(Node):
         ground = oa.analyze_ground(dmap, K, self._cam_R, self._cam_t, dscale,
                                    exclude_boxes=[m["box"] for m in meas if m["label"] in oa.MOVERS]) \
             if dmap is not None else None
-        # Zebra crossings: the detector rarely finds them; the white-stripe pattern does
+        ground = self._hazard_confirm.apply(ground)
+        # Zebra crossings: the detector rarely finds them; the white-stripe pattern does. Only on a floor found in
+        # the depth (stripes must lie on it): a chair's slats or a window's bars are not a crossing
         horizon = self._horizon_row(K, h)
-        zebra = oa.find_zebra_crossing(frame, horizon)
+        zebra = oa.find_zebra_crossing(frame, horizon) if ground is not None and ground.fitted else None
         if zebra is not None and not any(m["label"] in oa.CROSSINGS and _box_overlap(m["box"], zebra) > 0.3
                                          for m in meas):
             zm = self._crossing_measurement(zebra, K, ground)
@@ -3142,7 +3120,9 @@ class ObjectPerceptionNode(Node):
             gxy = np.stack([gx, gy], 1)
             self._occ.add_ground(ego, gxy[near & (hgt > oa.OBSTACLE_MIN_H) & (hgt < oa.HEAD_LOW)],
                                  gxy[near & (hgt < -oa.DROP_MIN_H) & (gx < oa.DROP_MAX_RANGE)], t_meas)
-        alerts, lanes = oa.assess(tracks, lidar, ground)
+        if vel_now is not None and abs(vel_now[2]) > oa.SIDE_TURN_RATE:
+            self._turn_until = now + oa.SIDE_TURN_HOLD_S
+        alerts, lanes = oa.assess(tracks, lidar, ground, turning=now < self._turn_until)
         self._publish_outdoor_markers(tracks, alerts, lanes, lidar, ground, now, vel_now)
         if now - self._last_occ_pub >= 0.2:
             self._last_occ_pub = now
@@ -3181,7 +3161,7 @@ class ObjectPerceptionNode(Node):
         for t in tracks:
             m = t.m
             if t.label is None or m.get("box") is None or t_meas - t.last_cam > 0.3:
-                continue  # beside / behind: LiDAR only, not in the camera picture
+                continue  # beside the wearer: LiDAR only, not in the camera picture
             x1, y1, x2, y2 = m["box"]
             name = f"{t.label.replace(' ', '_')}_{t.id}"
             detail = f"{t.dist:.1f}m ({ {'lidar': 'LiDAR', 'depth': 'depth', 'stripes': 'stripes'}.get(m.get('source'), 'cam')}) | {oa.where(*t.x[:2])}"
@@ -3215,7 +3195,7 @@ class ObjectPerceptionNode(Node):
         and the wearer's own walking path up to where it is blocked.
 
         Each array starts with DELETEALL, so RViz shows exactly the present: an object is drawn only while a
-        sensor sees it (the camera ahead, the LiDAR all around, OUTDOOR_SHOW_S), and nothing stays."""
+        sensor sees it (the camera ahead, the LiDAR ahead and beside, OUTDOOR_SHOW_S), and nothing stays."""
         if self._outdoor_marker_pub.get_subscription_count() == 0:
             return
         stamp = self.get_clock().now().to_msg()
@@ -3489,7 +3469,7 @@ class ObjectPerceptionNode(Node):
             y -= th + 12
 
     def _infer_tables(self, now: float):
-        """SMART TABLE INFERENCE: desktop objects floating at desk height imply a table YOLO missed."""
+        """Desktop objects floating at desk height imply a table YOLO missed."""
         real_tables = [t for lbl in ("table", "dining table") for t in self._static_tracks.get(lbl, [])
                        if t.live(now)]
         desk_items = [t for lbl, tracks in self._static_tracks.items() if lbl in DESKTOP_OBJECTS
@@ -3594,7 +3574,6 @@ class ObjectPerceptionNode(Node):
             current_markers.append(leader)
 
         self._marker_pub.publish(MarkerArray(markers=current_markers))
-        self._marker_pub_alias.publish(MarkerArray(markers=current_markers))
 
     def _publish_objects(self, now: float, frame_id: str):
         """Publish the global object dictionary as JSON (what the map shows, plus velocities)."""
@@ -3745,7 +3724,7 @@ class ObjectPerceptionNode(Node):
             current_markers.append(cube_marker)
             return
 
-        # Tesla-style semantic 3D rendering (Cylinders for people, spheres for balls, cubes for furniture)
+        # Shape by class: cylinders for people and bottles, spheres for round things, cubes otherwise
         if base_label in ["person", "bottle", "vase"]:
             cube_marker.type = Marker.CYLINDER
         elif base_label in ["sports ball", "apple", "orange", "bowl"]:
@@ -3822,7 +3801,7 @@ class ObjectPerceptionNode(Node):
                 cv2.circle(frame, (int(ui), int(vi)), 2, (int(255 * t), 64, int(255 * (1 - t))), -1)
 
     def _draw_cached_boxes(self, frame):
-        """Tesla FSD-style detection HUD with proximity colors, corner brackets, and assistive telemetry."""
+        """Camera window overlay: proximity-coloured boxes, corner brackets and assistive labels."""
         h, w = frame.shape[:2]
         if self._show_lidar_overlay:
             self._draw_lidar_overlay(frame)
@@ -3885,7 +3864,7 @@ class ObjectPerceptionNode(Node):
             if is_moving:
                 moving_count += 1
 
-            # ── 1. ULTRA-FAST ROI DANGER OVERLAY ──
+            # ── Danger tint on close objects ──
             if depth is not None and depth < self._danger_distance:
                 y1_i, y2_i = int(max(0, y1)), int(min(h, y2))
                 x1_i, x2_i = int(max(0, x1)), int(min(w, x2))
@@ -3894,7 +3873,7 @@ class ObjectPerceptionNode(Node):
                     color_rect = np.full_like(roi, get_proximity_color(depth))
                     cv2.addWeighted(color_rect, 0.20, roi, 0.80, 0, roi)
 
-            # ── 3. TESLA CORNER BRACKETS ──
+            # ── Corner brackets ──
             corner_len = min(20, max(6, (x2 - x1) // 4), max(6, (y2 - y1) // 4))
             cv2.line(frame, (x1, y1), (x1 + corner_len, y1), color, 3)
             cv2.line(frame, (x1, y1), (x1, y1 + corner_len), color, 3)
@@ -3905,11 +3884,11 @@ class ObjectPerceptionNode(Node):
             cv2.line(frame, (x2, y2), (x2 - corner_len, y2), color, 3)
             cv2.line(frame, (x2, y2), (x2, y2 - corner_len), color, 3)
 
-            # ── 4. CONFIDENCE BAR ──
+            # ── Confidence bar ──
             bar_w = int((x2 - x1) * max(0.0, min(1.0, conf)))
             cv2.rectangle(frame, (x1, y2 + 2), (x1 + bar_w, y2 + 6), color, cv2.FILLED)
 
-            # ── 5. ASSISTIVE LABEL: name / distance from the wearer / real height / direction ──
+            # ── Label: name / distance from the wearer / real height / direction ──
             detail = track_data.get('detail')
             if detail is None:
                 src_tag = {"lidar": "LiDAR", "depth": "depth"}.get(track_data.get('source'), "cam")
@@ -3922,7 +3901,7 @@ class ObjectPerceptionNode(Node):
                     detail += f" | MOVING {vel:.1f}m/s"
             labels.append((depth, (x1, y1, x2, y2), [label, detail], color))
 
-        # ── 6. LABEL LAYOUT: nearest objects first, never overlapping another label ──
+        # ── Label layout: nearest objects first, never overlapping another label ──
         font, scales = cv2.FONT_HERSHEY_SIMPLEX, (0.50, 0.40)
         top_limit, bottom_limit = 34, h - 24  # keep clear of the status and mode bars
         placed = []
@@ -3966,9 +3945,7 @@ class ObjectPerceptionNode(Node):
                 ty += lh
                 cv2.putText(frame, text, (bx + 5, ty - 4), font, sc, col, 1, cv2.LINE_AA)
 
-        # ══════════════════════════════════════════════════════════════════════
-        # ── TESLA HUD STATUS BAR (TOP) ──
-        # ══════════════════════════════════════════════════════════════════════
+        # ── STATUS BAR (TOP) ──
         cv2.rectangle(frame, (0, 0), (w, 32), (20, 20, 20), cv2.FILLED)
 
         now = time.monotonic()
@@ -4036,7 +4013,7 @@ def main(args=None) -> None:
 
     node = ObjectPerceptionNode(mode=mode)
 
-    # ── ZERO-LAG ARCHITECTURE: Offload ROS 2 spin to background thread ──
+    # ROS spins in a background thread; the main thread runs the OpenCV window
     def spin():
         try:
             rclpy.spin(node)
@@ -4049,7 +4026,7 @@ def main(args=None) -> None:
     ros_thread = threading.Thread(target=spin, daemon=True)
     ros_thread.start()
 
-    # ── MAIN THREAD: High-speed OpenCV GUI loop (maximum FPS, 0ms delay) ──
+    # ── MAIN THREAD: OpenCV window loop ──
     try:
         if node._show_window:
             waiting_frame = np.zeros((480, 640, 3), dtype=np.uint8)

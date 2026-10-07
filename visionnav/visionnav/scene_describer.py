@@ -8,10 +8,11 @@ Uses Qwen3-VL 2B *instruct* running 100% locally on the GPU via Ollama. When the
 question ("what colour is the door?", "is there a light switch?"), the node:
   1. Grabs the latest camera frame (un-mirrored, so left/right match the wearer)
   2. Asks the VLM, with instructions to answer briefly and only from what is visible
-  3. Speaks the answer aloud via Piper TTS
+  3. Publishes the answer on /scene_description: voice_navigation_assistant speaks it (without the assistant,
+     this node speaks it itself via Piper TTS)
 
-This is the system's only VLM. The instruct variant answers directly; the plain `qwen3-vl:2b` tag is
-the *thinking* variant, which spent its token budget on hidden reasoning and gave empty answers.
+This is the system's only VLM. The instruct variant answers directly (the plain `qwen3-vl:2b` tag is the
+thinking variant, which spends its token budget on hidden reasoning and gives empty answers).
 
 First-time setup:
   ollama pull qwen3-vl:2b-instruct
@@ -36,7 +37,7 @@ TTS_MODEL = model_path("en_US-lessac-medium.onnx")
 try:
     import rclpy
     from rclpy.node import Node
-    from sensor_msgs.msg import Image, CompressedImage
+    from sensor_msgs.msg import CompressedImage
     from std_msgs.msg import String
     from cv_bridge import CvBridge
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -62,19 +63,22 @@ def speak(text):
 # ── VLM Model Configuration ──
 VLM_MODEL = "qwen3-vl:2b-instruct"
 SYSTEM_PROMPT = (
-    "You are the eyes of a blind person, looking through a camera on their chest. Answer their "
-    "question about this image in one to three short, complete spoken sentences. Only mention what "
-    "is clearly visible; if you cannot tell, say so. Give left and right from the wearer's point of "
-    "view, and mention anything in their way when it matters for walking. Give distances in feet. "
-    "Do not rely on colours to tell things apart (they may never have seen colour): use position, "
-    "shape, size and what things are next to; name a colour only when asked about it."
+    "You are the eyes of a blind person, looking through a camera on their chest. Answer exactly the question "
+    "they ask and nothing else, in one short spoken sentence. Do not describe anything the question did not ask "
+    "about. If you cannot tell, say so. Speak to the wearer: directions are their left and right, not yours."
 )
-ANSWER_TOKENS = 256
+DESCRIBE_PROMPT = (
+    "Say only the most important things in front of the wearer, nearest first, in at most two short spoken "
+    "sentences. Give left and right from their point of view and distances in feet. No colours."
+)
+ANSWER_TOKENS = 60      # a question: one short sentence
+DESCRIBE_TOKENS = 100   # "describe": two short sentences
 KEEP_ALIVE = "30m"   # keep the model in VRAM between questions
 # The Pi's ROS camera stream arrives mirrored (as in object_perception): flip it back so that
 # "left" in the answer is the wearer's left. Override with WEARABLE_CAMERA_FLIP=0/1.
 FLIP_INPUT = os.environ.get("WEARABLE_CAMERA_FLIP", "1") == "1"
 DEFAULT_QUESTION = "Describe what is in front of me."
+ASSISTANT_NODE = "voice_navigation_assistant"  # it subscribes to /scene_description and speaks the answers
 
 
 class OfflineVLM:
@@ -99,7 +103,7 @@ class OfflineVLM:
         except Exception:
             pass
             
-        print(f"✅ GPU Warmed up! Model is now in memory. Ready to describe anything in ~2 seconds.")
+        print("✅ GPU Warmed up! Model is now in memory. Ready to describe anything in ~2 seconds.")
     
     @staticmethod
     def _jpeg(image_np) -> bytes:
@@ -110,16 +114,26 @@ class OfflineVLM:
         return ollama.chat(model=VLM_MODEL, messages=messages, keep_alive=KEEP_ALIVE, think=False,
                            options={'num_predict': num_predict, 'temperature': 0.2})
 
+    @staticmethod
+    def _sentences(text, n):
+        """The first `n` complete sentences (a small model does not always keep to the asked length)."""
+        parts = [p for p in re.split(r'(?<=[.!?])\s+', text.strip()) if p]
+        whole = [p for p in parts if p[-1] in ".!?"]
+        return " ".join((whole or parts)[:n])
+
     def describe(self, image_np, question=DEFAULT_QUESTION):
         """Answer a question about a BGR image."""
+        describing = question.strip().lower().rstrip(".") in (
+            "describe", DEFAULT_QUESTION.lower().rstrip("."), "describe what you see in this image in one sentence")
         try:
             response = self._chat([
-                {'role': 'system', 'content': SYSTEM_PROMPT},
+                {'role': 'system', 'content': DESCRIBE_PROMPT if describing else SYSTEM_PROMPT},
                 {'role': 'user', 'content': question, 'images': [self._jpeg(image_np)]},
-            ])
+            ], num_predict=DESCRIBE_TOKENS if describing else ANSWER_TOKENS)
         except Exception as e:
             return f"Error connecting to Ollama: {e}"
         answer = re.sub(r'<think>.*?</think>', '', response['message']['content'], flags=re.DOTALL).strip()
+        answer = self._sentences(answer, 2 if describing else 1)
         return answer or "I can see the scene but could not answer that. Please ask again."
 
 
@@ -163,7 +177,9 @@ class SceneDescriberNode(Node):
         """Handle commands from other nodes (e.g., voice_navigation_assistant.py)."""
         if self.latest_frame is not None:
             self._process_question(msg.data)
-            
+        else:
+            self._answer("I have no camera picture yet. Check that the camera is on.")  # not silence
+
     def _process_question(self, question):
         """Process a question about the current camera frame."""
         print("🔄 Analyzing image...")
@@ -174,14 +190,19 @@ class SceneDescriberNode(Node):
         
         print(f"⏱️  Response time: {elapsed:.1f}s")
         print(f"📝 Answer: {answer}")
-        
+        self._answer(answer)
+
+    def _answer(self, answer):
         # Publish to ROS topic
         msg = String()
         msg.data = answer
         self._desc_pub.publish(msg)
-        
-        # Speak the answer
-        speak(answer)
+
+        # The assistant says the answer when it is running (one voice, in turn with its warnings, and its STOP
+        # button cuts it off); alone, this node speaks it
+        if not any(info.node_name == ASSISTANT_NODE
+                   for info in self.get_subscriptions_info_by_topic("/scene_description")):
+            speak(answer)
 
 
 def main_ros():
@@ -190,7 +211,7 @@ def main_ros():
     rclpy.init()
     node = SceneDescriberNode(vlm)
     
-    # Background thread allowing instant frame capture and description by simply pressing ENTER!
+    # Typed questions (for testing at the laptop); Enter alone asks for a description
     def keyboard_trigger_loop():
         time.sleep(1)
         print("\n" + "="*65)

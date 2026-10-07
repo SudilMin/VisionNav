@@ -5,9 +5,8 @@ outdoor_awareness.py
 Outdoor mode for object_perception.py: live hazard awareness from the chest camera, metric depth and the
 LiDAR. Nothing is mapped or remembered; every warning comes from what is in front of the wearer right now.
 
-The open-vocabulary detector alone misses much of what matters outdoors (measured on street photos with
-YOLOE-11s: zebra crossings, trees on a footpath and most potholes were not found at all, and a water-filled
-pothole was called a "person"). So each hazard has a detector that does not depend on the class name:
+The open-vocabulary detector alone misses much of what matters outdoors (zebra crossings, trees on a footpath,
+most potholes), so each hazard also has a detector that does not depend on the class name:
 
   what                                how
   ─────────────────────────────────── ──────────────────────────────────────────────────────────────────────
@@ -24,13 +23,15 @@ pothole was called a "person"). So each hazard has a detector that does not depe
   traffic / pedestrian light colour   lit, saturated pixels of the light's box (red / yellow / green)
 
 AlertPolicy turns this into short spoken sentences in feet and clock directions ("Pole ahead, 6 feet. Step
-right."), most urgent first, without repeating itself. Everything here is plain Python/NumPy (no ROS), so it
-can be tested on recorded frames.
+right."): one at a time, about the most urgent thing only, without repeating itself or cutting itself off
+however many objects are in view. Nothing behind the wearer is tracked or said (FRONT_LIMIT_DEG). Everything
+here is plain Python/NumPy (no ROS), so it can be tested on recorded frames.
 """
 
 import math
 import os
 import time
+from collections import deque
 
 import cv2
 import numpy as np
@@ -50,7 +51,7 @@ OUTDOOR_VOCABULARY = [
     # traffic control
     "traffic light", "pedestrian traffic light", "stop sign", "road sign", "traffic cone", "road barrier",
     "barricade", "bollard", "zebra crossing", "crosswalk", "pedestrian crossing", "belisha beacon", "speed bump",
-    # street furniture (plastic chairs and tables outside shops: without "chair" a chair was called a "cat")
+    # street furniture (plastic chairs and tables outside shops)
     "chair", "plastic chair", "table", "stool", "box", "bag",
     "pole", "lamp post", "electric pole", "sign post", "fire hydrant", "bench", "trash can", "fence", "wall",
     "gate", "railing", "parking meter", "mailbox", "bus stop",
@@ -60,9 +61,8 @@ OUTDOOR_VOCABULARY = [
     "pothole", "hole in the ground", "open drain", "manhole", "curb", "stairs", "step", "ramp",
     "construction site", "debris",
 ]
-# Things that look like an object to an open-vocabulary detector but are not one; they win the box and are
-# never reported (the same trick as the indoor NEGATIVE_PROMPTS). Measured: a raised flower bed was a
-# "hole in the ground" (0.66) without "planter".
+# Things that look like an object to an open-vocabulary detector but are not one; they win the box and are never
+# reported (as the indoor NEGATIVE_PROMPTS; without "planter" a raised flower bed reads as a "hole in the ground").
 OUTDOOR_NEGATIVE_PROMPTS = ["sky", "building", "shadow", "road marking", "road", "sidewalk", "grass", "planter",
                             "shop sign", "window"]
 OUTDOOR_VOCABULARY = OUTDOOR_VOCABULARY + OUTDOOR_NEGATIVE_PROMPTS
@@ -140,7 +140,9 @@ GROUND_STRIDE = 8            # px between sampled depth pixels
 GROUND_RANSAC_ITERS = 80
 GROUND_INLIER_M = 0.06       # m from the plane counts as ground
 GROUND_MIN_INLIERS = 0.30    # share of the candidate ground points the fitted plane must explain
-GROUND_MAX_TILT_DEG = 25.0   # a "ground" plane steeper than this is a wall or a car side, not the ground
+GROUND_MAX_TILT_DEG = 15.0   # a "ground" plane steeper than this is a wall or a car side, not the ground
+GROUND_MAX_OFFSET = 0.30     # m: the plane must pass this close to the floor under the wearer (else it is a seat,
+                             # a table top or a car bonnet, and the real floor below it would read as a hole)
 GROUND_MAX_RANGE = 10.0      # m: depth beyond this is too coarse for heights
 BIN_M = 0.25                 # m, corridor bins along the walking direction
 OBSTACLE_MIN_H = 0.20        # m above the ground: something to walk into (a kerb up is ~0.15: only near)
@@ -154,13 +156,20 @@ DROP_MAX_RANGE = 5.0         # m: holes are only trusted this close (depth error
 # ── TRACKING (body frame, everything moves relative to a walking wearer) ──
 TRACK_ACCEL = {"vehicle": 8.0, "mover": 3.0, "static": 1.5}  # m^2/s^3 white-noise acceleration
 TRACK_MAX_GAP_S = 0.8        # s a track survives unseen
-TRACK_CONFIRM_HITS = 2       # sightings before it is reported (kills one-frame hallucinations)
+TRACK_CONFIRM_HITS = 3       # camera sightings before it is reported (kills one- and two-frame hallucinations)
+# What the camera named is kept only while the camera keeps seeing it (nearby LiDAR returns alone do not keep it)
+CAM_KEEP_IN_VIEW_S = 1.0     # s a named object in the camera's view lasts without the camera seeing it
+CAM_KEEP_BESIDE_S = 4.0      # s once out of the camera's view (beside the wearer; the LiDAR still warns, unnamed)
 DROP_CONFIRM_HITS = 3        # ground hazards are noisier (texture): one more sighting
+ANIMAL_CONFIRM_HITS = 5      # animals are often hallucinated in dark texture (a chair's weave read as a "cat")...
+ANIMAL_MIN_CONF = 0.5        # ...so they need more sightings and a higher mean score
+HAZARD_CONFIRM = (3, 5)      # a drop / head-height hazard from depth counts once seen in 3 of the last 5 frames...
+HAZARD_CONFIRM_M = 0.5       # ...at about the same distance
 TRACK_GATE_M = {"vehicle": 4.0, "mover": 1.5, "static": 1.2}  # m association gate (+ speed * dt)
 SPEED_MIN_AGE_S = 0.5        # s tracked before its speed is trusted
 APPROACH_MIN_HITS = 5        # sightings before anything is said to be coming toward the wearer
 LIDAR_CONFIRM_HITS = 4       # scans before an unnamed LiDAR object counts (it is never drawn or named, only
-                             # used for "something coming from behind")
+                             # used for "something coming on your left / right")
 CLUSTER_GATE_M = {"vehicle": 2.5, "mover": 0.8, "static": 0.6}  # m, LiDAR cluster to object
 
 # ── ALERTS ──
@@ -169,23 +178,37 @@ VEHICLE_TTC_CRITICAL = 3.0   # s
 VEHICLE_TTC_WARNING = 6.0
 VEHICLE_APPROACH_MPS = 1.5   # m/s toward the wearer faster than walking into it: the vehicle is moving
 OBSTACLE_CRITICAL_M = 1.0    # m, something in the path this close: stop
-OBSTACLE_WARNING_M = 2.5
+OBSTACLE_WARNING_M = 2.0
 DROP_CRITICAL_M = 1.8
 DROP_WARNING_M = 4.5
 OVERHEAD_CRITICAL_M = 1.5
 OVERHEAD_WARNING_M = 3.5
 PERSON_WARNING_M = 2.0       # a person in the path this close (and not walking away)
-CAMERA_HALF_FOV_DEG = 38.0   # beyond this bearing only the LiDAR sees an object
-REAR_MIN_SPEED = 1.2         # m/s of its own: something coming from behind / the side (needs odometry)
-REAR_TTC = 4.0               # s
-REAR_RANGE = 10.0            # m
-REAR_MIN_HITS = 8            # LiDAR sightings, and...
-REAR_MIN_AGE_S = 1.0         # ...seconds tracked, before something unseen by the camera is said to be coming
+CAMERA_HALF_FOV_DEG = 26.0   # beyond this bearing only the LiDAR sees an object (camera: 52 deg wide)
+FRONT_LIMIT_DEG = 100.0      # farther round than this from straight ahead is behind the wearer: not tracked, drawn
+                             # or said
+SIDE_MIN_SPEED = 1.2         # m/s of its own: something coming from the side (needs odometry)
+SIDE_TTC = 4.0               # s
+SIDE_RANGE = 10.0            # m
+SIDE_MIN_HITS = 12           # LiDAR sightings, and...
+SIDE_MIN_AGE_S = 1.5         # ...seconds tracked, before something unseen by the camera is said to be coming
+SIDE_TURN_RATE = math.radians(30.0)  # rad/s: turning faster than this, the odometry slips and walls beside the
+SIDE_TURN_HOLD_S = 1.5       # wearer seem to move: no "coming" alerts while turning and for this long after
 ANIMAL_WARNING_M = 3.0
-GLOBAL_GAP_S = 1.2           # s between two spoken alerts (a critical one interrupts at once)
-REPEAT_S = {CRITICAL: 3.0, WARNING: 7.0, INFO: 20.0}  # s before the same thing is said again at the same level
-CLOSER_REPEAT = 0.5          # ...or sooner, once it is this fraction of the distance it was announced at
-PATH_CLEAR_AFTER_S = 2.5     # s the path must stay clear before "Path clear" (after a blocking warning)
+STOP_ADVICE_M = 1.0          # m: "Stop." (no free side to step to) is only said this close
+NAME_LATERAL_M = 0.5         # m: a detection names what blocks the path only if it is on the same side
+# Speaking: one sentence at a time about the most urgent thing. The same thing is said again only when it becomes
+# more urgent (a warning turning into a danger) or after REPEAT_S, never just because it came a little closer.
+REPEAT_S = {CRITICAL: 6.0, WARNING: 15.0, INFO: 30.0}  # s before the same thing is said again at the same level,
+REPEAT_MAX_S = 30.0          # ...doubling each time while nothing has changed (standing in front of a table)
+FARTHER_M = 1.0              # m: what is in the path is this much farther than what was announced = another thing
+CHANGE_S = 5.0               # s before another thing in the same place is announced
+STICK_M = 0.5                # m: of several things in the path, the one announced stays the one spoken about
+                             # until another is this much nearer
+PAUSE_S = {WARNING: 2.5, INFO: 5.0}  # s of silence after a sentence before the next warning / information
+PATH_CLEAR_AFTER_S = 4.0     # s the path must stay clear before "Path clear" (after a blocking warning)
+GENERIC = "obstacle"         # what the LiDAR / depth found but the camera did not name
+BLOCKING_SLOTS = ("path", "vehicle")
 
 UNITS = os.environ.get("WEARABLE_UNITS", "feet").lower()  # "feet" (VisionNav default) or "metric"
 
@@ -231,6 +254,17 @@ def side_of(y: float) -> str:
 
 def spoken_class(label: str) -> str:
     return {"curb": "kerb", "walk signal": "pedestrian signal"}.get(label, label)
+
+
+def behind(x: float, y: float) -> bool:
+    """Behind the wearer (body frame, x forward, y left): past FRONT_LIMIT_DEG from straight ahead."""
+    return abs(math.degrees(math.atan2(y, x))) > FRONT_LIMIT_DEG
+
+
+def say_time(text: str) -> float:
+    """Seconds the assistant takes to say a sentence (Piper on the laptop: 2.5 s for "Chair ahead, 1 foot. Step
+    right.", 0.9 s for "Path clear.")."""
+    return 0.4 + len(text) / 14.0
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -355,9 +389,8 @@ def find_zebra_crossing(bgr: np.ndarray, horizon_v: int):
     for i in range(len(bars)):
         groups.setdefault(root(i), []).append(i)
     best = max(groups.values(), key=len)
-    # A crossing near enough to matter spans much of the view: measured on street photos, real ones were 6-7
-    # bars adding up to 1.2-1.6 image widths; sunlit paving slabs, house siding and a kerb's paint 3-4 bars
-    # adding up to under 0.3
+    # A crossing near enough to matter spans much of the view (real ones: 6-7 bars over 1.2-1.6 image widths;
+    # paving slabs, siding and kerb paint: 3-4 bars under 0.3)
     if len(best) < ZEBRA_MIN_BARS + 1 or sum(bars[i][2] for i in best) < ZEBRA_MIN_TOTAL_LEN * W:
         return None
     pts = np.vstack([bars[i][4].reshape(-1, 2) for i in best])
@@ -442,10 +475,13 @@ def analyze_ground(dmap: np.ndarray, K, cam_R: np.ndarray, cam_t: np.ndarray, sc
     # cloud, and the fitted plane is what corrects it.
     cand = (vs > 0.55 * H) & (P[:, 0] > 0.5) & (P[:, 0] < 12.0) & (P[:, 2] < cam_t[2] - 0.5)
     plane = fit_ground(P[cand]) if cand.sum() >= 30 else None
+    if plane is not None and abs((plane[1] + plane[0][0] * cam_t[0] + plane[0][1] * cam_t[1]) / plane[0][2]) \
+            > GROUND_MAX_OFFSET:
+        plane = None  # not the floor the wearer stands on
     res.fitted = plane is not None
     if plane is None:
-        # No ground in view (looking at a wall or a car side, or a pitch far from TF): heights against the
-        # nominal floor were mostly noise on street photos, so nothing is reported from depth this frame
+        # No ground in view (a wall or a car side, or a pitch far from TF): heights against the nominal floor are
+        # mostly noise, so nothing is reported from depth this frame
         return res
     n, d = plane
     res.plane = plane
@@ -504,6 +540,30 @@ def analyze_ground(dmap: np.ndarray, K, cam_R: np.ndarray, cam_t: np.ndarray, sc
     return res
 
 
+class HazardConfirm:
+    """Depth's drops and head-height hazards count only once seen in HAZARD_CONFIRM[0] of the last
+    HAZARD_CONFIRM[1] frames at about the same distance: a single frame's depth error is never said."""
+
+    def __init__(self):
+        k, n = HAZARD_CONFIRM
+        self._need = k
+        self._hist = {"drop": deque(maxlen=n), "overhead": deque(maxlen=n)}
+
+    def apply(self, ground):
+        """Clear ground.drop / ground.overhead that are not confirmed yet. Returns `ground`."""
+        for kind, hist in self._hist.items():
+            hit = getattr(ground, kind, None) if ground is not None and ground.ok else None
+            hist.append(None if hit is None else hit[0])
+            if hit is not None and sum(1 for d in hist if d is not None
+                                       and abs(d - hit[0]) <= HAZARD_CONFIRM_M) < self._need:
+                setattr(ground, kind, None)
+        return ground
+
+    def reset(self):
+        for hist in self._hist.values():
+            hist.clear()
+
+
 # ══════════════════════════════════════════════════════════════════════
 # ── LIDAR CORRIDOR ──
 # ══════════════════════════════════════════════════════════════════════
@@ -530,7 +590,7 @@ def lidar_corridor(xy: np.ndarray):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ── LIDAR OBJECTS (360°) ──
+# ── LIDAR OBJECTS (ahead and beside the wearer) ──
 # ══════════════════════════════════════════════════════════════════════
 CLUSTER_GAP = 0.20           # m (+ CLUSTER_GAP_PER_M x range) between neighbouring returns of one object
 CLUSTER_GAP_PER_M = 0.03
@@ -541,7 +601,8 @@ CLUSTER_MAX_LEN = 5.5        # m: longer is structure (a wall, a fence, a hedge)
 
 def lidar_clusters(xy: np.ndarray):
     """Objects in one scan (base_footprint points in scan order): a run of returns with no gap between them.
-    Returns measurements like the camera's, but unnamed (label None): centre, extent and direction."""
+    Returns measurements like the camera's, but unnamed (label None): centre, extent and direction. Only ahead
+    of and beside the wearer: what is behind them is not an object here."""
     if xy is None or len(xy) < CLUSTER_MIN_PTS:
         return []
     r = np.hypot(xy[:, 0], xy[:, 1])
@@ -560,7 +621,7 @@ def lidar_clusters(xy: np.ndarray):
             width = float(np.ptp((p - c) @ V[:, 0])) + 0.05
         else:
             axis, length, width = np.array([1.0, 0.0]), 0.1, 0.1
-        if length > CLUSTER_MAX_LEN:
+        if length > CLUSTER_MAX_LEN or behind(c[0], c[1]):
             continue
         # The LiDAR sees the near face: the centre is about half a thickness behind it (small objects)
         dist = float(np.hypot(*c))
@@ -573,7 +634,7 @@ def lidar_clusters(xy: np.ndarray):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ── LIVE OCCUPANCY (like a car's occupancy network, but from LiDAR + depth) ──
+# ── LIVE OCCUPANCY (LiDAR + depth, the last few seconds) ──
 # ══════════════════════════════════════════════════════════════════════
 OCC_RES = 0.10               # m per cell
 OCC_CELLS = 300              # 30 x 30 m around the wearer
@@ -586,10 +647,10 @@ OCC_FREE_SHOW = -0.8         # ...below which it is walkable free space
 
 
 class LocalOccupancy:
-    """What is occupied and what is free around the wearer, from the last few seconds of LiDAR (360°, chest
-    height) and depth (ahead: low obstacles and drops). World-fixed while the wearer's motion is known, so a
-    wall stays put while they walk; without odometry, just the latest scan in the body frame. It forgets on its
-    own (OCC_HALF_LIFE_S) and is never saved: a live picture, not a map."""
+    """What is occupied and free around the wearer, from the last few seconds of LiDAR (ahead and beside, chest
+    height) and depth (ahead: low obstacles and drops). World-fixed while the wearer's motion is known, so a wall
+    stays put while they walk; without odometry, just the latest scan in the body frame. It forgets on its own
+    (OCC_HALF_LIFE_S) and is never saved: a live picture, not a map."""
 
     def __init__(self):
         self.L = np.zeros((OCC_CELLS, OCC_CELLS), np.float32)      # LiDAR (chest height)
@@ -710,9 +771,9 @@ class OutdoorTrack:
     walking wearer). Either way, set_view() gives `x` / `P` as seen from the wearer now: body-frame position and
     velocity relative to the wearer, which is what the hazard rules use.
 
-    Fed by the camera (named: "car") and by LiDAR clusters (unnamed, all around). A LiDAR object takes the name
-    of the camera detection it is matched with and keeps it while the LiDAR still sees it beside or behind the
-    wearer: still live, not remembered."""
+    Fed by the camera (named: "car") and by LiDAR clusters (unnamed, ahead and beside). A LiDAR object takes the
+    name of the camera detection it is matched with and keeps it while the LiDAR still sees it beside the wearer:
+    still live, not remembered. Once behind them it is dropped."""
     _next_id = 1
 
     def __init__(self, m, now, ego=None):
@@ -727,6 +788,7 @@ class OutdoorTrack:
         self.first_seen = self.last_seen = self.t = now
         self.hits = 1
         self.cam_hits = 0 if m.get("cluster") else 1
+        self.conf_sum = 0.0 if m.get("cluster") else float(m.get("conf", 0.0))  # summed camera scores
         self.last_cam = -math.inf if m.get("cluster") else now
         self.m = m                  # latest camera measurement (box, sizes, source); a cluster's until one comes
         self.cm = m if m.get("cluster") else None  # latest LiDAR cluster
@@ -743,6 +805,8 @@ class OutdoorTrack:
     def confirmed(self):
         if self.label is None:
             return self.hits >= LIDAR_CONFIRM_HITS
+        if self.label in ANIMALS:
+            return self.cam_hits >= ANIMAL_CONFIRM_HITS and self.conf_sum / self.cam_hits >= ANIMAL_MIN_CONF
         need = DROP_CONFIRM_HITS if self.label in DROPS or self.label in CROSSINGS else TRACK_CONFIRM_HITS
         return self.cam_hits >= need
 
@@ -783,6 +847,7 @@ class OutdoorTrack:
         if self.label is None or (m["label"] != self.label and self.cam_hits < 3):
             self.label = m["label"]  # the camera names what the LiDAR found (or corrects an early name)
         self.cam_hits += 1
+        self.conf_sum += float(m.get("conf", 0.0))
         self.last_cam = now
         self.m = m
         if m.get("signal") is not None:
@@ -792,6 +857,14 @@ class OutdoorTrack:
         if self.color_votes:
             best = max(self.color_votes, key=self.color_votes.get)
             self.color = best if self.color_votes[best] >= 1.2 else self.color
+
+    def body_xy(self, ego=None):
+        """Position relative to the wearer at pose `ego` (x forward, y left); tracked in the body frame: as it is."""
+        if ego is None or not self.world:
+            return float(self.xw[0]), float(self.xw[1])
+        c, s_ = math.cos(ego[2]), math.sin(ego[2])
+        dx, dy = self.xw[0] - ego[0], self.xw[1] - ego[1]
+        return float(c * dx + s_ * dy), float(-s_ * dx + c * dy)
 
     def set_view(self, ego=None, ego_vel=None):
         """x / P as seen from the wearer now (body frame, velocity relative to the wearer walking straight on)."""
@@ -837,8 +910,7 @@ class OutdoorTrack:
 
     def approaching(self, speed: float) -> bool:
         """Confidently coming toward the wearer faster than `speed` (m/s): the closing speed minus two standard
-        deviations of its own uncertainty. Monocular ranges jitter by tens of centimetres per frame; on street
-        photos (not moving at all) that alone made a parked car "coming, 12 feet" with the plain estimate."""
+        deviations of its own uncertainty (monocular ranges jitter by tens of centimetres per frame)."""
         if self.hits < APPROACH_MIN_HITS:
             return False
         r = max(self.dist, 1e-3)
@@ -926,11 +998,22 @@ class OutdoorTracker:
             t = OutdoorTrack(m, now, ego)
             m["track"] = t
             self.tracks.append(t)
-        self.tracks = [t for t in self.tracks if now - t.last_seen <= TRACK_MAX_GAP_S]
+        # Gone: not seen for a moment, or now behind the wearer (they walked past it, or turned round), or named by
+        # the camera that no longer sees it (CAM_KEEP_*)
+        self.tracks = [t for t in self.tracks
+                       if now - t.last_seen <= TRACK_MAX_GAP_S and not behind(*t.body_xy(ego))
+                       and (t.label is None or t.cam_hits == 0 or now - t.last_cam <= self._cam_keep(t, ego))]
         return [t for t in self.tracks if t.confirmed]
 
+    @staticmethod
+    def _cam_keep(t, ego):
+        x, y = t.body_xy(ego)
+        in_view = x > 0.3 and abs(math.degrees(math.atan2(y, x))) < 0.85 * CAMERA_HALF_FOV_DEG
+        return CAM_KEEP_IN_VIEW_S if in_view else CAM_KEEP_BESIDE_S
+
     def confirmed(self):
-        return [t for t in self.tracks if t.confirmed]
+        """Confirmed objects ahead of and beside the wearer (as of the last set_view)."""
+        return [t for t in self.tracks if t.confirmed and not behind(t.x[0], t.x[1])]
 
     def set_view(self, ego=None, ego_vel=None):
         for t in self.tracks:
@@ -953,11 +1036,20 @@ def _box_iou(a, b):
 # ── HAZARD ASSESSMENT AND SPOKEN ALERTS ──
 # ══════════════════════════════════════════════════════════════════════
 class Alert:
-    def __init__(self, key, level, text, dist=None, kind="obstacle"):
+    def __init__(self, key, level, text, dist=None, kind="obstacle", slot=None, name=None):
         self.key, self.level, self.text, self.dist, self.kind = key, level, text, dist, kind
+        # Alerts sharing a slot are one thing to say: only the most urgent of them is spoken (AlertPolicy).
+        # Everything the wearer would walk into is in "path", a vehicle driving toward them in "vehicle".
+        self.slot = slot or key
+        self.name = name  # what it is ("chair"): tells another thing in the path from the same one again
+
+    @property
+    def rank(self):
+        """What may cut off what: a danger over a warning, a vehicle coming over any other danger."""
+        return self.level + (1 if self.kind == "vehicle" and self.level >= CRITICAL else 0)
 
     def as_dict(self):
-        return {"key": self.key, "level": self.level, "text": self.text,
+        return {"key": self.key, "level": self.level, "text": self.text, "rank": self.rank,
                 "dist": None if self.dist is None else round(self.dist, 2), "kind": self.kind}
 
 
@@ -966,7 +1058,8 @@ def _step_advice(lanes, block_d):
     need = block_d + 1.5
     left, right = lanes.get("left", 0.0), lanes.get("right", 0.0)
     if max(left, right) < need:
-        return " Stop."  # both sides blocked too
+        # Both sides blocked too: "Stop." only once it is close (not in the middle of a room)
+        return " Stop." if block_d < STOP_ADVICE_M else ""
     if left >= need and (left > right + 0.5 or right < need):
         return " Step left."
     if right >= need and (right > left + 0.5 or left < need):
@@ -974,10 +1067,14 @@ def _step_advice(lanes, block_d):
     return " Step left or right."
 
 
-def assess(tracks, lidar, ground, crossing_track=None):
+def assess(tracks, lidar, ground, turning=False):
     """All hazards in front of the wearer now, most urgent first. `tracks`: confirmed OutdoorTracks,
-    `lidar`: lidar_corridor() or None, `ground`: GroundAnalysis or None."""
+    `lidar`: lidar_corridor() or None, `ground`: GroundAnalysis or None, `turning`: the wearer is turning (or
+    just turned) fast, so the LiDAR-only motion of things beside them is not trusted."""
     alerts = []
+
+    def in_path(key, level, text, d, kind, name):
+        alerts.append(Alert(key, level, text, d, kind, "path", name))
     # Lanes for "step left / right": the nearer blockage of LiDAR (chest height) and depth (low things)
     lanes = {}
     for name in ("left", "center", "right"):
@@ -992,16 +1089,17 @@ def assess(tracks, lidar, ground, crossing_track=None):
     for t in tracks:
         lbl, d = t.label, t.dist
         bearing = math.degrees(math.atan2(t.x[1], t.x[0]))
-        # Out of the camera's view (beside / behind): only the LiDAR sees it. With the wearer's own motion known,
-        # something moving by itself toward them (a cyclist from behind) is worth a warning, named or not.
+        if behind(t.x[0], t.x[1]):
+            continue  # nothing behind the wearer is said
+        # Out of the camera's view (beside): only the LiDAR sees it. With the wearer's own motion known,
+        # something moving by itself toward them (a cyclist from a side road) is worth a warning, named or not.
         if abs(bearing) > CAMERA_HALF_FOV_DEG and (lbl is None or lbl in MOVERS):
-            if (t.world and t.hits >= REAR_MIN_HITS and t.t - t.first_seen >= REAR_MIN_AGE_S
-                    and t.moving(REAR_MIN_SPEED) and t.approaching(1.0) and t.ttc < REAR_TTC and d < REAR_RANGE):
-                side = "behind you" if abs(bearing) > 135 else "on your left" if bearing > 0 else "on your right"
+            if (not turning and t.world and t.hits >= SIDE_MIN_HITS and t.t - t.first_seen >= SIDE_MIN_AGE_S
+                    and t.moving(SIDE_MIN_SPEED) and t.approaching(1.0) and t.ttc < SIDE_TTC and d < SIDE_RANGE):
+                side = "on your left" if bearing > 0 else "on your right"
                 what = spoken_class(lbl).capitalize() if lbl else "Something"
-                # Keyed by side, not by track: someone moving about behind the wearer broke into new tracks and
-                # was announced every 2-3 s on the rig
-                alerts.append(Alert(f"rear:{side}", WARNING, f"{what} coming {side}, {say_distance(d)}.", d, "rear"))
+                # Keyed by side, not by track: someone moving about beside the wearer breaks into new tracks
+                alerts.append(Alert(f"side:{side}", WARNING, f"{what} coming {side}, {say_distance(d)}.", d, "side"))
             continue
         if lbl is None:
             continue  # unnamed LiDAR object in front: the corridor check below covers it
@@ -1014,14 +1112,14 @@ def assess(tracks, lidar, ground, crossing_track=None):
             moving = (t.moving(1.0) and t.approaching(0.5)) if t.world else t.approaching(VEHICLE_APPROACH_MPS)
             if moving and (t.in_path(0.8) or t.will_cross_path()) and ttc < VEHICLE_TTC_CRITICAL:
                 alerts.append(Alert(f"veh{t.id}", CRITICAL, f"Stop. {name.capitalize()} coming {where(*t.x[:2])}, "
-                                    f"{say_distance(d)}.", d, "vehicle"))
+                                    f"{say_distance(d)}.", d, "vehicle", "vehicle", name))
             elif moving and ttc < VEHICLE_TTC_WARNING and d < 25:
                 alerts.append(Alert(f"veh{t.id}", WARNING, f"{name.capitalize()} approaching {where(*t.x[:2])}, "
-                                    f"{say_distance(d)}.", d, "vehicle"))
+                                    f"{say_distance(d)}.", d, "vehicle", "vehicle", name))
             elif t.in_path() and d < OBSTACLE_WARNING_M * 1.6:
                 named_in_path.append((d, t))
-                alerts.append(Alert(f"obj{t.id}", CRITICAL if d < OBSTACLE_CRITICAL_M else WARNING,
-                                    f"Parked {name} ahead, {say_distance(d)}.", d, "obstacle"))
+                in_path(f"obj{t.id}", CRITICAL if d < OBSTACLE_CRITICAL_M else WARNING,
+                        f"Parked {name} ahead, {say_distance(d)}.", d, "obstacle", name)
             continue
         if lbl in PEOPLE or lbl in ANIMALS:
             coming = (t.moving(0.5) and t.approaching(0.5)) if t.world else t.approaching(1.0)
@@ -1030,8 +1128,8 @@ def assess(tracks, lidar, ground, crossing_track=None):
                 named_in_path.append((d, t))
                 if d < limit or (coming and t.ttc < 3.0):
                     what = f"{name.capitalize()} {'coming toward you' if coming else 'ahead'}"
-                    alerts.append(Alert(f"obj{t.id}", CRITICAL if d < OBSTACLE_CRITICAL_M else WARNING,
-                                        f"{what}, {say_distance(d)}.", d, "mover"))
+                    in_path(f"obj{t.id}", CRITICAL if d < OBSTACLE_CRITICAL_M else WARNING,
+                            f"{what}, {say_distance(d)}.", d, "mover", name)
             elif lbl in ANIMALS and d < limit:
                 alerts.append(Alert(f"obj{t.id}", WARNING, f"{name.capitalize()} {where(*t.x[:2])}, "
                                     f"{say_distance(d)}.", d, "mover"))
@@ -1040,14 +1138,14 @@ def assess(tracks, lidar, ground, crossing_track=None):
             if t.in_path(0.3) and d < DROP_WARNING_M * 1.5:
                 level = CRITICAL if d < DROP_CRITICAL_M else WARNING
                 verb = {"stairs": "Stairs", "step": "Step", "curb": "Kerb"}.get(lbl, name.capitalize())
-                alerts.append(Alert(f"obj{t.id}", level, f"{verb} ahead, {say_distance(d)}.", d, "drop"))
+                in_path(f"obj{t.id}", level, f"{verb} ahead, {say_distance(d)}.", d, "drop", name)
             continue
         if lbl in OVERHEAD:
             low = t.m.get("z", 0.0)
             if t.in_path(0.2) and HEAD_LOW - 0.3 <= low <= HEAD_HIGH and d < OVERHEAD_WARNING_M * 1.5:
                 level = CRITICAL if d < OVERHEAD_CRITICAL_M else WARNING
-                alerts.append(Alert(f"obj{t.id}", level, f"Low {name} at head height, {say_distance(d)} ahead. "
-                                    f"Duck.", d, "overhead"))
+                in_path(f"obj{t.id}", level, f"Low {name} at head height, {say_distance(d)} ahead. Duck.", d,
+                        "overhead", name)
             continue
         if lbl in INFO_ONLY:
             if lbl == "stop sign" and d < 12:
@@ -1064,37 +1162,38 @@ def assess(tracks, lidar, ground, crossing_track=None):
         blockers.append((ground.obstacle[0], ground.obstacle[1], "depth"))
     if blockers:
         d, y, src = min(blockers)
-        match = min((nt for nt in named_in_path if abs(nt[0] - d) < max(0.8, 0.25 * d)),
+        match = min((nt for nt in named_in_path if abs(nt[0] - d) < max(0.8, 0.25 * d)
+                     and abs(nt[1].x[1] - y) <= NAME_LATERAL_M + 0.5 * min(nt[1].m.get("width_m", 0.5), 3.0)),
                     key=lambda nt: abs(nt[0] - d), default=None)
         # A moving person / vehicle is announced by its own alert above
         if match is None or match[1].label not in MOVERS:
-            name = spoken_class(match[1].label) if match is not None else "obstacle"
+            name = spoken_class(match[1].label) if match is not None else GENERIC
             key = f"obj{match[1].id}" if match is not None else "path"
             if d < OBSTACLE_WARNING_M:
                 level = CRITICAL if d < OBSTACLE_CRITICAL_M else WARNING
-                alerts = [a for a in alerts if a.key != key]
-                alerts.append(Alert(key, level, f"{name.capitalize()} ahead, {say_distance(d)}."
-                                    + _step_advice(lanes, d), d, "obstacle"))
+                alerts[:] = [a for a in alerts if a.key != key]
+                in_path(key, level, f"{name.capitalize()} ahead, {say_distance(d)}." + _step_advice(lanes, d), d,
+                        "obstacle", name)
     else:
         # Detected static things in the path that neither LiDAR nor depth confirmed (below the scan plane,
         # no depth): still worth a warning when close
         for d, t in named_in_path:
             if t.label not in MOVERS and d < OBSTACLE_WARNING_M:
-                alerts.append(Alert(f"obj{t.id}", CRITICAL if d < OBSTACLE_CRITICAL_M else WARNING,
-                                    f"{spoken_class(t.label).capitalize()} ahead, {say_distance(d)}."
-                                    + _step_advice(lanes, d), d, "obstacle"))
+                in_path(f"obj{t.id}", CRITICAL if d < OBSTACLE_CRITICAL_M else WARNING,
+                        f"{spoken_class(t.label).capitalize()} ahead, {say_distance(d)}." + _step_advice(lanes, d),
+                        d, "obstacle", spoken_class(t.label))
 
     if ground is not None and ground.ok:
         if ground.drop is not None and not any(a.kind == "drop" for a in alerts):
             d = ground.drop[0]
             if d < DROP_WARNING_M:
-                alerts.append(Alert("drop", CRITICAL if d < DROP_CRITICAL_M else WARNING,
-                                    f"Drop or hole ahead, {say_distance(d)}.", d, "drop"))
+                in_path("drop", CRITICAL if d < DROP_CRITICAL_M else WARNING,
+                        f"Drop or hole ahead, {say_distance(d)}.", d, "drop", "drop")
         if ground.overhead is not None and not any(a.kind == "overhead" for a in alerts):
             d = ground.overhead[0]
             if d < OVERHEAD_WARNING_M:
-                alerts.append(Alert("overhead", CRITICAL if d < OVERHEAD_CRITICAL_M else WARNING,
-                                    f"Something at head height, {say_distance(d)} ahead. Duck.", d, "overhead"))
+                in_path("overhead", CRITICAL if d < OVERHEAD_CRITICAL_M else WARNING,
+                        f"Something at head height, {say_distance(d)} ahead. Duck.", d, "overhead", "overhead")
 
     # ── CROSSINGS AND SIGNALS (informational) ──
     for t in tracks:
@@ -1132,54 +1231,102 @@ def signal_summary(tracks):
 
 
 class AlertPolicy:
-    """Decides which alert is spoken now: the most urgent new one, at most one every GLOBAL_GAP_S (a critical
-    one at once), the same thing again only after REPEAT_S at its level, when it has escalated, or when it is
-    much closer than when it was announced. A signal is announced when its colour changes."""
+    """Decides which alert is spoken now, so the voice stays one clear sentence at a time however much is in view.
+
+    Everything the wearer would walk into shares the slot "path": only the most urgent is spoken about, and the
+    one announced stays the subject while it is about as near (STICK_M). It is said again when it has become more
+    urgent than ever said before, when it is another thing (CHANGE_S), or after REPEAT_S, doubling while nothing
+    changes. No sentence starts while the last one is still being spoken (say_time) or within PAUSE_S after it,
+    except a danger greater than what is being said: a danger over a warning, a vehicle coming over any other
+    danger. A signal is announced when its colour changes."""
     def __init__(self, clock=time.monotonic):
         self._clock = clock
-        self._said = {}          # key -> (time, level, dist)
-        self._last_any = -1e9
+        self._said = {}          # slot -> what was last said about it: t, level, dist, key, name, repeats, gone
+        self._busy_until = -1e9  # when the sentence being spoken ends
+        self._busy_rank = 0
         self._last_signal = None
-        self._blocked_since = None
         self._clear_since = None
         self._announced_block = False
 
+    def _may_speak(self, a, now):
+        if now < self._busy_until:
+            return a.level >= CRITICAL and a.rank > self._busy_rank
+        return a.level >= CRITICAL or now >= self._busy_until + PAUSE_S[a.level]
+
+    def _speak(self, a, now):
+        self._busy_until, self._busy_rank = now + say_time(a.text), a.rank
+        return a
+
+    @staticmethod
+    def _subject(group, prev):
+        """The alert of a slot to speak about: the most urgent, or the one said last while it is still as urgent
+        and about as near."""
+        top = group[0]
+        if prev is not None:
+            for a in group:
+                if a.key == prev["key"] and a.level >= top.level and (
+                        a.dist is None or top.dist is None or a.dist <= top.dist + STICK_M):
+                    return a
+        return top
+
+    @staticmethod
+    def _fresh(a, prev, now):
+        """Why `a` is worth saying after `prev` ("new" / "repeat"), or None."""
+        if prev is None or a.level > prev["level"]:
+            return "new"
+        since = now - prev["t"]
+        if a.dist is not None and prev["dist"] is not None:
+            if a.dist > prev["dist"] + FARTHER_M and since >= CHANGE_S:
+                return "new"  # what was announced is out of the way: this is the next thing
+        # Another named thing. Not "obstacle" <-> "chair": the camera naming what the LiDAR found is no news
+        if a.name != prev["name"] and GENERIC not in (a.name, prev["name"]) and since >= CHANGE_S:
+            return "new"
+        if since >= min(REPEAT_MAX_S, REPEAT_S[a.level] * 2 ** prev["repeats"]):
+            return "repeat"
+        return None
+
     def pick(self, alerts):
         now = self._clock()
+        groups = {}
+        for a in alerts:  # most urgent first
+            groups.setdefault(a.slot, []).append(a)
+        # Forget what is no longer there: the path once it has been clear a while (the next thing in it is new),
+        # the rest after a minute
+        for slot, prev in list(self._said.items()):
+            if slot in groups:
+                prev["gone"] = None
+                continue
+            if prev["gone"] is None:
+                prev["gone"] = now
+            if now - prev["gone"] >= (PATH_CLEAR_AFTER_S if slot in BLOCKING_SLOTS else 60.0):
+                del self._said[slot]
         # "Path clear" after a blocking warning, once the path has stayed clear for a while
-        blocking = any(a.kind in ("obstacle", "drop", "overhead", "vehicle") and a.level >= WARNING for a in alerts)
-        if blocking:
+        if any(a.slot in BLOCKING_SLOTS and a.level >= WARNING for a in alerts):
             self._clear_since = None
         elif self._announced_block:
-            self._clear_since = self._clear_since or now
-            if now - self._clear_since >= PATH_CLEAR_AFTER_S and now - self._last_any >= GLOBAL_GAP_S:
+            if self._clear_since is None:
+                self._clear_since = now
+            if now - self._clear_since >= PATH_CLEAR_AFTER_S and now >= self._busy_until + PAUSE_S[INFO]:
                 self._announced_block = False
-                self._last_any = now
-                return Alert("clear", INFO, "Path clear.", None, "clear")
-        for a in alerts:
-            if a.kind == "signal":
-                if a.key == self._last_signal:
-                    continue
-                if now - self._last_any < GLOBAL_GAP_S:
-                    continue
-                self._last_signal = a.key
-                self._last_any = now
-                return a
-            prev = self._said.get(a.key)
-            fresh = (prev is None or a.level > prev[1] or now - prev[0] >= REPEAT_S[a.level]
-                     or (a.dist is not None and prev[2] is not None and a.dist < CLOSER_REPEAT * prev[2]
-                         and now - prev[0] >= 1.5))
-            if not fresh:
+                return self._speak(Alert("clear", INFO, "Path clear.", None, "clear"), now)
+        for slot, group in groups.items():
+            if group[0].kind == "signal":
+                a = group[0]
+                if a.key != self._last_signal and self._may_speak(a, now):
+                    self._last_signal = a.key
+                    return self._speak(a, now)
                 continue
-            if a.level < CRITICAL and now - self._last_any < GLOBAL_GAP_S:
+            prev = self._said.get(slot)
+            a = self._subject(group, prev)
+            why = self._fresh(a, prev, now)
+            if why is None or not self._may_speak(a, now):
                 continue
-            self._said[a.key] = (now, a.level, a.dist)
-            self._last_any = now
-            if a.kind in ("obstacle", "drop", "overhead", "vehicle") and a.level >= WARNING:
+            level = max(a.level, prev["level"]) if prev is not None and prev["key"] == a.key else a.level
+            self._said[slot] = {"t": now, "level": level, "dist": a.dist, "key": a.key, "name": a.name,
+                                "repeats": prev["repeats"] + 1 if why == "repeat" else 0, "gone": None}
+            if slot in BLOCKING_SLOTS and a.level >= WARNING:
                 self._announced_block = True
-            return a
-        # forget old entries
-        self._said = {k: v for k, v in self._said.items() if now - v[0] < 60}
+            return self._speak(a, now)
         return None
 
     def reset(self):
