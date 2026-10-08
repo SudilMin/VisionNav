@@ -13,6 +13,9 @@ never needs a terminal:
   outdoor_tf  outdoor_sensors.launch.py (camera and LiDAR mounts on the rig, live RViz view)  outdoor
   pi_sensors  pi_sensors.launch.py buttons:=false (LiDAR + camera)          on the Pi, SENSORS button
 
+WEARABLE_WINDOWS=0 opens no desktop window: no RViz (map_view, the outdoor view) and no camera window. The web
+dashboard sets it for the assistant it starts, and shows the map, the LiDAR and the camera in its page instead.
+
 A part is "running" when its ROS node is on the network — so a part started by hand in a terminal is used
 as it is and never started twice (and never stopped by the manager either: only parts it started itself).
 Parts an earlier assistant started and left running (it was killed, or crashed) are adopted at start-up, so
@@ -32,6 +35,7 @@ import threading
 import time
 
 LOG_DIR = os.path.expanduser("~/.visionnav/logs")
+WINDOWS = os.environ.get("WEARABLE_WINDOWS", "1") != "0"  # RViz and the camera window on the desktop
 
 
 def _share(*path):
@@ -56,12 +60,14 @@ PARTS = {
     # object_perception's node exists before its models are loaded; its mode publisher only after
     "perception": {"cmd": ["ros2", "run", "visionnav", "object_perception"], "node": "object_perception",
                    "topic": "/perception_mode_state",
-                   "env": {"WEARABLE_CAMERA_MODE": "ros"}, "timeout": 240, "name": "the camera AI"},
+                   "env": {"WEARABLE_CAMERA_MODE": "ros", **({} if WINDOWS else {"WEARABLE_SHOW_WINDOW": "0"})},
+                   "timeout": 240, "name": "the camera AI"},
     "vision_ai": {"cmd": ["ros2", "run", "visionnav", "scene_describer"], "node": "scene_describer",
                   "env": {}, "timeout": 120, "name": "the vision AI"},
     # Same rig geometry as the brain (WEARABLE_BRAIN_ARGS), for the camera AI outdoors
     "outdoor_tf": {"cmd": ["ros2", "launch", "visionnav", "outdoor_sensors.launch.py"]
-                          + shlex.split(os.environ.get("WEARABLE_BRAIN_ARGS", "")),
+                          + shlex.split(os.environ.get("WEARABLE_BRAIN_ARGS", ""))
+                          + ([] if WINDOWS else ["use_rviz:=false"]),
                    "node": "outdoor_camera_optical", "nodes": ["outdoor_camera_optical", "outdoor_lidar_mount"],
                    "env": {"LIBGL_ALWAYS_SOFTWARE": "1"}, "timeout": 20, "name": "the sensor geometry"},
 }
@@ -71,7 +77,7 @@ PARTS["pi_sensors"] = {
     "node": "sllidar_node", "nodes": ["sllidar_node", "phone_camera_publisher"], "env": {}, "timeout": 30,
     "name": "the camera and LiDAR",
 }
-MODE_PARTS = {"indoor": ["brain", "map_view", "perception"],
+MODE_PARTS = {"indoor": ["brain", "map_view", "perception"] if WINDOWS else ["brain", "perception"],
               "outdoor": ["outdoor_tf", "perception"]}
 IMU_UP_MAX_DEG = 45.0  # the IMU's gravity, turned by its mount in the TF, must be this close to straight up (a
                        # wrong mount is ~90 off; a wearer leaning 30 deg forward reads ~34)

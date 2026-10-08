@@ -4,12 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>VisionNav Dashboard</title>
+<link rel="icon" href="data:,">
 <style>
   :root {
     --bg: #0f1216; --panel: #171b21; --panel2: #1e232b; --line: #2a313b;
     --text: #e6e9ee; --muted: #8b95a3; --accent: #3ca0ff;
     --ok: #3ecf7a; --warn: #f0b429; --bad: #ef5350;
-    --said: #3ca0ff; --heard: #3ecf7a; --typed: #c792ea; --system: #8b95a3;
+    --said: #3ca0ff; --heard: #3ecf7a; --button: #f0b429; --system: #8b95a3;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; }
@@ -17,76 +18,68 @@
          display: flex; flex-direction: column; }
 
   /* ── top bar ── */
-  header { display: flex; align-items: center; gap: 16px; padding: 10px 16px; background: var(--panel);
+  header { display: flex; align-items: center; gap: 16px; padding: 8px 16px; background: var(--panel);
            border-bottom: 1px solid var(--line); flex-wrap: wrap; }
   header h1 { font-size: 18px; margin: 0; letter-spacing: .5px; }
   header h1 span { color: var(--accent); }
   .launch { display: flex; align-items: center; gap: 8px; }
-  #launch { font: 600 16px system-ui; padding: 10px 28px; border: 0; border-radius: 8px; cursor: pointer;
+  #launch { font: 600 16px system-ui; padding: 8px 28px; border: 0; border-radius: 8px; cursor: pointer;
             background: var(--ok); color: #06210f; min-width: 150px; transition: filter .15s; }
   #launch:hover { filter: brightness(1.1); }
   #launch.stop { background: var(--bad); color: #fff; }
   #launch:disabled { background: var(--panel2); color: var(--muted); cursor: wait; }
   select { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 6px;
-           padding: 8px; font: inherit; }
-  .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; }
-  .chip { background: var(--panel2); border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px;
-          font-size: 13px; white-space: nowrap; }
-  .chip b { font-weight: 600; }
-  .parts { display: flex; gap: 12px; flex-wrap: wrap; padding: 6px 16px; background: var(--panel);
+           padding: 7px; font: inherit; }
+  .alert { display: none; padding: 6px 16px; font-size: 13px; border-bottom: 1px solid var(--line); }
+  .alert.warn { display: block; background: #33270a; color: #ffd27a; }
+  .alert.bad { display: block; background: #3b1515; color: #ffb4b4; }
+  .alert.note { display: block; background: #13263a; color: #a9d2ff; }
+  .parts { display: flex; gap: 12px; flex-wrap: wrap; padding: 4px 16px; background: var(--panel);
            border-bottom: 1px solid var(--line); font-size: 12px; color: var(--muted); }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #444b55; margin-right: 5px; }
   .dot.on { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
 
-  /* ── map | camera ── */
-  main { flex: 1; display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: minmax(0, 1fr) 300px;
-         gap: 12px; padding: 12px; min-height: 0; }
+  /* ── map | camera: most of the screen ── */
+  main { flex: 1; display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: minmax(0, 1fr) 170px;
+         gap: 10px; padding: 10px; min-height: 0; }
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; display: flex;
            flex-direction: column; min-height: 0; overflow: hidden; }
   .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin: 0;
-              padding: 8px 12px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 10px; }
+              padding: 6px 12px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 10px; }
   .panel h2 .hint { text-transform: none; letter-spacing: 0; margin-left: auto; font-size: 12px; }
-  .frame { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; background: #14181d; }
-  .frame img { max-width: 100%; max-height: 100%; object-fit: contain; }
+  .frame, .view3d { flex: 1; min-height: 0; position: relative; overflow: hidden; }
+  .frame { display: flex; align-items: center; justify-content: center; background: #14181d; }
+  .frame img { width: 100%; height: 100%; object-fit: contain; }
+  .view3d { background: #1e1e24; }
+  .view3d canvas { position: absolute; inset: 0; display: block; }
+  .view3d.no3d { display: flex; align-items: center; justify-content: center; color: var(--muted); padding: 20px;
+                 text-align: center; }
+  .status3d { position: absolute; left: 8px; bottom: 6px; font-size: 11px; color: var(--muted); pointer-events: none;
+              background: rgba(15, 18, 22, .6); padding: 2px 6px; border-radius: 4px; z-index: 1; }
+  .off { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; flex-direction: column;
+         gap: 6px; background: #14181d; color: var(--muted); font-size: 18px; text-align: center; z-index: 2; }
+  .off small { font-size: 13px; }
+  .is-off .off { display: flex; }
   #outdoor { padding: 6px 12px; font-size: 13px; border-top: 1px solid var(--line); display: none; }
 
-  /* ── voice ── */
+  /* ── voice and buttons ── */
   .voice { grid-column: 1 / -1; }
-  .voice-body { flex: 1; display: grid; grid-template-columns: 1fr 340px; min-height: 0; }
   .tabs { display: flex; gap: 4px; }
   .tabs button { background: none; border: 0; color: var(--muted); font: inherit; font-size: 13px; cursor: pointer;
                  padding: 2px 8px; border-radius: 4px; text-transform: uppercase; letter-spacing: 1px; }
   .tabs button.active { color: var(--text); background: var(--panel2); }
-  #log, #syslog { overflow-y: auto; padding: 8px 12px; min-height: 0; }
+  #log, #syslog { flex: 1; overflow-y: auto; padding: 6px 12px; min-height: 0; }
   #syslog { display: none; margin: 0; font: 12px/1.35 ui-monospace, monospace; color: #b8c0cc; white-space: pre-wrap; }
-  .entry { display: flex; gap: 10px; padding: 3px 0; align-items: baseline; }
+  .entry { display: flex; gap: 10px; padding: 2px 0; align-items: baseline; }
   .entry time { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; flex: none; }
-  .entry .who { flex: none; width: 92px; font-size: 12px; font-weight: 600; text-transform: uppercase; }
-  .said .who { color: var(--said); } .heard .who, .understood .who { color: var(--heard); }
-  .typed .who { color: var(--typed); } .system .who { color: var(--system); }
+  .entry .who { flex: none; width: 100px; font-size: 12px; font-weight: 600; text-transform: uppercase; }
+  .said .who { color: var(--said); } .heard .who, .understood .who, .typed .who { color: var(--heard); }
+  .button .who, .button .text { color: var(--button); } .system .who { color: var(--system); }
   .system .text { color: var(--muted); font-style: italic; }
-  .empty { color: var(--muted); padding: 12px 0; }
-  .controls { border-left: 1px solid var(--line); padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
-  form { display: flex; gap: 6px; }
-  input[type=text] { flex: 1; min-width: 0; background: var(--panel2); color: var(--text); border: 1px solid var(--line);
-                     border-radius: 6px; padding: 8px; font: inherit; }
-  .btn { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 6px;
-         padding: 6px 10px; font: inherit; cursor: pointer; }
-  .btn:hover { border-color: var(--accent); }
-  .quick { display: flex; flex-wrap: wrap; gap: 6px; }
-  .quick .btn { font-size: 12px; padding: 4px 8px; }
-  .hw { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
-  .hw button { padding: 14px 0; font: 600 13px system-ui; border-radius: 8px; border: 1px solid var(--line);
-               background: var(--panel2); color: var(--text); cursor: pointer; user-select: none; touch-action: none; }
-  .hw button.down { background: var(--accent); color: #fff; }
-  .hw button.held { background: var(--bad); color: #fff; }
-  .small { font-size: 12px; color: var(--muted); }
+  .empty { color: var(--muted); padding: 8px 0; }
 
   @media (max-width: 900px) {
-    main { grid-template-columns: 1fr; grid-template-rows: 300px 300px auto; }
-    .voice-body { grid-template-columns: 1fr; }
-    .controls { border-left: 0; border-top: 1px solid var(--line); }
-    #log { max-height: 260px; }
+    main { grid-template-columns: 1fr; grid-template-rows: 60vh 45vh 220px; }
   }
 </style>
 </head>
@@ -100,58 +93,34 @@
       <option value="outdoor">Outdoor</option>
     </select>
   </div>
-  <div class="chips">
-    <span class="chip">Assistant: <b id="s-assistant">…</b></span>
-    <span class="chip">Sensors: <b id="s-sensors">…</b></span>
-    <span class="chip">Mode: <b id="s-mode">…</b></span>
-    <span class="chip">Navigation: <b id="s-nav">…</b></span>
-    <span class="chip">Objects: <b id="s-objects">0</b></span>
-  </div>
 </header>
+<div class="alert" id="alert"></div>
 <div class="parts" id="parts"></div>
 
 <main>
   <section class="panel">
-    <h2>Map <span class="hint">blue: you · yellow: objects · orange: people · green: route</span></h2>
-    <div class="frame"><img src="/stream/map.mjpg" alt="map"></div>
+    <h2>Map <span class="hint">drag: turn · right-drag: move · scroll: zoom · double-click: reset</span></h2>
+    <div class="view3d is-off" id="scene-box">
+      <div class="off" id="scene-off">Map off<small>It turns on with the camera AI (press SENSORS, or tap MODE)</small></div>
+      <div class="status3d" id="scene-status"></div>
+    </div>
     <div id="outdoor"></div>
   </section>
   <section class="panel">
-    <h2>Camera <span class="hint">the camera AI's view</span></h2>
-    <div class="frame"><img src="/stream/camera.mjpg" alt="camera"></div>
+    <h2>Camera <span class="hint">the camera AI's view, or the plain camera for the vision AI</span></h2>
+    <div class="frame is-off" id="camera-box">
+      <div class="off">Camera off<small>It turns on with the camera AI (press SENSORS, or tap MODE) or the vision AI (LOOK)</small></div>
+      <img id="camera" alt="camera">
+    </div>
   </section>
 
   <section class="panel voice">
     <h2>
-      <div class="tabs"><button class="active" data-tab="log">Voice</button><button data-tab="syslog">System log</button></div>
-      <span class="hint">what the system says and hears</span>
+      <div class="tabs"><button class="active" data-tab="log">Voice and buttons</button><button data-tab="syslog">System log</button></div>
+      <span class="hint">what the system says and hears, and every button press on the rig</span>
     </h2>
-    <div class="voice-body">
-      <div id="log"><div class="empty">Nothing said yet. Press START, then SENSORS on the rig.</div></div>
-      <pre id="syslog"></pre>
-      <div class="controls">
-        <form id="cmd">
-          <input type="text" id="cmd-text" placeholder="Type a command: find the cup, go to the chair…" autocomplete="off">
-          <button class="btn" type="submit">Send</button>
-        </form>
-        <div class="quick">
-          <button class="btn" data-cmd="status">status</button>
-          <button class="btn" data-cmd="what is around me">around me</button>
-          <button class="btn" data-cmd="where am i">where am I</button>
-          <button class="btn" data-cmd="help">help</button>
-          <button class="btn" data-cmd="vision off">vision off</button>
-          <button class="btn" data-cmd="stop">stop</button>
-        </div>
-        <div class="hw">
-          <button data-btn="look">LOOK</button>
-          <button data-btn="mode">MODE</button>
-          <button data-btn="hand">HAND</button>
-          <button data-btn="talk">TALK</button>
-        </div>
-        <div class="small">The rig's buttons: click = tap, hold = hold (speak into the laptop's microphone while
-          holding), click twice = double. SENSORS is only on the rig.</div>
-      </div>
-    </div>
+    <div id="log"><div class="empty">Nothing yet. Press START, then SENSORS on the rig.</div></div>
+    <pre id="syslog"></pre>
   </section>
 </main>
 
@@ -159,44 +128,37 @@
 const $ = (id) => document.getElementById(id);
 const post = (url, body) => fetch(url, {method: "POST", headers: {"Content-Type": "application/json"},
                                          body: JSON.stringify(body || {})}).then(r => r.json()).catch(() => ({}));
-let since = 0, assistant = "stopped", own = false, tab = "log";
+let since = 0, assistant = "stopped", own = false, tab = "log", last = null, mapOn = false, cameraOn = false;
+const gb = (mb) => (mb / 1024).toFixed(1) + " GB";
 
-// ── START / STOP ──
+// ── START / STOP (STOP also while it starts; Force stop once a stop takes long) ──
 $("launch").onclick = () => {
-  if (assistant === "stopped") post("/api/launch", {mode: $("mode").value});
-  else if (assistant === "running" && (own || confirm("The assistant was started elsewhere. Ask it to exit?")))
+  if (assistant === "stopped") {
+    const mem = last && last.mem;
+    if (mem && mem.avail < last.start_needs && !confirm(
+        `Only ${gb(mem.avail)} of memory is free; VisionNav needs about ${gb(last.start_needs)}. ` +
+        `Close other programs first (browser tabs, VS Code…), or the laptop may freeze. Start anyway?`)) return;
+    post("/api/launch", {mode: $("mode").value});
+  } else if (assistant === "stopping") {
+    post("/api/stop", {force: true});
+  } else if (own || confirm("The assistant was started elsewhere. Ask it to exit?")) {
     post("/api/stop");
+  }
   $("launch").disabled = true;
 };
 
-// ── typed commands ──
-$("cmd").onsubmit = (e) => {
-  e.preventDefault();
-  const text = $("cmd-text").value.trim();
-  if (text) post("/api/command", {text});
-  $("cmd-text").value = "";
-};
-document.querySelectorAll("[data-cmd]").forEach(b => b.onclick = () => post("/api/command", {text: b.dataset.cmd}));
-
-// ── the rig's buttons: down / up go to the server, which decides tap, hold and double as the Pi does ──
-document.querySelectorAll("[data-btn]").forEach(b => {
-  let timer = null, isDown = false;
-  const up = () => {
-    if (!isDown) return;
-    isDown = false; clearTimeout(timer);
-    b.classList.remove("down", "held");
-    post("/api/button", {button: b.dataset.btn, action: "up"});
-  };
-  b.addEventListener("pointerdown", (e) => {
-    b.setPointerCapture(e.pointerId);
-    isDown = true; b.classList.add("down");
-    timer = setTimeout(() => b.classList.add("held"), 600);
-    post("/api/button", {button: b.dataset.btn, action: "down"});
-  });
-  b.addEventListener("pointerup", up);
-  b.addEventListener("pointercancel", up);
-  b.addEventListener("contextmenu", (e) => e.preventDefault());
-});
+// ── the map and the camera: on only while the camera AI runs, and while this page is shown ──
+// The map while the camera AI runs; the camera while the camera AI or the vision AI (LOOK) runs
+function setViews(map, camera) {
+  mapOn = map; cameraOn = camera;
+  $("scene-box").classList.toggle("is-off", !map);
+  $("camera-box").classList.toggle("is-off", !camera);
+  const cam = $("camera"), camLive = camera && !document.hidden;
+  if (camLive && !cam.getAttribute("src")) cam.src = "/stream/camera.mjpg?t=" + Date.now();
+  else if (!camLive && cam.getAttribute("src")) cam.removeAttribute("src");
+  document.dispatchEvent(new CustomEvent("views", {detail: map && !document.hidden}));  // the 3D map (module below)
+}
+document.addEventListener("visibilitychange", () => setViews(mapOn, cameraOn));
 
 // ── tabs ──
 document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => {
@@ -208,7 +170,8 @@ document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => {
 });
 
 // ── what the system does ──
-const WHO = {said: "🔊 Said", heard: "🎤 Heard", understood: "🎤 Understood", typed: "⌨ Typed", system: "⚙ System"};
+const WHO = {said: "Said", heard: "Heard", understood: "Understood", typed: "Typed", button: "Button",
+             system: "System"};
 function addEntry(e) {
   const log = $("log");
   const empty = log.querySelector(".empty");
@@ -226,20 +189,40 @@ function addEntry(e) {
 }
 
 function render(s) {
+  last = s;
   assistant = s.assistant; own = s.own;
   const btn = $("launch");
-  btn.disabled = assistant === "starting" || assistant === "stopping";
-  btn.classList.toggle("stop", assistant === "running");
-  btn.textContent = {stopped: "▶ START", running: "■ STOP", starting: "Starting…", stopping: "Stopping…"}[assistant];
+  const canStop = assistant === "running" || (assistant === "starting" && own);
+  const canForce = assistant === "stopping" && own && s.stopping_s > 4;
+  btn.disabled = !(assistant === "stopped" || canStop || canForce);
+  btn.classList.toggle("stop", canStop || canForce);
+  btn.textContent = assistant === "stopped" ? "▶ START" : canForce ? "✖ Force stop" : canStop ? "■ STOP"
+                  : assistant === "starting" ? "Starting…" : "Stopping…";
+  btn.title = canForce ? "Kill what is still running of it now" : "";
   $("mode").disabled = assistant !== "stopped";
-  $("s-assistant").textContent = assistant + (assistant === "running" && !own ? " (elsewhere)" : "");
-  $("s-sensors").textContent = s.sensors || "no Pi";
-  $("s-mode").textContent = s.mode || "—";
-  $("s-nav").textContent = s.nav || "—";
-  $("s-objects").textContent = s.objects;
   $("parts").innerHTML = s.parts.map(p => `<span><i class="dot ${p.on ? "on" : ""}"></i>${p.name}</span>`).join("");
+  if (s.map_on !== mapOn || s.camera_on !== cameraOn) setViews(s.map_on, s.camera_on);
+  // Memory: the laptop froze when it ran out (earlyoom then closes programs, the browser first)
+  const mem = s.mem, alert = $("alert");
+  let cls = "", msg = "";
+  if (mem) {
+    const level = mem.avail < s.mem_low / 2 ? "bad" : mem.avail < s.mem_low ? "warn" : "";
+    if (level) {
+      cls = level;
+      msg = `⚠ The laptop has only ${gb(mem.avail)} of memory free (${gb(mem.swap)} of swap). Close other ` +
+            `programs and browser tabs (VS Code…), or press STOP: it slows down and freezes when memory runs out, ` +
+            `and earlyoom then closes programs by itself, the browser first.`;
+    }
+  }
+  if (!msg && s.rviz && !own) {
+    cls = "note";
+    msg = "RViz is open on the desktop: this assistant was started outside the dashboard. To have the map and the " +
+          "camera only in this page, press STOP, then START here.";
+  }
+  alert.className = "alert " + cls;
+  alert.textContent = msg;
   const od = $("outdoor");
-  if (s.outdoor && (s.outdoor.summary || s.outdoor.signal)) {
+  if (s.map_on && s.outdoor && (s.outdoor.summary || s.outdoor.signal)) {
     od.style.display = "block";
     od.textContent = [s.outdoor.summary, s.outdoor.signal && s.outdoor.signal.text].filter(Boolean).join(" · ");
   } else od.style.display = "none";
@@ -252,9 +235,10 @@ async function poll() {
     const r = await fetch("/api/state?since=" + since);
     render(await r.json());
   } catch (e) {
-    $("s-assistant").textContent = "dashboard offline";
+    $("launch").textContent = "Dashboard offline";
+    $("launch").disabled = true;
   }
-  setTimeout(poll, 500);
+  setTimeout(poll, 300);
 }
 
 async function refreshSyslog() {
@@ -267,6 +251,27 @@ async function refreshSyslog() {
 }
 setInterval(refreshSyslog, 2000);
 poll();
+</script>
+
+<!-- The 3D map (web/scene3d.js, three.js from share/visionnav/web/vendor: no internet needed). A module of its own:
+     if it cannot load, the rest of the page still works -->
+<script type="importmap">{"imports": {"three": "/static/vendor/three.module.js"}}</script>
+<script type="module">
+import { Scene3D, LAYERS } from "/static/scene3d.js";
+
+const box = document.getElementById("scene-box");
+const view = new Scene3D(box, {status: document.getElementById("scene-status")});
+// Each mode's layers as its .rviz file shows them
+view.onMode = (mode) => { for (const [key, , modes, on] of LAYERS) view.setLayer(key, modes.includes(mode) && on.includes(mode)); };
+view.onMode("indoor");
+box.addEventListener("dblclick", () => { view.setFollow(true); view.resetView(); });
+const live = (on) => {
+  if (!view.renderer) return;  // no WebGL: the panel says so
+  if (on) view.connect();
+  else { view.disconnect(); view.clear(); }
+};
+document.addEventListener("views", (e) => live(e.detail));
+live(mapOn && !document.hidden);  // the state before this module loaded
 </script>
 </body>
 </html>

@@ -52,14 +52,14 @@ All nodes are in the `visionnav` package (`visionnav/visionnav/*.py`); `sllidar_
 | Nav2 planner + smoother | Theta* path and smoothing (no controller: a person follows voice, not `cmd_vel`) |
 | `semantic_navigator` | `/semantic_goal` ("chair") → an approach point in front of it → `/object_path` |
 | `lidar_orientation_calibrator` | One-off tool: measures the LiDAR's mount on the rig |
-| `web_dashboard` | Web page (http://localhost:8080): starts / stops the assistant, shows the map, the camera AI's picture, what is said and heard; types commands and presses LOOK / MODE / HAND / TALK |
+| `web_dashboard` | Web page (http://localhost:8080): starts / stops the assistant (with no desktop windows: `WEARABLE_WINDOWS=0`), shows in 3D what RViz showed, from the same topics (`web/scene3d.js`, three.js served from the package), and the live LiDAR scan, the camera AI's picture (both only while the camera AI runs), what is said and heard, every press of the rig's buttons (`/button_event`), the laptop's free memory |
 
 Sensor geometry (camera, LiDAR and IMU mounts) is defined once in `launch/sensor_tf.launch.py` and read from TF by
 every node.
 
 ## 4. Modes
 
-**Indoor** (`laptop_brain.launch.py` + map window + `object_perception`). Objects seen reliably are placed on the
+**Indoor** (`laptop_brain.launch.py` + map window, unless the web dashboard shows the map, + `object_perception`). Objects seen reliably are placed on the
 SLAM map and kept for the session, even out of view; one taken away is removed once the camera looks at its
 spot again. "Go to the chair next to the door": `object_language` resolves the description to one object, the
 navigator plans a route, and the assistant speaks clock-direction guidance along it until arrival. In hand
@@ -96,3 +96,4 @@ wearer is tracked or said.
 | `/describe_command`, `/scene_description` | assistant ↔ vision AI |
 | `/voice_log`, `/voice_command` | assistant → dashboard (what is said and heard, JSON) / dashboard → assistant (typed commands) |
 | `/perception/view/compressed` | perception → dashboard (the camera window's picture, JPEG, only while subscribed) |
+| `/map`, `/scan(_filtered)`, `/semantic_markers`, `/structure_markers`, `/trajectory_node_list`, `/outdoor_markers`, `/outdoor_occupancy`, `/object_path`, TF | → RViz or the dashboard's 3D view (subscribed only while a page shows it) |

@@ -22,7 +22,9 @@ setup(
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
         (os.path.join('share', package_name, 'config'), glob('config/*')),
         (os.path.join('share', package_name, 'rviz'), glob('rviz/*.rviz')),
-        (os.path.join('share', package_name, 'web'), glob('web/*.html')),
+        (os.path.join('share', package_name, 'web'), glob('web/*.html') + glob('web/*.js')),
+        # three.js (MIT, npm three@0.186.1), for the dashboard's 3D view: served from here, no internet needed
+        (os.path.join('share', package_name, 'web', 'vendor'), glob('web/vendor/*')),
         # TensorRT engines are generated at run time next to the weights, so they are not installed.
         (os.path.join('share', package_name, 'models'),
          [f for f in glob('models/*') if not f.endswith('.engine')]),

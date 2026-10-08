@@ -39,7 +39,8 @@ VisionNav runs on two computers:
    ```
    then open **http://localhost:8080** and press **▶ START** (see [Web Dashboard](#️-web-dashboard-start-it-and-watch-it-from-a-browser)).
 2. **Press SENSORS.** Click → "Sensors turned on." → the laptop starts indoor mode by itself (the map window
-   and the camera window open) → **"Indoor mode activated."** Each thing is said once, when it is done.
+   and the camera window open; started from the web dashboard, both are in its page instead) → **"Indoor mode
+   activated."** Each thing is said once, when it is done.
 3. Use the buttons (below), or type commands in the assistant's terminal. Every tap clicks, so you know it was
    heard. Hold LOOK and say **"help"** to hear what the buttons do.
 4. **Hold MODE** when you are done with a place: "Map and camera closed." — the map and what it learned are
@@ -80,8 +81,8 @@ The assistant starts and stops these itself (`system_manager.py`); the Pi's butt
 | Mode / button | Programs |
 |---|---|
 | **SENSORS** (Pi) | `pi_sensors.launch.py`: RPLiDAR C1 (`sllidar_node`) + chest camera (`phone_camera_publisher`) |
-| **Indoor** (default, laptop) | `laptop_brain.launch.py use_rviz:=false` (sensor TFs, Cartographer SLAM, Nav2, walls) + the map window (RViz, `rviz/visionnav.rviz`; opened again at every mode start if it was closed) + `object_perception` (camera AI, camera window) |
-| **Outdoor** (laptop) | `outdoor_sensors.launch.py` (camera and LiDAR mounts, live RViz view) + `object_perception` (hazard warnings, below) |
+| **Indoor** (default, laptop) | `laptop_brain.launch.py use_rviz:=false` (sensor TFs, Cartographer SLAM, Nav2, walls) + the map window (RViz, `rviz/visionnav.rviz`; opened again at every mode start if it was closed) + `object_perception` (camera AI, camera window). Started from the web dashboard: no map window and no camera window (its page shows them) |
+| **Outdoor** (laptop) | `outdoor_sensors.launch.py` (camera and LiDAR mounts, live RViz view; from the web dashboard without RViz) + `object_perception` (hazard warnings, below) |
 | **LOOK** (laptop) | `scene_describer` (Qwen3-VL), started on the first press, stopped by saying "vision off" |
 | **MODE** hold (laptop) | Stops both modes' programs (everything above except the sensors and the vision AI) and forgets the session |
 
@@ -92,7 +93,8 @@ The assistant starts and stops these itself (`system_manager.py`); the Pi's butt
   `pi_sensors` on the Pi).
 * Settings (set before starting the assistant): `WEARABLE_AUTOSTART` — `sensors` (default: start the mode when
   the camera and LiDAR come on, pause it when they go off), `now` (start at once), `off` (never, section 6);
-  `WEARABLE_MODE=outdoor` starts in outdoor mode;
+  `WEARABLE_MODE=outdoor` starts in outdoor mode; `WEARABLE_WINDOWS=0` opens no RViz and no camera window (the web
+  dashboard sets it for the assistant it starts);
   `WEARABLE_BRAIN_ARGS="camera_height:=1.32 camera_pitch_deg:=12 lidar_height:=1.18"` passes the rig's measured
   geometry to the map (section 5).
 * Switching from indoor to outdoor ends the indoor session: its map and objects are forgotten (section 4).
@@ -201,8 +203,8 @@ Colours are understood when someone says one ("the red cup") but only spoken wit
 
 ## 🖥️ Web Dashboard (start it and watch it from a browser)
 
-For a helper, a demo or a test on the rig: one page that starts the system and shows what it does. The wearer
-never needs it.
+For a helper, a demo or a test on the rig: one page that starts the system and shows everything it does. What RViz
+showed and the camera AI's picture are in the page, not in windows of their own. The wearer never needs it.
 
 ```bash
 export ROS_DOMAIN_ID=42 ROS_LOCALHOST_ONLY=0
@@ -214,23 +216,35 @@ Open **http://localhost:8080** (on the laptop), choose Indoor or Outdoor, and pr
 
 | Where | What it shows |
 |---|---|
-| **Top** | START / STOP; the assistant, the Pi's sensors, the mode, the navigation, how many objects; a green dot for each program running (Pi buttons, LiDAR, camera, map, camera AI, vision AI, map window) |
-| **Left: Map** | Indoors the SLAM map with you (blue arrow), the objects (yellow), people (orange) and the route (green); outdoors what is ahead of you, with the distance, and the scene summary |
-| **Right: Camera** | The camera AI's picture with its boxes and distances; the plain camera while the camera AI is off |
-| **Bottom: Voice** | Everything said (🔊) and heard (🎤, and what it was understood as), typed commands, and the **System log** tab (the assistant's output) |
+| **Top** | START / STOP; a warning when the laptop's memory runs low; a green dot for each program running (Pi buttons, LiDAR, camera, IMU, map, camera AI, vision AI) |
+| **Left: Map** | What RViz showed, from the same topics, in 3D. Indoors (`rviz/visionnav.rviz`): the SLAM map, the objects with their names, the walls, your tracked path, the route (red), you (blue arrow) and the TF frames. Outdoors (`rviz/visionnav_outdoor.rviz`): the live occupancy and the objects ahead of you with their distances. Also the live **LiDAR** points (red; outdoors only ahead of you, and off at first as in RViz). It follows you; drag to turn, right-drag (or Shift+drag) to move, scroll to zoom, double-click to go back to RViz's view; on a phone one finger turns, two zoom. A small line in its corner says what arrives (fixed frame, LiDAR points, map size, markers) |
+| **Right: Camera** | The camera AI's picture with its boxes and distances (the camera window's picture); the plain camera while the vision AI answers a LOOK (until 5 s after its answer) |
+| **Bottom: Voice and buttons** | Everything said and heard (and what it was understood as), every press of the rig's buttons as it happens ("LOOK tap", "TALK hold", "TALK released", "HAND double press"), and the **System log** tab (the assistant's output) |
 
-* **Type a command** ("find the cup", "go to the chair", "status") or click a quick one: the same as typing in the
-  assistant's terminal.
-* **LOOK / MODE / HAND / TALK** on the page work as the rig's buttons: click = tap, **hold** = hold (speak into the
-  laptop's microphone while holding; release to send), click twice = double. SENSORS is only on the rig (the Pi
-  powers the camera and LiDAR).
-* **STOP** stops the assistant and everything it started. Closing the dashboard (Ctrl+C) does the same for an
-  assistant it started. An assistant already started at login is used as it is (STOP asks it to exit).
+* **No RViz and no camera window** open for an assistant started here (it runs with `WEARABLE_WINDOWS=0`): the page
+  shows both, and the laptop is spared RViz's memory and its software drawing. An assistant started at login opens
+  its windows as before, and the page says so: press STOP, then START here, to have them only in the page.
+* **The map is on while the camera AI runs** (a mode is on); **the camera while the camera AI runs, or while the
+  vision AI answers a LOOK**. Otherwise ("Camera closed", before SENSORS, after a MODE hold, with the sensors off) they say "Map off" /
+  "Camera off", and nothing is sent to the page.
+* The page only watches: everything is done with the rig's buttons and the voice.
+* **STOP** stops the assistant and everything it started, also while it is still starting. When that takes more
+  than a few seconds the button turns into **✖ Force stop** (kills what is left at once); after 20 s it is killed
+  anyway. Nothing it started keeps running after a STOP.
+* **Closing the dashboard**: Ctrl+C in its terminal stops an assistant it started the same way ("Stopping the
+  assistant…", then "Assistant stopped."); **Ctrl+C again** stops it at once. Closing the terminal window, or the
+  dashboard being killed (earlyoom), stops it too. An assistant already started at login is used as it is (STOP asks
+  it to exit).
+* **Memory.** The laptop has 7.6 GB; the whole system (Whisper, the map, the camera AI) takes about 3.5 GB. A browser
+  with many tabs plus VS Code can already fill most of it: the laptop then swaps and freezes, and earlyoom closes
+  programs by itself, the browser (this page) first. A warning appears at the top under 1.5 GB free, and
+  START asks first when less than about 3.5 GB is free. Close other programs and tabs before START.
 * The assistant started here logs to `~/.visionnav/logs/assistant.log`.
 * From a phone on the same Wi-Fi: start it with `WEARABLE_WEB_HOST=0.0.0.0`, open `http://<laptop IP>:8080`
   (anyone on that network can then use it). Another port: `WEARABLE_WEB_PORT=8090`.
-* The RViz map window and the camera window still open as before; the page is an extra view. The camera AI's picture
-  is only encoded while the page shows it.
+* No internet is needed (three.js, which draws the 3D view, comes with the package). The LiDAR, the map and the
+  camera picture are only sent, and the camera AI's picture only drawn, while a page shows them: a hidden tab gets
+  nothing.
 
 ---
 
@@ -509,6 +523,7 @@ ros2 topic echo /outdoor_alert            # what would be said, as it is decided
 
 | Problem | Cause | Fix |
 |---------|-------|-----|
+| The laptop freezes after START; the browser or VS Code closes by itself | Out of memory: earlyoom closes the biggest programs (`journalctl \| grep earlyoom`) | Close browser tabs and other programs first (the dashboard warns at the top when memory is low); STOP frees VisionNav's share |
 | "Waiting for the Pi…" / "The Pi is not answering" | Pi off, not booted yet, on another Wi-Fi, or another `ROS_DOMAIN_ID` | Switch it on and wait ~30 s; put both on the same network (section 1, hotspot); the button service sets `ROS_DOMAIN_ID=42` |
 | `setup_pi.sh imu`: no `68` in the table / `IMU not found` in the button log | I2C off (reboot after `setup_pi.sh`), SDA/SCL swapped, VCC not on pin 1, or a loose wire | Section 3b wiring; `ls /dev/i2c-1` must exist; `i2cdetect -y 1` |
 | The map turns the wrong way or smears only with the IMU | IMU mount in TF does not match the board | `setup_pi.sh imu`, put the printed `imu_*_deg` in `WEARABLE_BRAIN_ARGS`; `WEARABLE_IMU=0` meanwhile |
