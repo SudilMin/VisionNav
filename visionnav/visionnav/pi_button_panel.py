@@ -15,11 +15,12 @@ pin reads 1 when released and 0 when pressed). Default pins (BCM numbering / phy
                            double tap: the vision AI off (frees its GPU memory)
   MODE    GPIO27 / pin 13  tap: switch indoor <-> outdoor
                            hold: the laptop closes the map and the camera feed (the sensors stay on)
-  HAND    GPIO22 / pin 15  tap: guide the hand to the object found last (walks there first if it is far);
-                                tap again to stop        hold: hand guidance off
-                           double tap: face mode (then tap: who is it; hold: say a name to remember the face)
+  HAND    GPIO22 / pin 15  tap: hand mode on / off (camera AI on)
+                           hold: say an object ("cup", "screwdriver"), the laptop guides the hand to it
+                           double tap: face mode (then tap: who is it; hold: say a name to remember the face);
+                                       in face mode a double tap turns face and hand mode off
   TALK    GPIO23 / pin 16  hold (indoor mode): say where to go, the laptop guides you there
-                           tap: end the navigation (otherwise nothing)   double tap: what is around me
+                           tap: what is around me   double tap: stop the navigation (at any moment)
   GND     pin 14 (or 9, 20, 25) shared by all buttons
 
 Publishes /button_event (std_msgs/String, JSON): {"button": "sensors"|"look"|"mode"|"hand"|"talk",

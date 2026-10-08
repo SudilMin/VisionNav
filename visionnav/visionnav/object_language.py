@@ -41,6 +41,11 @@ CLASS_ALIASES = {
     "fridge": "refrigerator", "bin": "trash can", "dustbin": "trash can", "garbage bin": "trash can",
     "doorway": "door", "entrance": "door", "plant": "plant", "potted plant": "plant",
     "stairs": "stairs", "staircase": "stairs", "steps": "stairs", "water bottle": "bottle",
+    # tools and small things on a table (hand mode)
+    "screw driver": "screwdriver", "spanner": "wrench", "torch": "flashlight", "tape": "adhesive tape",
+    "sellotape": "adhesive tape", "scotch tape": "adhesive tape", "measuring tape": "tape measure",
+    "earbuds": "earphones", "charger": "phone charger", "spectacles": "glasses", "specs": "glasses",
+    "cellphone": "smartphone",
 }
 
 # Things other objects rest on

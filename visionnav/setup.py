@@ -9,6 +9,7 @@ NODES = [
     'object_perception', 'voice_navigation_assistant', 'scene_describer', 'phone_camera_publisher',
     'lidar_body_filter', 'semantic_costmap', 'semantic_navigator', 'wall_structure_mapper',
     'lidar_orientation_calibrator', 'map_manager', 'pi_button_panel', 'lidar_odometry', 'mpu6050_imu',
+    'web_dashboard',
 ]
 
 setup(
@@ -21,6 +22,7 @@ setup(
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
         (os.path.join('share', package_name, 'config'), glob('config/*')),
         (os.path.join('share', package_name, 'rviz'), glob('rviz/*.rviz')),
+        (os.path.join('share', package_name, 'web'), glob('web/*.html')),
         # TensorRT engines are generated at run time next to the weights, so they are not installed.
         (os.path.join('share', package_name, 'models'),
          [f for f in glob('models/*') if not f.endswith('.engine')]),

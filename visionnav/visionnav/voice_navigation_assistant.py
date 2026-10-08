@@ -83,8 +83,7 @@ MAX_NAME_WORDS = 3        # a longer sentence is not a name
 # The Pi's camera stream arrives mirrored (as for object_perception and the vision AI): flipped back so that
 # "on your left" is the wearer's left
 FLIP_CAMERA = os.environ.get("WEARABLE_CAMERA_FLIP", "1") == "1"
-HAND_REACH_M = 1.0        # m: an object this close is within reach, hand guidance starts at once
-HAND_SEARCH_RANGE = 2.5   # m: without a found object, HAND picks the nearest object ahead within this range
+REACH_LEADS = ("reach for ", "reach ", "grab ", "grasp ", "pick up ", "find ", "get ", "the ", "my ", "a ", "an ")
 SENSOR_SETTLE_S = 15.0    # s after "Sensors turned on." in which it is not said again (nor a stream appearing)
 LOOK_REPEAT_S = 1.5       # a second LOOK tap this soon after the first is the same press: one description
 # Words of the commands themselves (never "corrected" into the name of an object or a person)
@@ -109,11 +108,12 @@ PI_NODE = "pi_button_panel"   # the Pi's button program: seen on the network = t
 WATCH_S = 2.0                 # how often the Pi connection and sensors are checked
 HELP_TEXT = ("Five buttons. Sensor button: press to turn the camera and LiDAR on; hold it to turn them off. Look: describe what is in front; "
              "hold it to ask the camera a question or say a command; press it twice to turn the vision AI off. Mode: indoor or outdoor; hold it to close the map "
-             "and the camera and forget this place. Hand: guide your hand to an object; hold it to stop. Talk, in "
-             "indoor mode: hold it and say where to go, for example chair; press it again to end the navigation. "
+             "and the camera and forget this place. Hand: press it for hand mode, then hold it and say what to reach, "
+             "for example cup, and I guide your hand to it; press it again to end hand mode. Talk, in "
+             "indoor mode: hold it and say where to go, for example chair; press it twice to stop the navigation. "
              "Press hand twice for face mode: then press it to hear who is in front, or hold it and say a name to "
              "remember that person. "
-             "Tap talk twice for what is around you. "
+             "Press talk once for what is around you. "
              "You can say: find the table with the cup, go to the chair, what is around me, call this my chair, "
              "status, vision off.")
 HELP_TEXT_OUTDOOR = ("Outdoor mode warns you about obstacles, holes, low branches and vehicles, with their distance. "
@@ -285,6 +285,8 @@ class FindObjectNode(Node):
         self._speaking_rank = 0  # urgency of the sentence being spoken (0: not a warning): what may cut it off
         self._voice = None       # Piper, kept loaded (see _load_voice)
         threading.Thread(target=self._load_voice, daemon=True).start()
+        # What is said and heard, for the web dashboard (web_dashboard.py): {"kind": "said"|"heard"|..., "text": ..}
+        self._voice_log_pub = self.create_publisher(String, '/voice_log', 50)
         self._marker_sub = self.create_subscription(MarkerArray, '/semantic_markers', self._marker_callback, 10)
         
         map_qos = QoSProfile(
@@ -333,6 +335,10 @@ class FindObjectNode(Node):
         self._hand_busy = False     # a HAND press is starting the camera AI
         self._hand_timer = None     # a HAND tap waiting to see whether it is a double press
         self._look_timer = None     # a LOOK tap waiting to see whether it is a double press (vision AI off)
+        self._talk_timer = None     # a TALK tap waiting to see whether it is a double press (stop navigation)
+        self._nav_cancel_gen = 0    # +1 at every TALK double press: a navigation asked for before it never starts
+        self._cmd_gen = 0           # _nav_cancel_gen when the command being handled was given
+        self._cmd_busy = False      # main_logic_loop is handling a command
         self._face_mode = False     # HAND double press: taps recognise faces, a hold remembers one
         self._face_ptt = False      # a HAND hold in face mode is recording a name
         self._faces = None          # face_memory.FaceMemory, loaded at the first use
@@ -340,7 +346,9 @@ class FindObjectNode(Node):
         self._frame = (None, 0.0)   # the latest camera picture (compressed) and when it came
         self._talk_refused = False  # the TALK hold under way was refused (not in indoor mode): no recording
         self._nav_gen = 0           # +1 at every navigation start: an older guidance loop ends without a word
-        self._grasp_on_arrival = False  # guide the hand after arriving (HAND button), not after a TALK navigation
+        self._hand_mode = False     # HAND tap: the camera AI is on and a HAND hold names the object to reach
+        self._reach_ptt = False     # a HAND hold (not in face mode) is recording the object to reach
+        self._classes = set()       # what the camera AI can recognise (/perception_classes)
         # The vision AI's answers are said here, in turn with everything else
         self.create_subscription(String, '/scene_description', self._description_callback, 10)
         self.create_subscription(String, '/button_event', self._button_callback, 10)
@@ -386,6 +394,9 @@ class FindObjectNode(Node):
         self._grasp_status = None
         self._grasp_cmd_pub = self.create_publisher(String, '/grasp_command', 10)
         self.create_subscription(String, '/grasp_offset', self._grasp_callback, 10)
+        self.create_subscription(String, '/perception_classes', self._classes_callback,
+                                 QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                                            durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
         # Outdoor mode: one alert at a time, the most urgent; a critical one cuts off whatever is being said
         self._alert_lock = threading.Lock()
@@ -405,6 +416,7 @@ class FindObjectNode(Node):
         
         # Commands (typed, or spoken with push-to-talk) are handled one at a time by main_logic_loop
         self.command_queue = queue.Queue()
+        self.create_subscription(String, '/voice_command', self._voice_command_callback, 10)
         
         self.thread = threading.Thread(target=self.main_logic_loop)
         self.thread.daemon = True
@@ -440,7 +452,7 @@ class FindObjectNode(Node):
         `expires` (monotonic time): a warning still waiting for its turn by then is dropped, not said late.
         `rank`: how urgent it is, for what may cut it off (_outdoor_alert_callback).
         `still`: a function; when its turn comes and it returns False, the sentence is out of date and dropped."""
-        print(f"🔊 Speaking: '{text}'")
+        print(f"Speaking: '{text}'")
         gen = self._speech_gen
         with self._speech_lock:
             if gen != self._speech_gen:  # STOP was pressed while this was waiting its turn
@@ -450,6 +462,7 @@ class FindObjectNode(Node):
             if still is not None and not still():
                 return
             self._speaking_rank = rank
+            self._voice_log("said", text)
             try:
                 wav_path = os.path.join(TMP_DIR, "visionnav_voice.wav")
                 self._synthesize(text, wav_path)
@@ -460,6 +473,19 @@ class FindObjectNode(Node):
                 self._speech_proc = None
             finally:
                 self._speaking_rank = 0
+
+    def _voice_log(self, kind, text):
+        try:
+            self._voice_log_pub.publish(String(data=json.dumps({"kind": kind, "text": text, "t": round(time.time(), 3)})))
+        except Exception:
+            pass  # shutting down
+
+    def _voice_command_callback(self, msg: String):
+        """A command typed in the web dashboard: handled as one typed in this terminal."""
+        cmd = msg.data.strip().lower()
+        if cmd:
+            self._voice_log("typed", cmd)
+            self.command_queue.put((cmd, self._nav_cancel_gen))
 
     def stop_speech(self):
         """Cut off what is being said and drop what is waiting to be said."""
@@ -594,8 +620,7 @@ class FindObjectNode(Node):
         except (ValueError, KeyError, TypeError):
             return
         print(f"🔘 {button.upper()} {event}")
-        if event == "tap" or (event == "hold_start" and button in ("mode", "sensors")) or (
-                event == "hold_start" and button == "hand" and not self._face_mode):
+        if event == "tap" or (event == "hold_start" and button in ("mode", "sensors")):
             # A click at once, so the wearer knows the press was heard
             subprocess.Popen(["aplay", "-q", _click_wav()], stderr=subprocess.DEVNULL)
         if button == "look" and event in ("tap", "double"):
@@ -609,6 +634,17 @@ class FindObjectNode(Node):
                 self._look_timer = threading.Timer(HAND_DOUBLE_WAIT_S, self._look_tap)
                 self._look_timer.start()
             return
+        if button == "talk" and event in ("tap", "double"):
+            # A tap waits a moment: two quick presses stop the navigation instead (never "what is around me")
+            if self._talk_timer is not None:
+                self._talk_timer.cancel()
+                self._talk_timer = None
+            if event == "double":
+                threading.Thread(target=self._cancel_navigation, daemon=True).start()
+            else:
+                self._talk_timer = threading.Timer(HAND_DOUBLE_WAIT_S, self._talk_tap)
+                self._talk_timer.start()
+            return
         if button == "hand" and event in ("tap", "double"):
             # A tap waits a moment: two quick presses switch face mode on or off instead
             if self._hand_timer is not None:
@@ -620,11 +656,15 @@ class FindObjectNode(Node):
                 self._hand_timer = threading.Timer(HAND_DOUBLE_WAIT_S, self._hand_tap)
                 self._hand_timer.start()
             return
-        if button == "hand" and event == "hold_start" and self._face_mode:
-            self._face_ptt = True  # recording the name of the person in front
-        if button == "hand" and event == "hold_end" and self._face_ptt:
-            self._face_ptt = False
-            threading.Thread(target=self._ptt_finish, args=("hand",), daemon=True).start()
+        if button == "hand" and event == "hold_start":
+            if self._face_mode:
+                self._face_ptt = True   # recording the name of the person in front
+            else:
+                self._reach_ptt = True  # recording the object to reach
+        if button == "hand" and event == "hold_end" and (self._face_ptt or self._reach_ptt):
+            kind = "hand" if self._face_ptt else "reach"
+            self._face_ptt = self._reach_ptt = False
+            threading.Thread(target=self._ptt_finish, args=(kind,), daemon=True).start()
             return
         if button == "talk" and event == "hold_start" and not (self._active and self._mode == "indoor"):
             # TALK is the navigation button: only in indoor mode (the map is indoor mode's)
@@ -634,7 +674,7 @@ class FindObjectNode(Node):
         if button == "talk" and event == "hold_end" and self._talk_refused:
             self._talk_refused = False
             return
-        if (button in ("talk", "look") or self._face_ptt) and event == "hold_start":
+        if (button in ("talk", "look") or self._face_ptt or self._reach_ptt) and event == "hold_start":
             # Push-to-talk: silence the speaker (it would be recorded), beep, record while held. TALK: where to go
             # (or a command); LOOK: a question for the camera ("what colour is the door") or a command
             self.stop_speech()
@@ -662,33 +702,40 @@ class FindObjectNode(Node):
         return words[:60]
 
     def _ptt_finish(self, button):
+        gen = self._nav_cancel_gen  # a TALK double press while this is being heard cancels it
         text = self._ptt.stop(self._ptt_words())
         self._listening = False
         if not text:
             self.speak("I did not catch that.")
             return
         print(f"🎤 Heard: '{text}'")
+        self._voice_log("heard", text)
         target = " ".join(re.sub(r"[^a-z0-9_ ]", " ", text.lower()).split())
         # Sound-alikes of what this system knows: "top" -> "stop", "share one" -> "chair one" (speech_fix.py)
         phrases = self._command_phrases()
         fixed = speech_fix.fix_command(target, phrases)
-        if button != "hand" and fixed not in phrases:  # a new name is never "corrected" into one already known
+        if button == "reach":  # an object the camera AI knows: "skew driver" -> "screwdriver"
+            fixed = speech_fix.fix_words(target, sorted(self._classes) + list(lang.CLASS_ALIASES))
+        elif button != "hand" and fixed not in phrases:  # a new name is never "corrected" into a known one
             fixed = speech_fix.fix_words(fixed, self._ptt_words() + list(lang.FURNITURE),
                                          protect=list(phrases) + [PTT_VOCABULARY.lower()] + list(COMMAND_WORDS))
         if fixed != target:
             print(f"🎤 Understood: '{fixed}'")
+            self._voice_log("understood", fixed)
             target = text = fixed
         if button == "hand":
             self._remember_face(target)
+        elif button == "reach":
+            self._reach(target)
         elif button == "look" and not self._outdoor_words(target) and self._camera_question(target):
             self._ask_vision(text)  # LOOK is the camera's button: "is there a chair" asks the camera, not the map
         elif self._is_command(target):
-            self.command_queue.put(text)  # "status", "vision off", "find the cup", "go to the table", ...
+            self.command_queue.put((text, gen))  # "status", "vision off", "find the cup", "go to the table", ...
         elif button == "look":
             self._ask_vision(text)  # a question for the camera (Qwen3-VL), started first if it is off
         else:
             # TALK: just the destination ("chair", "the table with the cup", "my chair"): go there
-            self.command_queue.put(f"go to {target}")
+            self.command_queue.put((f"go to {target}", gen))
 
     # ── FACES (HAND button: double press = face mode; there a tap says who it is, a hold remembers a name) ──
     def _hand_tap(self):
@@ -696,15 +743,23 @@ class FindObjectNode(Node):
         if self._face_mode:
             self._recognize()
         else:
-            self._on_button("hand", "tap")  # hand guidance
+            self._toggle_hand_mode()
 
     def _toggle_face_mode(self):
         if self._face_mode:
+            # Double press in face mode: everything of the HAND button off (face mode, hand mode, any hand guidance,
+            # and the camera AI if HAND opened it and no mode needs it)
             self._face_mode_off()
-            self.speak("Face mode off.")
+            self._hand_mode = self.grasping = False
+            camera = not self._active and not self._switching and self._sys.owned("perception")
+            if camera:
+                self._sys.stop("perception")
+            self.speak("Face mode and hand mode off." + (" Camera closed." if camera else ""))
             return
         if self._load_faces() is None:
             return
+        if self._hand_mode:
+            self._hand_mode = self.grasping = False  # one or the other: HAND presses now mean faces
         self._face_mode = True
         self._watch_camera(True)
         self.speak("Face mode. Press to recognise a person. Hold and say a name to remember them.")
@@ -862,14 +917,24 @@ class FindObjectNode(Node):
         else:
             self.speak("You can't use navigation now. It works only in indoor mode.")
 
-    def _end_navigation(self):
-        """TALK press while being guided: the navigation ends."""
-        self._stop_nav()
+    def _talk_tap(self):
+        """TALK tap (not a double press): what is around the wearer."""
+        self._talk_timer = None
+        self._around()
+
+    def _cancel_navigation(self):
+        """TALK double press: stop the navigation, at any moment: while guiding, while "Taking you to ..." is said,
+        and while the request is still being heard (it is then never started)."""
+        busy = self.navigating or self._cmd_busy or self._listening or not self.command_queue.empty()
+        self._nav_cancel_gen += 1
+        self._nav_gen += 1  # a guidance loop ends at once
+        self.stop_speech()
+        if self.navigating:
+            self._stop_nav()
         cancel_path = Path()
         cancel_path.header.frame_id = "map"
         self._path_pub.publish(cancel_path)
-        self.stop_speech()
-        self.speak("Navigation stopped.")
+        self.speak("Navigation stopped." if busy else "Navigation is off.")
 
     def _description_callback(self, msg: String):
         """The vision AI's answer (scene_describer), said here in turn with everything else so STOP can cut it off."""
@@ -891,18 +956,6 @@ class FindObjectNode(Node):
         elif button == "mode" and event == "hold_start":
             self._intended_off = True
             self._request(("off",))
-        elif button == "hand" and event == "tap":
-            self._hand_button()
-        elif button == "hand" and event == "hold_start":
-            self._hand_off()
-        elif button == "talk" and event == "tap":
-            if self.navigating:
-                self._end_navigation()  # one press while guided: the navigation ends (otherwise a tap does nothing)
-        elif button == "talk" and event == "double":
-            if self.navigating:
-                self._end_navigation()
-            else:
-                self._around()
 
     # ── MODE AND SENSOR REQUESTS: one at a time, the latest press wins ──
     @property
@@ -1015,6 +1068,7 @@ class FindObjectNode(Node):
             self._off = self._pi_sensors not in ("stopping", "off")  # sensors off: they start it all again
             self._forget_session()
             self._face_mode_off()
+            self._hand_mode = False
             msg = "Map and camera closed. Press mode to start again."
             by_hand = [self._sys.name(p) for p in parts if self._sys.running(p)]
             if by_hand:  # started in a terminal, not by the assistant: left alone
@@ -1281,61 +1335,72 @@ class FindObjectNode(Node):
         if n:
             self._around()
 
-    def _hand_off(self):
-        """HAND hold: hand guidance off, and the camera AI with its camera window closed when no mode is using it
-        (the HAND button opened it). In indoor or outdoor mode the camera stays: the mode needs it (MODE hold
-        closes it)."""
-        guiding = self.grasping or self.navigating
-        if guiding:
-            self._stop_all(say=None)
-        camera = not self._active and not self._switching and self._sys.owned("perception")
-        if camera:
-            self._sys.stop("perception")
-        if guiding or camera:
-            self.speak("Hand guidance off." + (" Camera closed." if camera else ""))
-        else:
-            self.speak("Hand guidance is already off.")
-
-    def _hand_button(self):
-        """HAND tap: guide the hand to the object found last, or the nearest one ahead; walk there first if it
-        is out of reach (arrival starts the hand guidance). Tap again to stop. Said once: what it will do."""
+    # ── HAND MODE (HAND tap: on / off; HAND hold: say the object, the hand is guided to it) ──
+    def _toggle_hand_mode(self):
         if self._hand_busy:
             return  # a second tap while the camera AI is starting
-        if self.grasping or self.navigating:
-            self._stop_all("Hand guidance disabled.")
-            return
+        if self._hand_mode:
+            self._hand_mode_off()
+        else:
+            self._hand_mode_on()
+
+    def _hand_mode_on(self, quiet=False) -> bool:
+        """The camera AI on (started if no mode runs it) and HAND holds name objects to reach. True when ready."""
         self._hand_busy = True
         try:
             if not self._sys.running("perception"):
                 self.speak("Turning on the camera AI.")
                 if not self._sys.start("perception"):
                     self.speak("The camera AI could not start.")
-                    return
+                    return False
                 time.sleep(2.0)  # first detections
-            self._hand_target()
+            if self._face_mode:
+                self._face_mode_off()
+            was, self._hand_mode = self._hand_mode, True
+            if not was and not quiet:
+                self.speak("Hand mode. Hold the hand button and say what to reach.")
+            return True
         finally:
             self._hand_busy = False
 
-    def _hand_target(self):
-        objects, pose = self._static_objects(), self.get_robot_pose()
-        obj = next((o for o in objects if o["name"] == self.last_found_object and not o.get("dynamic")), None)
-        if obj is None and pose is not None:
-            ahead = [o for o in objects if not o.get("dynamic") and lang._bearing(o, pose)[0] <= HAND_SEARCH_RANGE
-                     and abs(lang._bearing(o, pose)[1]) < math.radians(60)]
-            small = [o for o in ahead if o["class"] not in lang.FURNITURE]  # a cup or a switch, not the table
-            obj = min(small or ahead, key=lambda o: lang._bearing(o, pose)[0], default=None)
-        if obj is None:
-            self.speak("Nothing to reach for yet. Find an object first, then press the hand button.")
+    def _hand_mode_off(self):
+        """Hand mode and any hand guidance off; the camera AI and its window close when the HAND button opened
+        them (no mode needs them)."""
+        self._hand_mode = self.grasping = False
+        camera = not self._active and not self._switching and self._sys.owned("perception")
+        if camera:
+            self._sys.stop("perception")
+        self.speak("Hand mode off." + (" Camera closed." if camera else ""))
+
+    def _reach_class(self, text):
+        """The camera AI's name for the object said ("the red mug" -> "cup"), or None if it knows no such object."""
+        t = " ".join(text.lower().split())
+        for lead in REACH_LEADS:
+            if t.startswith(lead):
+                t = t[len(lead):]
+        if not t:
+            return None
+        query = lang.parse(t, self._classes)
+        if query.target is not None and (not self._classes or query.target.cls in self._classes):
+            return query.target.cls
+        if not self._classes:
+            return t  # its names not heard yet: the camera AI itself says if it does not know this one
+        return t if t in self._classes else None
+
+    def _reach(self, text):
+        """HAND hold (or "grasp the cup"): find the object in front and guide the hand to it."""
+        cls = self._reach_class(text)
+        if cls is None:
+            self.speak(f"I can't look for {text}. Hold the hand button and say an object, like cup or screwdriver.")
             return
-        self.last_found_object = obj["name"]
-        dist = lang._bearing(obj, pose)[0] if pose is not None else 0.0
-        if dist <= HAND_REACH_M:
-            self.start_grasp(obj["class"])  # speaks "Reach out your hand toward the cup."
-        else:
-            name = lang.spoken_name(obj, objects, **self._say_opts())
-            self.speak(f"{name[0].upper()}{name[1:]} is {lang.where(obj, pose)}. "
-                       f"Taking you there, then I will guide your hand.")
-            self._start_nav(obj, objects, grasp=True)
+        if self._hand_mode_on(quiet=True):
+            self.start_grasp(cls)
+
+    def _classes_callback(self, msg: String):
+        try:
+            self._classes = set(json.loads(msg.data))
+        except (ValueError, TypeError):
+            pass
 
     # ── SPOKEN OBJECT REQUESTS ──
     def _static_objects(self):
@@ -1413,7 +1478,8 @@ class FindObjectNode(Node):
             self._found(verb, obj, self._static_objects(), self.get_robot_pose())
         elif verb == "go":
             self.speak(f"I can't see {spoken} right now. Taking you to where it was.")
-            threading.Thread(target=self.navigate_to, args=(spoken, (n["x"], n["y"])), daemon=True).start()
+            threading.Thread(target=self.navigate_to, args=(spoken, (n["x"], n["y"])), kwargs={"gen": self._cmd_gen},
+                             daemon=True).start()
         else:
             self.speak(f"I can't see {spoken} right now. Say go to {spoken} to walk to where it was.")
         return True
@@ -1462,13 +1528,15 @@ class FindObjectNode(Node):
             self._semantic_goal_pub.publish(String(data="stop"))
         time.sleep(0.3)
 
-    def _start_nav(self, obj, objects, grasp=False):
+    def _start_nav(self, obj, objects, gen=None):
+        gen = self._cmd_gen if gen is None else gen
+        if gen != self._nav_cancel_gen:
+            return  # stopped with a TALK double press while it was being asked for
         if self.navigating:
             self._stop_nav()  # a new destination replaces the old one
-        self._grasp_on_arrival = grasp
         name = lang.spoken_name(obj, objects, **self._say_opts())
         spoken = name[4:] if name.startswith("the ") else name
-        threading.Thread(target=self.navigate_to, args=(obj["name"],), kwargs={"spoken": spoken},
+        threading.Thread(target=self.navigate_to, args=(obj["name"],), kwargs={"spoken": spoken, "gen": gen},
                          daemon=True).start()
 
     def _found(self, verb, obj, objects, pose):
@@ -1647,12 +1715,16 @@ class FindObjectNode(Node):
         self._grasp_cmd_pub.publish(String(data=f"start {obj}"))
         print(f"\n✋ GRASP MODE: {obj}   — type 'stop' to cancel")
         self.speak(f"Reach out your hand toward the {obj}.")
-        start, last_cue, last_time = time.time(), None, 0.0
+        start = time.time()
+        last_cue, last_time = f"Reach out your hand toward the {obj}.", start  # not said twice in a row
         while rclpy.ok() and self.grasping:
             status = self._grasp_status or {}
             state = status.get("state")
             if state == "unavailable":
                 self.speak("Hand tracking is not available.")
+                break
+            if state == "unknown_object":
+                self.speak(f"I can't recognise a {obj}. Hold the hand button and say another name for it.")
                 break
             if state == "reached":
                 self.speak(f"Stop. The {obj} is at your hand.")
@@ -1738,9 +1810,12 @@ class FindObjectNode(Node):
             # Wait up to 1 second for keyboard input without blocking permanently
             i, o, e = select.select([sys.stdin], [], [], 1.0)
             if i:
-                cmd = sys.stdin.readline().strip().lower()
+                line = sys.stdin.readline()
+                if not line:
+                    return  # no terminal (started by the web dashboard or a service): stdin is at its end
+                cmd = line.strip().lower()
                 if cmd:
-                    self.command_queue.put(cmd)
+                    self.command_queue.put((cmd, self._nav_cancel_gen))
 
     def main_logic_loop(self):
         time.sleep(2)
@@ -1760,13 +1835,18 @@ class FindObjectNode(Node):
         threading.Thread(target=self.keyboard_listener_loop, daemon=True).start()
         
         while rclpy.ok():
+            self._cmd_busy = False
             try:
-                # A command: typed, or spoken with push-to-talk
-                target = self.command_queue.get(timeout=0.5)
+                # A command: typed, or spoken with push-to-talk, with the cancel count of when it was given
+                target, self._cmd_gen = self.command_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
+            self._cmd_busy = True
             # "Where's the cup?" -> "where s the cup" (IDs such as chair_1 keep their underscore)
             target = " ".join(re.sub(r"[^a-z0-9_ ]", " ", target.lower()).split())
+            if self._cmd_gen != self._nav_cancel_gen and (target.startswith(GO_COMMANDS) or target in GO_THERE):
+                print(f"🧭 '{target}' cancelled (TALK double press)")
+                continue
             
             if target in ('exit', 'shut down', 'shutdown'):
                 self.speak("Shutting down.")
@@ -1817,9 +1897,8 @@ class FindObjectNode(Node):
             elif target.startswith(GRASP_COMMANDS):
                 prefix = next(p for p in GRASP_COMMANDS if target.startswith(p))
                 obj = target[len(prefix):].strip()
-                obj = obj[4:] if obj.startswith("the ") else obj
                 if obj:
-                    self.start_grasp(obj)
+                    self._reach(obj)
 
             elif target in ("save map", "save the map"):
                 # Maps are not kept for another day (the wearer's choice): one lives as long as its session
@@ -1887,7 +1966,7 @@ class FindObjectNode(Node):
                 if place is not None:
                     self.speak(f"Starting navigation to the {dest_term}.")
                     threading.Thread(target=self.navigate_to, args=(dest_term, (place['x'], place['y'])),
-                                     daemon=True).start()
+                                     kwargs={"gen": self._cmd_gen}, daemon=True).start()
                 elif not self._object_request("go", dest_term):
                     self.speak(f"I don't know where {dest_term} is.")
 
@@ -1901,11 +1980,15 @@ class FindObjectNode(Node):
                       "save this place as <name>, where am i, status")
 
     # ── CONTINUOUS TURN-BY-TURN NAVIGATION ──
-    def navigate_to(self, target_name, place=None, spoken=None):
+    def navigate_to(self, target_name, place=None, spoken=None, gen=None):
         """Continuously guide the user to an object, or to a named place (place = (x, y)), by voice.
-        `spoken` is how the object is named aloud ("table with the red cup on it"), never its ID."""
+        `spoken` is how the object is named aloud ("table with the red cup on it"), never its ID. `gen`: the TALK
+        double-press count when it was asked for (a stop since then: it does not start)."""
+        want = self._nav_cancel_gen if gen is None else gen
+        if want != self._nav_cancel_gen:
+            return
         if self._nav2_available():
-            self._navigate_nav2(target_name, place, spoken)
+            self._navigate_nav2(target_name, place, spoken, want)
             return
         self._nav_gen += 1
         gen = self._nav_gen
@@ -1941,7 +2024,7 @@ class FindObjectNode(Node):
         print("   Type 'stop' to cancel navigation")
         print("=" * 50)
         
-        while rclpy.ok() and self.navigating and gen == self._nav_gen:
+        while rclpy.ok() and self.navigating and gen == self._nav_gen and want == self._nav_cancel_gen:
             pose = self.get_robot_pose()
             if pose is None:
                 time.sleep(0.1)
@@ -2017,7 +2100,7 @@ class FindObjectNode(Node):
             
             time.sleep(0.1)
 
-        if gen == self._nav_gen:  # not replaced by a newer navigation
+        if gen == self._nav_gen or want != self._nav_cancel_gen:  # not replaced by a newer navigation
             self.navigating = False
         print("\n✅ Navigation ended.\n")
 
@@ -2047,9 +2130,6 @@ class FindObjectNode(Node):
         empty_path = Path()
         empty_path.header.frame_id = 'map'
         self._path_pub.publish(empty_path)
-        if not is_place and obj_class and self._grasp_on_arrival:
-            self.start_grasp(obj_class)
-        self._grasp_on_arrival = False
 
     @staticmethod
     def _instruction(rel_angle, clock_hr, dist_ft):
@@ -2072,8 +2152,9 @@ class FindObjectNode(Node):
         return (kind != last_kind or now - last_t > 8.0
                 or (dist_ft <= 12 and last_ft is not None and last_ft - dist_ft >= step and now - last_t > 1.2))
 
-    def _navigate_nav2(self, target_name, place=None, spoken=None):
+    def _navigate_nav2(self, target_name, place=None, spoken=None, want=None):
         """Guide the user along the smooth Nav2 path from semantic_navigator.py (re-planned every second)."""
+        want = self._nav_cancel_gen if want is None else want
         if place:
             friendly_name, (tx, ty) = target_name, place
         else:
@@ -2095,7 +2176,7 @@ class FindObjectNode(Node):
         self._semantic_goal_pub.publish(String(data=json.dumps(goal)))
         print(f"\n🧭 NAVIGATING (Nav2) TO: {friendly_name}   — type 'stop' to cancel")
         last_instruction, last_speech_time, last_problem, last_ft = "", 0.0, None, None
-        while rclpy.ok() and self.navigating and gen == self._nav_gen:
+        while rclpy.ok() and self.navigating and gen == self._nav_gen and want == self._nav_cancel_gen:
             status = self._nav2_status or {}
             state = status.get("state")
             if state == "arrived":
@@ -2141,7 +2222,7 @@ class FindObjectNode(Node):
                 print(f"  📍 {instruction}")
                 last_instruction, last_speech_time, last_ft = kind, now, remaining * 3.28084
             time.sleep(0.1)
-        if gen == self._nav_gen:  # not replaced by a newer navigation
+        if gen == self._nav_gen or want != self._nav_cancel_gen:  # not replaced by a newer navigation
             self._semantic_goal_pub.publish(String(data="stop"))
             self.navigating, self._using_nav2 = False, False
         print("\n✅ Navigation ended.\n")
@@ -2369,15 +2450,22 @@ class FindObjectNode(Node):
         return smoothed_path
 
 def main(args=None):
+    from rclpy.executors import SingleThreadedExecutor, ExternalShutdownException
     rclpy.init(args=args)
     node = FindObjectNode()
-    # Closing the terminal (SIGHUP) or a kill (SIGTERM) also stops the programs it started, as Ctrl+C does
+    # Closing the terminal (SIGHUP) or a kill (SIGTERM, e.g. earlyoom when the laptop runs out of memory) also
+    # stops the programs it started, as Ctrl+C does
     import signal
     for sig in (signal.SIGHUP, signal.SIGTERM):
         signal.signal(sig, lambda *_: rclpy.shutdown() if rclpy.ok() else None)
+    # Its own executor, not rclpy.spin()'s shared one: rclpy.shutdown() (the handler above, which runs in the
+    # middle of a callback, or "exit") destroys the shared one under the running callback (InvalidHandle crash);
+    # this one it only wakes
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
-    except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
+        executor.spin()
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         # A second Ctrl+C must not break off the clean-up (that left the parts running on their own)

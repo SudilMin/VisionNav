@@ -52,6 +52,7 @@ All nodes are in the `visionnav` package (`visionnav/visionnav/*.py`); `sllidar_
 | Nav2 planner + smoother | Theta* path and smoothing (no controller: a person follows voice, not `cmd_vel`) |
 | `semantic_navigator` | `/semantic_goal` ("chair") → an approach point in front of it → `/object_path` |
 | `lidar_orientation_calibrator` | One-off tool: measures the LiDAR's mount on the rig |
+| `web_dashboard` | Web page (http://localhost:8080): starts / stops the assistant, shows the map, the camera AI's picture, what is said and heard; types commands and presses LOOK / MODE / HAND / TALK |
 
 Sensor geometry (camera, LiDAR and IMU mounts) is defined once in `launch/sensor_tf.launch.py` and read from TF by
 every node.
@@ -61,8 +62,9 @@ every node.
 **Indoor** (`laptop_brain.launch.py` + map window + `object_perception`). Objects seen reliably are placed on the
 SLAM map and kept for the session, even out of view; one taken away is removed once the camera looks at its
 spot again. "Go to the chair next to the door": `object_language` resolves the description to one object, the
-navigator plans a route, and the assistant speaks clock-direction guidance along it until arrival. The HAND
-button then guides the hand to the object ("Left 2 inches… Forward 4 inches").
+navigator plans a route, and the assistant speaks clock-direction guidance along it until arrival. In hand
+mode (HAND tap), holding HAND and saying an object ("cup", "screwdriver") finds it in the camera picture and
+guides the hand to it ("Left 2 inches… Forward 4 inches… Stop. The cup is at your hand.").
 
 **Outdoor** (`outdoor_sensors.launch.py` + `object_perception` in outdoor mode). Nothing is mapped. The camera,
 depth and the forward half of the LiDAR scan feed a live hazard model: walking corridor, holes and kerbs, head-height
@@ -77,8 +79,8 @@ wearer is tracked or said.
 | SENSORS | camera, LiDAR, IMU on | off | — |
 | LOOK | describe the scene (vision AI) | ask a question / say a command | vision AI off |
 | MODE | indoor ↔ outdoor | close the map and camera, forget the session | — |
-| HAND | guide the hand to the last found object | hand guidance off | face mode |
-| TALK | end navigation | say where to go (indoor) | what is around me |
+| HAND | hand mode on / off | say an object, the hand is guided to it | face mode on; in face mode: face and hand mode off |
+| TALK | what is around me | say where to go (indoor) | stop the navigation |
 
 ## 6. Main topics
 
@@ -90,5 +92,7 @@ wearer is tracked or said.
 | `/semantic_goal`, `/object_path`, `/semantic_nav_status` | assistant ↔ navigator |
 | `/perception_mode`, `/perception_mode_state` | assistant ↔ perception |
 | `/outdoor_alert`, `/outdoor_scene` | perception → assistant |
-| `/grasp_command`, `/grasp_offset` | assistant ↔ perception |
+| `/grasp_command`, `/grasp_offset`, `/perception_classes` | assistant ↔ perception (hand mode) |
 | `/describe_command`, `/scene_description` | assistant ↔ vision AI |
+| `/voice_log`, `/voice_command` | assistant → dashboard (what is said and heard, JSON) / dashboard → assistant (typed commands) |
+| `/perception/view/compressed` | perception → dashboard (the camera window's picture, JPEG, only while subscribed) |

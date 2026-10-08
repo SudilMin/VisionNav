@@ -29,6 +29,15 @@ VisionNav runs on two computers:
    source install/setup.bash
    ros2 run visionnav voice_navigation_assistant
    ```
+   **Or from a browser** (the web dashboard: start, stop and watch it all on one page):
+   ```bash
+   export ROS_DOMAIN_ID=42
+   export ROS_LOCALHOST_ONLY=0
+   cd ~/wearable_ws
+   source install/setup.bash
+   ros2 run visionnav web_dashboard
+   ```
+   then open **http://localhost:8080** and press **▶ START** (see [Web Dashboard](#️-web-dashboard-start-it-and-watch-it-from-a-browser)).
 2. **Press SENSORS.** Click → "Sensors turned on." → the laptop starts indoor mode by itself (the map window
    and the camera window open) → **"Indoor mode activated."** Each thing is said once, when it is done.
 3. Use the buttons (below), or type commands in the assistant's terminal. Every tap clicks, so you know it was
@@ -48,12 +57,12 @@ VisionNav runs on two computers:
 | | double press | **Vision AI off** (frees its GPU memory) → "Vision AI off." (A single tap now describes after a short wait, 0.45 s, to tell it from a double press.) |
 | **MODE** | tap | While paused (sensors off): "Outdoor mode selected. It starts when the camera and LiDAR are on." Otherwise: click → closes the indoor map (Cartographer, Nav2, its RViz), opens the outdoor view (its own RViz) → "Outdoor mode activated." Tap again: the outdoor view closes and the indoor map opens → "Indoor mode activated." The camera window stays open throughout. |
 | | hold | **Close the map and the camera feed; the session ends.** Stops the map (Cartographer, Nav2, the map window), the camera AI with its camera window and the outdoor view, and any guidance → click → "Map and camera closed. Press mode to start again." The map, the objects, the places and the names of this session are forgotten (nothing is kept for another day). The camera and LiDAR stay on (SENSORS is their button); tap MODE to start again, with a new map. The vision AI stays on: say "vision off" to stop it. The status is a voice command: hold LOOK, say "status". |
-| **HAND** | tap | (After 0.45 s, see double tap.) Starts the camera AI if it is off ("Turning on the camera AI.") → guides your hand to the object found last (or the nearest one ahead): "Reach out your hand toward the cup." — walking you there first if it is more than 1 m away. Nothing found: "Nothing to reach for yet…". Tap again: "Hand guidance disabled." |
-| | hold | Click → stops hand guidance (and the walk to the object), and closes the camera AI and its camera window if the HAND button opened it (no mode running): "Hand guidance off. Camera closed." In indoor or outdoor mode the camera stays (the mode needs it; MODE hold closes it): "Hand guidance off." Nothing running: "Hand guidance is already off." |
-| | double tap | **Face mode** on / off: "Face mode. Press to recognise a person. Hold and say a name to remember them." / "Face mode off." In face mode: **tap** → who is in front: "This is Kamal." / "I see 2 people: Kamal on your left, and someone I do not know on your right." / "I don't know this person…"; **hold** → beep → say the name ("Kamal", "his name is Kamal") → let go → "I will remember Kamal." (the largest face in view; do it again from another angle to recognise them better). Faces are kept for another day, on this laptop only (`~/.visionnav/faces/faces.json`). A HAND tap waits 0.45 s to see whether a second one follows. |
-| **TALK** | tap | While navigating: **ends the navigation** → "Navigation stopped." Otherwise nothing. |
+| **HAND** | tap | (After 0.45 s, see double tap.) **Hand mode** on / off. On: starts the camera AI if it is off ("Turning on the camera AI.") → "Hand mode. Hold the hand button and say what to reach." Off: stops any hand guidance and closes the camera AI and its window if HAND opened it (no mode running): "Hand mode off. Camera closed." |
+| | hold | Beep → say the object while holding ("cup", "the red mug", "screwdriver", "my phone") → let go → it finds that object in front of you (on a table, a shelf…) and guides your hand: "Reach out your hand toward the cup." → "Left 2 inches.", "Lower 1 inch.", "Forward 6 inches." → "Stop. The cup is at your hand." Hand mode turns on by itself if it was off and stays on for the next object. An object the camera AI cannot recognise: "I can't look for …". Tools are included (screwdriver, hammer, pliers, wrench, tape, stapler, battery…). |
+| | double tap | **Face mode** on / off: "Face mode. Press to recognise a person. Hold and say a name to remember them." / in face mode, a double tap turns face mode **and hand mode** off: "Face mode and hand mode off." (and closes the camera AI if HAND opened it) In face mode: **tap** → who is in front: "This is Kamal." / "I see 2 people: Kamal on your left, and someone I do not know on your right." / "I don't know this person…"; **hold** → beep → say the name ("Kamal", "his name is Kamal") → let go → "I will remember Kamal." (the largest face in view; do it again from another angle to recognise them better). Faces are kept for another day, on this laptop only (`~/.visionnav/faces/faces.json`). A HAND tap waits 0.45 s to see whether a second one follows. |
+| **TALK** | tap | What is around you (after 0.45 s, see double tap). While navigating it does not stop the guidance. |
 | | hold | **Navigation (indoor mode only).** Beep → say where to go while holding ("chair", "chair 1" — the ID shown on the map and camera window —, "the table with the cup", "my chair", "kitchen") → let go → "Taking you to the chair…" → turn-by-turn guidance, always with the clock direction and the feet left ("Turn left, to 10 o'clock. 12 feet.", "Bear slightly right, 1 o'clock. 6 feet.", "Straight ahead. 3 feet."; every 2 feet in the last 12 feet, every foot in the last 4) → "You have arrived. The chair is at 12 o'clock, within reach." (where it is from where you stopped, about an arm's length from its near edge) and the navigation ends (no hand guidance; the HAND button does that). A command also works here ("status", "save this place as kitchen", "call this my chair"). Not in indoor mode: "You can't use navigation now. It works only in indoor mode." |
-| | double tap | What is around you |
+| | double tap | **Stops the navigation, at any moment** → "Navigation stopped.": while guiding, while "Taking you to …" is being said, or while what you said is still being heard (that navigation then never starts). Nothing to stop: "Navigation is off." |
 
 A hold is 0.6 s and acts at that moment, with the button still down; a double tap is two taps within 0.4 s. The
 Pi reads the buttons 200 times a second, so a very short press counts and a poor contact does not split one press
@@ -144,7 +153,7 @@ with the distance in feet and the direction — **one sentence at a time, about 
   stripes, holes as magenta discs — with its distance, its own speed and its predicted path (3 s). Threats turn
   orange / red. An object leaves the view as soon as no sensor sees it. Topics: `/outdoor_markers`,
   `/outdoor_occupancy`. Without a screen: `use_rviz:=false` on `outdoor_sensors.launch.py`.
-* **Say** (hold LOOK): "what is ahead" (also TALK double tap), "what colour is the light", "can I cross" (the
+* **Say** (hold LOOK): "what is ahead" (also a TALK tap), "what colour is the light", "can I cross" (the
   crossing, its signal and any vehicle coming — it never says it is safe; listen for traffic), "quiet warnings"
   (two minutes; dangers are still said), "warnings on", "help".
 * **Settings**: `WEARABLE_USER_HEIGHT=1.75` (m, for head-height warnings), `WEARABLE_UNITS=metric` (metres instead
@@ -169,7 +178,7 @@ distances are in feet ("The table, with the cup on it, 7 feet away, at 1 o'clock
 | "call this my chair" → later "go to my chair"; "forget name my chair" | Your own names for objects (kept for this session) |
 | "save this place as kitchen" (or "mark kitchen"), "go to kitchen", "where am i", "forget place kitchen" | Named places |
 | "save map" | Nothing is saved for another day: "The map is kept until you hold the mode button. It is not saved for another day." |
-| "grasp the cup" ("grab", "pick up", "reach for") | Hand guidance: "Right 4 inches", "Lower 2 inches", "Forward 6 inches"… "Stop. The cup is at your hand." (also starts on arrival at an object) |
+| "grasp the cup" ("grab", "pick up", "reach for") | Hand guidance: "Right 4 inches", "Lower 2 inches", "Forward 6 inches"… "Stop. The cup is at your hand." (the same as a HAND hold) |
 | "what colour is the door?", "describe …", "read …", "how many people are here?" | Sent to the vision AI (it starts first if it is off) |
 | "vision off" | Stops the vision AI and frees its GPU memory |
 | "who is this", "who is here" | Who is in front of the camera (as a HAND tap in face mode) |
@@ -187,6 +196,41 @@ Faster but a little less accurate: `WEARABLE_WHISPER_MODEL=base.en` (0.4 s). `sm
 recorded commands.
 Colours are understood when someone says one ("the red cup") but only spoken with `WEARABLE_SPEAK_COLORS=1`
 (for a partially sighted user).
+
+---
+
+## 🖥️ Web Dashboard (start it and watch it from a browser)
+
+For a helper, a demo or a test on the rig: one page that starts the system and shows what it does. The wearer
+never needs it.
+
+```bash
+export ROS_DOMAIN_ID=42 ROS_LOCALHOST_ONLY=0
+source ~/wearable_ws/install/setup.bash
+ros2 run visionnav web_dashboard
+```
+Open **http://localhost:8080** (on the laptop), choose Indoor or Outdoor, and press **▶ START**: the assistant starts
+("VisionNav is on…"); then press **SENSORS** on the rig as usual.
+
+| Where | What it shows |
+|---|---|
+| **Top** | START / STOP; the assistant, the Pi's sensors, the mode, the navigation, how many objects; a green dot for each program running (Pi buttons, LiDAR, camera, map, camera AI, vision AI, map window) |
+| **Left: Map** | Indoors the SLAM map with you (blue arrow), the objects (yellow), people (orange) and the route (green); outdoors what is ahead of you, with the distance, and the scene summary |
+| **Right: Camera** | The camera AI's picture with its boxes and distances; the plain camera while the camera AI is off |
+| **Bottom: Voice** | Everything said (🔊) and heard (🎤, and what it was understood as), typed commands, and the **System log** tab (the assistant's output) |
+
+* **Type a command** ("find the cup", "go to the chair", "status") or click a quick one: the same as typing in the
+  assistant's terminal.
+* **LOOK / MODE / HAND / TALK** on the page work as the rig's buttons: click = tap, **hold** = hold (speak into the
+  laptop's microphone while holding; release to send), click twice = double. SENSORS is only on the rig (the Pi
+  powers the camera and LiDAR).
+* **STOP** stops the assistant and everything it started. Closing the dashboard (Ctrl+C) does the same for an
+  assistant it started. An assistant already started at login is used as it is (STOP asks it to exit).
+* The assistant started here logs to `~/.visionnav/logs/assistant.log`.
+* From a phone on the same Wi-Fi: start it with `WEARABLE_WEB_HOST=0.0.0.0`, open `http://<laptop IP>:8080`
+  (anyone on that network can then use it). Another port: `WEARABLE_WEB_PORT=8090`.
+* The RViz map window and the camera window still open as before; the page is an extra view. The camera AI's picture
+  is only encoded while the page shows it.
 
 ---
 
@@ -283,8 +327,8 @@ Run the same two Pi lines again after every update. Then `exit` — the Pi needs
 | **SENSORS** | GPIO24 | pin 18 | LiDAR + camera + IMU: tap on, hold off |
 | **LOOK** | GPIO17 | pin 11 | Vision AI: tap describe, hold ask a question, double press off |
 | **MODE** | GPIO27 | pin 13 | Tap indoor ↔ outdoor, hold everything off |
-| **HAND** | GPIO22 | pin 15 | Tap hand guidance, hold off; double tap face mode |
-| **TALK** | GPIO23 | pin 16 | Indoor navigation: hold say where to go, press again to stop |
+| **HAND** | GPIO22 | pin 15 | Tap hand mode on/off, hold say the object to reach; double tap face mode |
+| **TALK** | GPIO23 | pin 16 | Indoor navigation: hold say where to go, double press stop; tap what is around you |
 | GND (shared) | — | pin 14 (also 9, 20, 25) | Second leg of every button |
 
 **Parts:** 5 momentary, normally-open push buttons (12 mm tactile or 16–19 mm panel buttons; give each a

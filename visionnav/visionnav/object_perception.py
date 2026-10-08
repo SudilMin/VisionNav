@@ -104,6 +104,9 @@ VOCABULARY = [
     "book", "notebook", "pen", "paper", "backpack", "handbag", "wallet", "keys", "glasses", "watch",
     "medicine", "umbrella", "pillow", "blanket", "cushion", "clothes", "hanger", "basket", "vase",
     "potted plant", "flower", "candle", "scissors", "teddy bear",
+    # tools and small things on a table (hand mode reaches for them)
+    "screwdriver", "hammer", "pliers", "wrench", "tape measure", "adhesive tape", "stapler", "calculator",
+    "earphones", "flashlight", "lighter", "comb", "battery", "soldering iron",
     # people / pets
     "person", "child", "dog", "cat",
     # outdoor
@@ -216,6 +219,8 @@ FRIENDLY_NAMES = {
     "hair drier": "hair dryer", "tv": "monitor", "fire hydrant": "hydrant",
     "parking meter": "meter", "traffic light": "signal",
 }
+# Names hand mode can reach for: a detection's reported name or its prompt (grasp_tracker matches either)
+REACHABLE_CLASSES = INDOOR_CLASSES | {FRIENDLY_NAMES.get(c, c) for c in INDOOR_CLASSES}
 
 # ── MAXIMUM PHYSICAL SIZES (width_m, height_m): estimated sizes are clamped to these ──
 OBJECT_MAX_SIZES = {
@@ -351,6 +356,8 @@ DESKTOP_OBJECTS = {
     "monitor", "book", "vase", "scissors", "remote", "cell phone",
     "smartphone", "apple", "orange", "banana", "fork", "knife",
     "spoon", "toaster", "microwave", "sink",
+    "screwdriver", "hammer", "pliers", "wrench", "tape measure", "adhesive tape", "stapler", "calculator",
+    "earphones", "flashlight", "lighter", "comb", "battery", "soldering iron",
 }
 DESK_HEIGHT = 0.75
 SUPPORT_HEIGHTS = {"microwave": 0.90, "toaster": 0.90, "sink": 0.85}
@@ -517,6 +524,7 @@ OUTDOOR_SHOW_S = 0.3         # s: outdoors an object is drawn in RViz only this 
 OUTDOOR_STRUCTURE = {"wall", "fence", "railing", "gate", "bus stop", "construction site"}  # drawn by the occupancy grid
 OUTDOOR_MARKER_LIFETIME = 0.5  # s: RViz drops the outdoor view this soon if frames stop coming
 HUD_SYNC_MAX_AGE = 0.3       # s: the window shows the frame the boxes were computed on while it is this fresh
+VIEW_HZ = 8.0                # the camera window's picture is sent to the web dashboard at most this often
 HUD_BOX_ALPHA, HUD_BOX_SCALE_PX = 0.15, 40.0     # static box: weight of a new corner, +1 per this many px moved
 HUD_DEPTH_ALPHA, HUD_DEPTH_SCALE_M = 0.1, 1.0    # static distance label: same, per metre changed
 LABEL_SCALE = 0.15           # RViz text height (m)
@@ -951,6 +959,9 @@ class ObjectPerceptionNode(Node):
         # ── CAMERA ACQUISITION MODE (Direct USB or ROS Wi-Fi) ──
         self._camera_mode = os.environ.get("WEARABLE_CAMERA_MODE", "direct").lower()
         self._camera_pub = self.create_publisher(Image, '/camera/image_raw', realtime_qos)
+        # The camera window's picture (boxes, labels, distances) for the web dashboard, sent only while it watches
+        self._view_pub = self.create_publisher(CompressedImage, '/perception/view/compressed', realtime_qos)
+        self._last_view_pub = 0.0
         # The Pi's ROS camera stream arrives mirrored and is flipped back on arrival; all geometry uses the flipped
         # frame. WEARABLE_CAMERA_FLIP=0/1 overrides it for other cameras.
         flip_default = "1" if self._camera_mode == "ros" else "0"
@@ -1090,6 +1101,11 @@ class ObjectPerceptionNode(Node):
             String, "/perception_mode_state",
             QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self._mode_state_pub.publish(String(data=self._mode))
+        # What the camera AI can recognise (indoor names and prompts), so the assistant can match a spoken object
+        self._classes_pub = self.create_publisher(
+            String, "/perception_classes",
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self._classes_pub.publish(String(data=json.dumps(sorted(REACHABLE_CLASSES))))
 
         # ── GRASP MODE: guide the hand to an object ("start cup" / "stop" on /grasp_command) ──
         self._grasp = GraspTracker(self.get_logger())
@@ -2373,9 +2389,13 @@ class ObjectPerceptionNode(Node):
     def _grasp_command_callback(self, msg: String):
         words = msg.data.strip().lower().split(maxsplit=1)
         if words and words[0] == "start" and len(words) > 1:
-            ok = self._grasp.start(words[1])
+            target = FRIENDLY_NAMES.get(words[1], words[1])
+            if target not in REACHABLE_CLASSES:  # the detector has no such class: it would never be found
+                self._grasp_pub.publish(String(data=json.dumps({"target": words[1], "state": "unknown_object"})))
+                return
+            ok = self._grasp.start(target)
             if not ok:
-                self._grasp_pub.publish(String(data=json.dumps({"target": words[1], "state": "unavailable"})))
+                self._grasp_pub.publish(String(data=json.dumps({"target": target, "state": "unavailable"})))
         elif words and words[0] == "stop":
             self._grasp.stop()
             self._grasp_status = None
@@ -3575,6 +3595,21 @@ class ObjectPerceptionNode(Node):
 
         self._marker_pub.publish(MarkerArray(markers=current_markers))
 
+    def publish_view(self, frame):
+        """The camera window's picture as JPEG on /perception/view/compressed, at most VIEW_HZ, while subscribed."""
+        now = time.monotonic()
+        if now - self._last_view_pub < 1.0 / VIEW_HZ or self._view_pub.get_subscription_count() == 0:
+            return
+        self._last_view_pub = now
+        h, w = frame.shape[:2]
+        if w > 800:
+            frame = cv2.resize(frame, (800, int(h * 800 / w)), interpolation=cv2.INTER_AREA)
+        ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        if ok:
+            msg = CompressedImage(format="jpeg", data=jpg.tobytes())
+            msg.header.stamp = self.get_clock().now().to_msg()
+            self._view_pub.publish(msg)
+
     def _publish_objects(self, now: float, frame_id: str):
         """Publish the global object dictionary as JSON (what the map shows, plus velocities)."""
         objects = []
@@ -4052,6 +4087,7 @@ def main(args=None) -> None:
                     display_frame = frame.copy()
                     node._draw_cached_boxes(display_frame)
                     cv2.imshow(node._window_name, display_frame)
+                    node.publish_view(display_frame)
                 else:
                     cv2.imshow(node._window_name, waiting_frame)
 
@@ -4063,7 +4099,17 @@ def main(args=None) -> None:
         else:
             # Headless mode: no GUI, just let ROS spin handle everything
             node.get_logger().info("Running in HEADLESS mode (no display). Press Ctrl+C to stop.")
-            ros_thread.join()
+            # Still drawn for the web dashboard while it watches (publish_view sends nothing otherwise)
+            while ros_thread.is_alive():
+                frame = node._gui_frame
+                hud_frame = node._hud_frame
+                if hud_frame is not None and time.monotonic() - hud_frame[1] < HUD_SYNC_MAX_AGE:
+                    frame = hud_frame[0]
+                if frame is not None and node._view_pub.get_subscription_count() > 0:
+                    display_frame = frame.copy()
+                    node._draw_cached_boxes(display_frame)
+                    node.publish_view(display_frame)
+                time.sleep(1.0 / VIEW_HZ)
     except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
     finally:
