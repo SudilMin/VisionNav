@@ -75,6 +75,8 @@ VISION_ANSWER_S = 60.0  # s: a question unanswered this long is not waited for (
 # A HAND or LOOK tap waits this long for a second one (HAND double press: face mode on/off; LOOK: vision AI off)
 HAND_DOUBLE_WAIT_S = 0.45
 FRAME_MAX_AGE_S = 1.5     # a camera picture older than this is not used to recognise anyone
+RECOGNIZE_FRAMES = 4      # pictures in a row looked at to say who it is (one blurred picture does not decide)
+REMEMBER_FRAMES = 8       # pictures in a row taken to remember a face (the clear ones are kept)
 WHO_COMMANDS = ("who is this", "who is it", "who is here", "who is in front of me", "who is there",
                 "who s this", "whos this", "who s there", "whos there")
 NAME_LEADS = ("his name is ", "her name is ", "their name is ", "this is ", "it is ", "it s ", "name ")
@@ -789,46 +791,53 @@ class FindObjectNode(Node):
             self.destroy_subscription(self._cam_sub)
             self._cam_sub, self._frame = None, (None, 0.0)
 
-    def _picture(self):
-        """The latest camera picture (BGR, as the wearer sees it) or None. Outside face mode ("who is this"
-        said with LOOK) the stream is watched just for this."""
+    def _pictures(self, count):
+        """Up to `count` camera pictures in a row (BGR, as the wearer sees it), or [] when the camera is not
+        sending. Outside face mode ("who is this" said with LOOK) the stream is watched just for this."""
         import cv2
         import numpy as np
         temporary = self._cam_sub is None
         self._watch_camera(True)
-        t0 = time.monotonic()
-        while time.monotonic() - self._frame[1] > FRAME_MAX_AGE_S and time.monotonic() - t0 < 2.0:
-            time.sleep(0.05)
+        msgs, deadline = [], time.monotonic() + 2.0
+        while len(msgs) < count and time.monotonic() < deadline:
+            msg, t = self._frame
+            if msg is not None and time.monotonic() - t <= FRAME_MAX_AGE_S and (not msgs or msg is not msgs[-1]):
+                if not msgs:
+                    deadline = time.monotonic() + 1.5  # the rest follow the first within this
+                msgs.append(msg)
+            time.sleep(0.02)
         msg, t = self._frame
         if temporary:
             self._watch_camera(False)
-        if msg is None or time.monotonic() - t > FRAME_MAX_AGE_S + 2.0:
-            return None
-        img = cv2.imdecode(np.frombuffer(bytes(msg.data), np.uint8), cv2.IMREAD_COLOR)
-        return cv2.flip(img, 1) if img is not None and FLIP_CAMERA else img
+        if not msgs and msg is not None and time.monotonic() - t <= FRAME_MAX_AGE_S + 2.0:
+            msgs = [msg]  # a slow stream: the last picture is still recent enough
+        imgs = [cv2.imdecode(np.frombuffer(bytes(m.data), np.uint8), cv2.IMREAD_COLOR) for m in msgs]
+        return [cv2.flip(img, 1) if FLIP_CAMERA else img for img in imgs if img is not None]
 
     def _recognize(self):
         """Who is in front, left to right: "This is Kamal." / "I see 2 people: Kamal on your left, and someone I
         don't know on your right." """
         if self._load_faces() is None:
             return
-        img = self._picture()
-        if img is None:
+        imgs = self._pictures(RECOGNIZE_FRAMES)
+        if not imgs:
             self.speak("The camera is not sending pictures. Press the sensor button.")
             return
-        people = self._faces.identify(img)
+        people = self._faces.identify(imgs)
         if not people:
             self.speak("I don't see a face.")
             return
         if len(people) == 1:
-            name = people[0][0]
+            name, _, _, guess = people[0]
             self.speak(f"This is {name}." if name else
+                       f"This might be {guess}, but I am not sure." if guess else
                        "I don't know this person. Hold the hand button and say their name to remember them.")
             return
 
         def where(cx):
             return "on your left" if cx < 0.35 else "on your right" if cx > 0.65 else "ahead"
-        said = [f"{name or 'someone I do not know'} {where(cx)}" for name, _, cx in people]
+        said = [f"{name or (f'maybe {guess}' if guess else 'someone I do not know')} {where(cx)}"
+                for name, _, cx, guess in people]
         self.speak(f"I see {len(people)} people: {', '.join(said[:-1])}, and {said[-1]}.")
 
     def _remember_face(self, target):
@@ -855,14 +864,16 @@ class FindObjectNode(Node):
             return
         if self._load_faces() is None:
             return
-        img = self._picture()
-        if img is None:
+        imgs = self._pictures(REMEMBER_FRAMES)
+        if not imgs:
             self.speak("The camera is not sending pictures. Press the sensor button.")
             return
-        result, replaced = self._faces.remember(name, img)
+        result, replaced = self._faces.remember(name, imgs)
         said = {"ok": f"I will remember {name}.",
                 "no_face": "I don't see a face. Point the camera at the person, then try again.",
-                "several": f"I see more than one face. Only {name} should be in front of the camera."}[result]
+                "several": f"I see more than one face. Only {name} should be in front of the camera.",
+                "unclear": f"I can't see the face clearly. {name} should face the camera from about one metre "
+                           "and hold still, then try again."}[result]
         if replaced:
             said += f" I had this face as {' and '.join(replaced)}; that is corrected."
         self.speak(said)
@@ -872,11 +883,11 @@ class FindObjectNode(Node):
         wrong = " ".join(w.capitalize() for w in wrong.split())
         if self._load_faces() is None:
             return
-        img = self._picture()
-        if img is None:
+        imgs = self._pictures(RECOGNIZE_FRAMES)
+        if not imgs:
             self.speak("The camera is not sending pictures. Press the sensor button.")
             return
-        result = self._faces.not_this(wrong, img)
+        result = self._faces.not_this(wrong, imgs)
         self.speak({"ok": f"Okay, this is not {wrong}. Hold the hand button and say who it is.",
                     "unknown_name": f"I don't know anyone called {wrong}.",
                     "no_match": f"I did not have this face as {wrong}.",
