@@ -36,3 +36,4 @@ This project bridges the gap between physical embedded hardware and advanced Art
 ## Documentation
 * [visionnav/ARCHITECTURE.md](visionnav/ARCHITECTURE.md): how the system is built (computers, nodes, modes, topics)
 * [visionnav/STARTUP_INSTRUCTIONS.md](visionnav/STARTUP_INSTRUCTIONS.md): setup, wiring, daily use and troubleshooting
+* [installation_guide.md](installation_guide.md): installing everything on a fresh laptop and Raspberry Pi
